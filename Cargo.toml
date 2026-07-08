@@ -1,0 +1,20 @@
+[package]
+name = "peredozWM"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay = { version = "0.7", features = [
+    "backend_winit",
+    "renderer_gl",
+    "desktop",
+    "wayland-backend",
+    "backend_drm",
+    "backend_gbm",
+    "backend_egl",
+    "backend_libinput",
+    "backend_udev",
+    "backend_session_libseat",
+    "use_system_lib",
+    "renderer_gl",
+] }

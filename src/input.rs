@@ -1,0 +1,345 @@
+use smithay::{
+    backend::{
+        input::{
+            AbsolutePositionEvent, Event, InputEvent, KeyboardKeyEvent,
+            PointerButtonEvent, PointerMotionEvent, ButtonState, KeyState,
+        },
+        session::Session,
+        winit::WinitInput,
+        libinput::LibinputInputBackend,
+    },
+    input::{
+        keyboard::{FilterResult, keysyms as xkb},
+        pointer::{ButtonEvent, MotionEvent},
+    },
+    utils::SERIAL_COUNTER,
+};
+use crate::state::AppState;
+use crate::tiling::SplitDir;
+
+// BTN_LEFT = 272 (0x110)
+const BTN_LEFT: u32 = 272;
+
+pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) {
+    match event {
+        InputEvent::Keyboard { event } => {
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = event.time_msec();
+            let keycode = event.key_code();
+            let key_state = event.state();
+
+            state.seat.get_keyboard().unwrap().input(
+                state,
+                keycode,
+                key_state,
+                serial,
+                time,
+                |app_state, modifiers, keysym| {
+                    if key_state == KeyState::Pressed {
+                        handle_key(app_state, modifiers, u32::from(keysym.modified_sym()))
+                    } else {
+                        FilterResult::Forward
+                    }
+                },
+            );
+        }
+        InputEvent::PointerMotionAbsolute { event } => {
+            let serial = SERIAL_COUNTER.next_serial();
+            // No output mapped yet (hotplug / early init) — ignore the event
+            // instead of panicking on the missing mode.
+            let Some(out) = state.space.outputs().next() else { return };
+            let Some(mode) = out.current_mode() else { return };
+            let logical_size = smithay::utils::Size::<i32, smithay::utils::Logical>::from((mode.size.w, mode.size.h));
+            let pos = event.position_transformed(logical_size);
+
+            handle_pointer_motion(state, pos.x, pos.y, serial, event.time_msec());
+        }
+        InputEvent::PointerButton { event } => {
+            handle_pointer_button(state, event.button_code(), event.state(), event.time_msec());
+        }
+        _ => {}
+    }
+}
+
+/// Handler for libinput events (TTY/DRM backend)
+pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputInputBackend>) {
+    match event {
+        InputEvent::Keyboard { event } => {
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = event.time_msec();
+            let keycode = event.key_code();
+            let key_state = event.state();
+
+            state.seat.get_keyboard().unwrap().input(
+                state,
+                keycode,
+                key_state,
+                serial,
+                time,
+                |app_state, modifiers, keysym| {
+                    if key_state == KeyState::Pressed {
+                        handle_key(app_state, modifiers, u32::from(keysym.modified_sym()))
+                    } else {
+                        FilterResult::Forward
+                    }
+                },
+            );
+        }
+        InputEvent::PointerMotion { event } => {
+            let serial = SERIAL_COUNTER.next_serial();
+            let dx = event.delta_x();
+            let dy = event.delta_y();
+            let Some(ptr) = state.seat.get_pointer() else { return };
+            let cur = ptr.current_location();
+            let new_pos = (cur.x + dx, cur.y + dy);
+
+            handle_pointer_motion(state, new_pos.0, new_pos.1, serial, event.time_msec());
+        }
+        InputEvent::PointerButton { event } => {
+            handle_pointer_button(state, event.button_code(), event.state(), event.time_msec());
+        }
+        _ => {}
+    }
+}
+
+/// Centralized keyboard shortcut handler (shared between winit & libinput)
+fn handle_key(
+    app_state: &mut AppState,
+    modifiers: &smithay::input::keyboard::ModifiersState,
+    keysym: u32,
+) -> FilterResult<()> {
+    // Ctrl+Alt+F1..F12 → switch virtual terminal (TTY / libseat mode)
+    if modifiers.ctrl && modifiers.alt && !modifiers.logo {
+        if let Some(vt) = vt_number_from_keysym(keysym) {
+            if let Some(mut session) = app_state.session.clone() {
+                if session.change_vt(vt).is_ok() {
+                    return FilterResult::Intercept(());
+                }
+            }
+        }
+    }
+
+    if !modifiers.logo {
+        return FilterResult::Forward;
+    }
+
+    match keysym {
+        // Super+Enter → spawn kitty
+        xkb::KEY_Return => {
+            let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+            std::process::Command::new("kitty")
+                .env("WAYLAND_DISPLAY", &wayland_display)
+                .env_remove("DISPLAY")
+                .spawn()
+                .ok();
+            FilterResult::Intercept(())
+        }
+
+        // Super+Q → quit WM
+        xkb::KEY_q | xkb::KEY_Q => {
+            app_state.running = false;
+            FilterResult::Intercept(())
+        }
+
+        // Super+Escape → quit WM
+        xkb::KEY_Escape => {
+            app_state.running = false;
+            FilterResult::Intercept(())
+        }
+
+        // Super+Right → focus next window
+        xkb::KEY_Right => {
+            app_state.focus_next(true);
+            FilterResult::Intercept(())
+        }
+
+        // Super+Left → focus previous window
+        xkb::KEY_Left => {
+            app_state.focus_next(false);
+            FilterResult::Intercept(())
+        }
+
+        // Super+Up → focus next window (same as Right)
+        xkb::KEY_Up => {
+            app_state.focus_next(true);
+            FilterResult::Intercept(())
+        }
+
+        // Super+Down → focus previous window (same as Left)
+        xkb::KEY_Down => {
+            app_state.focus_next(false);
+            FilterResult::Intercept(())
+        }
+
+        // Super+W → close focused window
+        xkb::KEY_w | xkb::KEY_W => {
+            let focused = app_state.seat.get_keyboard().unwrap().current_focus();
+            if let Some(surf) = focused {
+                if let Some(win) = app_state.space.elements()
+                    .find(|w| {
+                        w.toplevel()
+                            .map(|t| t.wl_surface() == &surf)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                {
+                    if let Some(toplevel) = win.toplevel() {
+                        toplevel.send_close();
+                    }
+                }
+            }
+            FilterResult::Intercept(())
+        }
+
+        _ => FilterResult::Forward,
+    }
+}
+
+fn vt_number_from_keysym(keysym: u32) -> Option<i32> {
+    match keysym {
+        xkb::KEY_F1 => Some(1),
+        xkb::KEY_F2 => Some(2),
+        xkb::KEY_F3 => Some(3),
+        xkb::KEY_F4 => Some(4),
+        xkb::KEY_F5 => Some(5),
+        xkb::KEY_F6 => Some(6),
+        xkb::KEY_F7 => Some(7),
+        xkb::KEY_F8 => Some(8),
+        xkb::KEY_F9 => Some(9),
+        xkb::KEY_F10 => Some(10),
+        xkb::KEY_F11 => Some(11),
+        xkb::KEY_F12 => Some(12),
+        _ => None,
+    }
+}
+
+/// Update pointer position and find the window under cursor
+fn handle_pointer_motion(
+    state: &mut AppState,
+    x: f64,
+    y: f64,
+    serial: smithay::utils::Serial,
+    time: u32,
+) {
+    // Clamp to screen bounds
+    let screen = state.output_size();
+    let x = x.clamp(0.0, (screen.w - 1) as f64);
+    let y = y.clamp(0.0, (screen.h - 1) as f64);
+    let pos: smithay::utils::Point<f64, smithay::utils::Logical> = (x, y).into();
+
+    state.pointer_location = pos;
+
+    // --- Super+LMB tile resize ---
+    if let (Some(resize_win), Some((start_x, start_y)), Some(_start_geo)) = (
+        state.resize_window.clone(),
+        state.resize_start_ptr,
+        state.resize_start_geo,
+    ) {
+        let dx = (x - start_x) as i32;
+        let dy = (y - start_y) as i32;
+
+        if dx == 0 && dy == 0 {
+            return;
+        }
+
+        let screen = state.output_size();
+        let delta = state
+            .tile_tree
+            .as_ref()
+            .and_then(|tree| tree.split_dir_for(&resize_win))
+            .map(|dir| match dir {
+                SplitDir::H => dx as f64 / screen.w as f64,
+                SplitDir::V => dy as f64 / screen.h as f64,
+            })
+            .unwrap_or(0.0);
+
+        if delta == 0.0 {
+            return;
+        }
+
+        if let Some(mut tree) = state.tile_tree.take() {
+            if tree.adjust_ratio(&resize_win, delta) {
+                state.tile_tree = Some(tree);
+                state.resize_start_ptr = Some((x, y));
+                state.recalculate_layout();
+                state.needs_render = true;
+            } else {
+                state.tile_tree = Some(tree);
+            }
+        }
+        return;
+    }
+
+    // Find surface under pointer for hover focus
+    let under = state.space.element_under(pos).and_then(|(w, loc)| {
+        let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc.x as f64, loc.y as f64).into();
+        w.toplevel().map(|t| (t.wl_surface().clone(), loc_f64))
+    });
+
+    if let Some(ptr) = state.seat.get_pointer() {
+        ptr.motion(state, under, &MotionEvent { location: pos, serial, time });
+        state.needs_render = true;
+    }
+}
+
+/// Shared click-to-focus + Super+LMB tile resize
+fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonState, time_msec: u32) {
+    let serial = SERIAL_COUNTER.next_serial();
+    let pos = state.pointer_location;
+
+    // End resize on LMB release even if Super was released first
+    if button == BTN_LEFT && btn_state == ButtonState::Released && state.resize_window.is_some() {
+        state.end_resize();
+        return;
+    }
+
+    // Check if Super is held
+    // No keyboard yet (early init) — can't determine Super state, bail safely.
+    let Some(kbd) = state.seat.get_keyboard() else { return };
+    let super_held = kbd.modifier_state().logo;
+
+    // Super + Left Mouse Button → start tile resize
+    if button == BTN_LEFT && super_held && btn_state == ButtonState::Pressed {
+        let win = state.space.element_under(pos).map(|(w, _)| w.clone());
+        if let Some(win) = win {
+            let geo = state.space.element_geometry(&win).unwrap_or_default();
+            state.resize_window = Some(win);
+            state.resize_start_ptr = Some((pos.x, pos.y));
+            state.resize_start_geo = Some(geo);
+        }
+        return;
+    }
+
+    // While resizing, ignore other pointer button events
+    if state.resize_window.is_some() {
+        return;
+    }
+
+    if btn_state == ButtonState::Pressed {
+        let window = state.space.element_under(pos).map(|(w, _)| w.clone());
+        if let Some(window) = window {
+            let win_clone = window.clone();
+            state.focus_window(&win_clone);
+        } else {
+            // Click on empty space → unfocus
+            let serial2 = SERIAL_COUNTER.next_serial();
+            if let Some(kbd) = state.seat.get_keyboard() {
+                kbd.set_focus(state, None, serial2);
+                state.needs_render = true;
+            }
+        }
+    }
+
+    if let Some(ptr) = state.seat.get_pointer() {
+        ptr.button(
+            state,
+            &ButtonEvent {
+                button,
+                state: btn_state,
+                serial,
+                time: time_msec,
+            },
+        );
+        state.needs_render = true;
+    }
+}
