@@ -267,22 +267,26 @@ impl CompositorHandler for AppState {
     fn commit(&mut self, surface: &WlSurface) {
         // Обновляем буферы рендера
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
-        // Обновляем bbox всех окон которые используют эту поверхность
-        let mut relayout = false;
-        for window in self.space.elements() {
+        // Обновляем bbox окна, используя эту поверхность.
+        // ВАЖНО: recalculate_layout() здесь не вызываем — это создаёт петлю:
+        // commit → configure → commit → configure → ...  (~30–40% CPU).
+        // Тайловые позиции уже сохранены в space при map_element.
+        // Нужно только обновить внутреннее состояние окна через on_commit()
+        // и переприложить текущую позицию из space (без отправки нового configure).
+        for window in self.space.elements().cloned().collect::<Vec<_>>() {
             if window.wl_surface().as_ref().map(|s| s.as_ref()) == Some(surface) {
                 window.on_commit();
-                relayout = true;
+                // Повторно маппируем на текущей позиции, чтобы обновить bbox.
+                if let Some(geo) = self.space.element_geometry(&window) {
+                    self.space.map_element(window, geo.loc, false);
+                }
                 break;
             }
         }
-        // Keep tiled geometry after client commits (prevents snap-back).
-        if relayout && self.tile_tree.is_some() && self.resize_window.is_none() {
-            self.recalculate_layout();
-        }
-        // A new buffer was committed, so the screen needs redrawing.
+        // Новый буфер — экран нужно перерисовать.
         self.needs_render = true;
     }
+
 }
 
 smithay::delegate_compositor!(AppState);
