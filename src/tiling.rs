@@ -1,4 +1,4 @@
-/// BSP/Dwindle tiling tree for peredozWM.
+/// BSP/Dwindle tiling tree for sandboxWM.
 ///
 /// Every node is either:
 ///   - Leaf(Window)  – an actual window taking up a rectangle

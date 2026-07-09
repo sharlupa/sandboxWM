@@ -1,4 +1,4 @@
-/// DRM/KMS + libinput backend — запуск peredozWM прямо из TTY.
+/// DRM/KMS + libinput backend — запуск sandboxWM прямо из TTY.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -54,16 +54,7 @@ pub fn run_tty(
     println!("=====> Сессия: {seat_name}");
     state.session = Some(session.clone());
 
-    loop_handle.insert_source(notifier, |event, _, state| match event {
-        SessionEvent::ActivateSession => {
-            state.session_paused = false;
-            println!("[session] активна");
-        }
-        SessionEvent::PauseSession => {
-            state.session_paused = true;
-            println!("[session] пауза");
-        }
-    })?;
+
 
     // 2. GPU
     let gpu_path = primary_gpu(&seat_name)?
@@ -172,6 +163,38 @@ pub fn run_tty(
 
     println!("=====> DRM compositor готов!");
 
+    // 7.4. libinput
+    use smithay::reexports::input as libinput_raw;
+    let mut libinput_ctx =
+        libinput_raw::Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
+    libinput_ctx.udev_assign_seat(&seat_name).unwrap();
+    let libinput_backend = LibinputInputBackend::new(libinput_ctx.clone());
+    loop_handle.insert_source(libinput_backend, |event, _, state| {
+        process_libinput_event(state, event);
+    })?;
+
+    // 7.5. Обработка событий сессии (VT-переключения)
+    let compositor_session = compositor.clone();
+    let mut libinput_session = libinput_ctx;
+    loop_handle.insert_source(notifier, move |event, _, state| match event {
+        SessionEvent::ActivateSession => {
+            state.session_paused = false;
+            state.needs_render = true;
+            if let Err(e) = libinput_session.resume() {
+                eprintln!("[libinput] Ошибка при resume: {:?}", e);
+            }
+            if let Err(e) = compositor_session.borrow_mut().reset_state() {
+                eprintln!("[DRM] Ошибка при сбросе состояния после активации сессии: {:?}", e);
+            }
+            println!("[session] активна");
+        }
+        SessionEvent::PauseSession => {
+            state.session_paused = true;
+            libinput_session.suspend();
+            println!("[session] пауза");
+        }
+    })?;
+
     // 8. VBlank — обязательно подтверждаем каждый кадр
     let compositor_vb = compositor.clone();
     loop_handle.insert_source(drm_notifier, move |event, _, _| {
@@ -180,15 +203,6 @@ pub fn run_tty(
         }
     })?;
 
-    // 9. libinput
-    use smithay::reexports::input as libinput_raw;
-    let mut libinput_ctx =
-        libinput_raw::Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
-    libinput_ctx.udev_assign_seat(&seat_name).unwrap();
-    let libinput_backend = LibinputInputBackend::new(libinput_ctx);
-    loop_handle.insert_source(libinput_backend, |event, _, state| {
-        process_libinput_event(state, event);
-    })?;
 
     // 10. udev hotplug
     let udev_backend = UdevBackend::new(&seat_name)?;

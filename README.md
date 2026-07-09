@@ -162,9 +162,3 @@ cargo run --release
 # Нативный режим (из TTY, требует libseat, libdrm, libgbm, драйвер EGL):
 cargo run --release
 ```
-
----
-
-## Примечания
-- В `Cargo.toml` и комментариях в коде местами осталось старое имя — его стоит переименовать в `sandboxWM`.
-- Корневой `test.rs` больше не нужен (макрос `render_elements!` перенесён в `src/render.rs`).
