@@ -225,11 +225,13 @@ pub fn run_tty(
                 .map(CustomRenderElements::Space)
                 .collect();
 
-            // Программный курсор поверх окон. `pointer_location` хранится в
-            // logical координатах; from_buffer принимает physical-позицию, поэтому
-            // переводим через to_physical(1.0) (scale = 1.0 у DRM-вывода).
+            // Программный курсор поверх окон. `render_frame` принимает элементы
+            // в порядке front-to-back: первый элемент в слайсе рисуется поверх
+            // всех остальных. Поэтому вставляем курсор в начало вектора.
+            // `pointer_location` хранится в logical координатах; from_buffer
+            // принимает physical-позицию, поэтому переводим через to_physical(1.0).
             let cursor_loc = state.pointer_location.to_physical(1.0).to_i32_round();
-            elements.push(CustomRenderElements::Cursor(
+            elements.insert(0, CustomRenderElements::Cursor(
                 SolidColorRenderElement::from_buffer(
                     &cursor_buf,
                     cursor_loc,
