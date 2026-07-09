@@ -108,12 +108,45 @@ fn handle_key(
     modifiers: &smithay::input::keyboard::ModifiersState,
     keysym: u32,
 ) -> FilterResult<()> {
-    // Ctrl+Alt+F1..F12 → switch virtual terminal (TTY / libseat mode)
-    if modifiers.ctrl && modifiers.alt && !modifiers.logo {
-        if let Some(vt) = vt_number_from_keysym(keysym) {
+    // Ctrl+Alt+F1..F12 → switch virtual terminal (TTY / libseat mode).
+    // On standard Linux XKB keymaps, Ctrl+Alt+Fn produces XKB_KEY_XF86Switch_VT_N
+    // (not KEY_Fn). We handle both cases:
+    //   1. modified_sym() returns XF86Switch_VT_N directly (most common).
+    //   2. modified_sym() returns KEY_Fn + Ctrl+Alt modifiers (rare layouts).
+    {
+        let sym = keysym;
+        // Case 1: XKB already mapped it to XF86Switch_VT_N
+        let vt_from_xf86 = match sym {
+            0x1008_FE01 => Some(1),
+            0x1008_FE02 => Some(2),
+            0x1008_FE03 => Some(3),
+            0x1008_FE04 => Some(4),
+            0x1008_FE05 => Some(5),
+            0x1008_FE06 => Some(6),
+            0x1008_FE07 => Some(7),
+            0x1008_FE08 => Some(8),
+            0x1008_FE09 => Some(9),
+            0x1008_FE0A => Some(10),
+            0x1008_FE0B => Some(11),
+            0x1008_FE0C => Some(12),
+            _ => None,
+        };
+        // Case 2: layout keeps KEY_Fn but Ctrl+Alt are held
+        let vt_from_fn = if modifiers.ctrl && modifiers.alt && !modifiers.logo {
+            vt_number_from_keysym(sym)
+        } else {
+            None
+        };
+        if let Some(vt) = vt_from_xf86.or(vt_from_fn) {
             if let Some(mut session) = app_state.session.clone() {
-                if session.change_vt(vt).is_ok() {
-                    return FilterResult::Intercept(());
+                match session.change_vt(vt) {
+                    Ok(_) => {
+                        println!("[VT] переключение на VT{vt} успешно");
+                        return FilterResult::Intercept(());
+                    }
+                    Err(e) => {
+                        eprintln!("[VT] ошибка переключения на VT{vt}: {e:?}");
+                    }
                 }
             }
         }
