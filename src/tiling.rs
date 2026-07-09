@@ -82,6 +82,27 @@ impl TileNode {
         }
     }
 
+    /// Return the area of the immediate parent split of `target`.
+    pub fn parent_area_for(
+        &self,
+        target: &Window,
+        total: Rectangle<i32, Logical>,
+    ) -> Option<Rectangle<i32, Logical>> {
+        match self {
+            TileNode::Leaf(_) => None,
+            TileNode::Split { dir, ratio, left, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (TileNode::Leaf(w), _) if w == target => Some(total),
+                    (_, TileNode::Leaf(w)) if w == target => Some(total),
+                    _ => {
+                        let (a, b) = split_rect(total, *dir, *ratio);
+                        left.parent_area_for(target, a).or_else(|| right.parent_area_for(target, b))
+                    }
+                }
+            }
+        }
+    }
+
     /// Walk the tree and collect `(window, final_rect)` with `gaps_in` applied to every leaf.
     pub fn collect_rects(
         &self,
@@ -121,11 +142,15 @@ impl TileNode {
             TileNode::Leaf(_) => false,
             TileNode::Split { ratio, left, right, .. } => match (left.as_mut(), right.as_mut()) {
                 (TileNode::Leaf(w), _) if w == target => {
+                    let old_ratio = *ratio;
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    log::info!("adjust_ratio (left child): delta={}, ratio changed from {} to {}", delta, old_ratio, *ratio);
                     true
                 }
                 (_, TileNode::Leaf(w)) if w == target => {
-                    *ratio = (*ratio - delta).clamp(0.1, 0.9);
+                    let old_ratio = *ratio;
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    log::info!("adjust_ratio (right child): delta={}, ratio changed from {} to {}", delta, old_ratio, *ratio);
                     true
                 }
                 (left, right) => left.adjust_ratio(target, delta) || right.adjust_ratio(target, delta),

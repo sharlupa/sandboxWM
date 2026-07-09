@@ -276,13 +276,23 @@ fn handle_pointer_motion(
         }
 
         let screen = state.output_size();
+        let gaps_out = 8i32;
+        let screen_rect = smithay::utils::Rectangle::new(
+            (gaps_out, gaps_out).into(),
+            (screen.w - gaps_out * 2, screen.h - gaps_out * 2).into()
+        );
+
         let delta = state
             .tile_tree
             .as_ref()
-            .and_then(|tree| tree.split_dir_for(&resize_win))
-            .map(|dir| match dir {
-                SplitDir::H => dx as f64 / screen.w as f64,
-                SplitDir::V => dy as f64 / screen.h as f64,
+            .and_then(|tree| {
+                let dir = tree.split_dir_for(&resize_win)?;
+                let parent_area = tree.parent_area_for(&resize_win, screen_rect)?;
+                Some((dir, parent_area))
+            })
+            .map(|(dir, parent_area)| match dir {
+                SplitDir::H => dx as f64 / parent_area.size.w as f64,
+                SplitDir::V => dy as f64 / parent_area.size.h as f64,
             })
             .unwrap_or(0.0);
 

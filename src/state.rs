@@ -276,9 +276,11 @@ impl CompositorHandler for AppState {
         for window in self.space.elements().cloned().collect::<Vec<_>>() {
             if window.wl_surface().as_ref().map(|s| s.as_ref()) == Some(surface) {
                 window.on_commit();
-                // Повторно маппируем на текущей позиции, чтобы обновить bbox.
-                if let Some(geo) = self.space.element_geometry(&window) {
-                    self.space.map_element(window, geo.loc, false);
+                // Повторно маппируем на текущей позиции, чтобы обновить bbox (как просил пользователь),
+                // но используем чистую позицию из space (element_location),
+                // чтобы избежать сдвигов из-за теней/декораций (element_geometry).
+                if let Some(loc) = self.space.element_location(&window) {
+                    self.space.map_element(window, loc, false);
                 }
                 break;
             }
