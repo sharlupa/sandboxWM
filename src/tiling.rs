@@ -82,26 +82,7 @@ impl TileNode {
         }
     }
 
-    /// Return the area of the immediate parent split of `target`.
-    pub fn parent_area_for(
-        &self,
-        target: &Window,
-        total: Rectangle<i32, Logical>,
-    ) -> Option<Rectangle<i32, Logical>> {
-        match self {
-            TileNode::Leaf(_) => None,
-            TileNode::Split { dir, ratio, left, right } => {
-                match (left.as_ref(), right.as_ref()) {
-                    (TileNode::Leaf(w), _) if w == target => Some(total),
-                    (_, TileNode::Leaf(w)) if w == target => Some(total),
-                    _ => {
-                        let (a, b) = split_rect(total, *dir, *ratio);
-                        left.parent_area_for(target, a).or_else(|| right.parent_area_for(target, b))
-                    }
-                }
-            }
-        }
-    }
+
 
     /// Walk the tree and collect `(window, final_rect)` with `gaps_in` applied to every leaf.
     pub fn collect_rects(
@@ -122,39 +103,60 @@ impl TileNode {
         }
     }
 
-    /// Split direction of the immediate parent of `target`, if any.
-    pub fn split_dir_for(&self, target: &Window) -> Option<SplitDir> {
-        match self {
-            TileNode::Leaf(_) => None,
-            TileNode::Split { dir, left, right, .. } => match (left.as_ref(), right.as_ref()) {
-                (TileNode::Leaf(w), _) if w == target => Some(*dir),
-                (_, TileNode::Leaf(w)) if w == target => Some(*dir),
-                _ => left
-                    .split_dir_for(target)
-                    .or_else(|| right.split_dir_for(target)),
-            },
-        }
+    /// Resizes the target window by adjusting the nearest horizontal and vertical splits.
+    /// `dx` and `dy` are pixel deltas. `drag_left` and `drag_top` indicate which edges of the window are being dragged.
+    pub fn resize_target(&mut self, target: &Window, dx: f64, dy: f64, drag_left: bool, drag_top: bool, area: Rectangle<i32, Logical>) -> bool {
+        self.resize_target_impl(target, dx, dy, drag_left, drag_top, area).is_some()
     }
 
-    /// Adjust the ratio of the immediate parent split of `target` by `delta`.
-    pub fn adjust_ratio(&mut self, target: &Window, delta: f64) -> bool {
+    /// Returns `Some((needs_h, needs_v))` where booleans indicate if a horizontal/vertical drag hasn't been consumed yet.
+    fn resize_target_impl(&mut self, target: &Window, dx: f64, dy: f64, drag_left: bool, drag_top: bool, area: Rectangle<i32, Logical>) -> Option<(bool, bool)> {
         match self {
-            TileNode::Leaf(_) => false,
-            TileNode::Split { ratio, left, right, .. } => match (left.as_mut(), right.as_mut()) {
-                (TileNode::Leaf(w), _) if w == target => {
-                    let old_ratio = *ratio;
-                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
-                    log::info!("adjust_ratio (left child): delta={}, ratio changed from {} to {}", delta, old_ratio, *ratio);
-                    true
+            TileNode::Leaf(w) => {
+                if w == target {
+                    // Reached the target. We now need to consume horizontal and vertical delta by traversing up.
+                    Some((true, true))
+                } else {
+                    None
                 }
-                (_, TileNode::Leaf(w)) if w == target => {
-                    let old_ratio = *ratio;
-                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
-                    log::info!("adjust_ratio (right child): delta={}, ratio changed from {} to {}", delta, old_ratio, *ratio);
-                    true
+            }
+            TileNode::Split { dir, ratio, left, right } => {
+                let (a, b) = split_rect(area, *dir, *ratio);
+                
+                // Check if target is in the left child
+                if let Some((mut needs_h, mut needs_v)) = left.resize_target_impl(target, dx, dy, drag_left, drag_top, a) {
+                    if *dir == SplitDir::H && needs_h && !drag_left {
+                        // Dragging right edge of the target, and this split IS that right edge.
+                        let delta_ratio = dx / area.size.w as f64;
+                        *ratio = (*ratio + delta_ratio).clamp(0.05, 0.95);
+                        needs_h = false; // Consumed
+                    } else if *dir == SplitDir::V && needs_v && !drag_top {
+                        // Dragging bottom edge of the target, and this split IS that bottom edge.
+                        let delta_ratio = dy / area.size.h as f64;
+                        *ratio = (*ratio + delta_ratio).clamp(0.05, 0.95);
+                        needs_v = false; // Consumed
+                    }
+                    return Some((needs_h, needs_v));
                 }
-                (left, right) => left.adjust_ratio(target, delta) || right.adjust_ratio(target, delta),
-            },
+                
+                // Check if target is in the right child
+                if let Some((mut needs_h, mut needs_v)) = right.resize_target_impl(target, dx, dy, drag_left, drag_top, b) {
+                    if *dir == SplitDir::H && needs_h && drag_left {
+                        // Dragging left edge of the target, and this split IS that left edge.
+                        let delta_ratio = dx / area.size.w as f64;
+                        *ratio = (*ratio + delta_ratio).clamp(0.05, 0.95);
+                        needs_h = false; // Consumed
+                    } else if *dir == SplitDir::V && needs_v && drag_top {
+                        // Dragging top edge of the target, and this split IS that top edge.
+                        let delta_ratio = dy / area.size.h as f64;
+                        *ratio = (*ratio + delta_ratio).clamp(0.05, 0.95);
+                        needs_v = false; // Consumed
+                    }
+                    return Some((needs_h, needs_v));
+                }
+                
+                None
+            }
         }
     }
 
@@ -290,6 +292,6 @@ pub fn split_rect(
 pub fn shrink(rect: Rectangle<i32, Logical>, gaps: i32) -> Rectangle<i32, Logical> {
     Rectangle::new(
         (rect.loc.x + gaps, rect.loc.y + gaps).into(),
-        ((rect.size.w - gaps * 2).max(1), (rect.size.h - gaps * 2).max(1)).into(),
+        ((rect.size.w - gaps * 2).max(100), (rect.size.h - gaps * 2).max(100)).into(),
     )
 }

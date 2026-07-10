@@ -54,7 +54,7 @@ pub struct AppState {
     // Tiling / resize state
     pub resize_window: Option<Window>,
     pub resize_start_ptr: Option<(f64, f64)>,
-    pub resize_start_geo: Option<Rectangle<i32, Logical>>,
+    pub resize_edges: Option<(bool, bool)>, // (drag_left, drag_top)
     pub tile_tree: Option<crate::tiling::TileNode>,
 
     // TTY session (None in winit/nested mode)
@@ -95,7 +95,7 @@ impl AppState {
             running: true,
             resize_window: None,
             resize_start_ptr: None,
-            resize_start_geo: None,
+            resize_edges: None,
             tile_tree: None,
             session: None,
             session_paused: false,
@@ -105,14 +105,13 @@ impl AppState {
         }
     }
 
-    /// Finish an active tile resize and re-apply the saved layout.
     pub fn end_resize(&mut self) {
         if self.resize_window.is_none() {
             return;
         }
         self.resize_window = None;
         self.resize_start_ptr = None;
-        self.resize_start_geo = None;
+        self.resize_edges = None;
         self.recalculate_layout();
         self.needs_render = true;
     }
@@ -154,8 +153,30 @@ impl AppState {
     }
 
     fn apply_window_geometry(&mut self, window: &Window, rect: Rectangle<i32, Logical>) {
-        // Re-map at the correct position
-        self.space.map_element(window.clone(), rect.loc, false);
+        let current_buffer_geo = window.geometry();
+        let mut loc = rect.loc;
+
+        if let Some(old_geo) = self.space.element_geometry(window) {
+            let old_left = old_geo.loc.x;
+            let old_right = old_geo.loc.x + old_geo.size.w;
+            let target_right = rect.loc.x + rect.size.w;
+            
+            let old_top = old_geo.loc.y;
+            let old_bottom = old_geo.loc.y + old_geo.size.h;
+            let target_bottom = rect.loc.y + rect.size.h;
+            
+            // If the right edge is conceptually fixed, anchor visual location to the right
+            if (target_right - old_right).abs() < 5 && (rect.loc.x - old_left).abs() > 0 {
+                loc.x = target_right - current_buffer_geo.size.w;
+            }
+            
+            // If the bottom edge is conceptually fixed, anchor visual location to the bottom
+            if (target_bottom - old_bottom).abs() < 5 && (rect.loc.y - old_top).abs() > 0 {
+                loc.y = target_bottom - current_buffer_geo.size.h;
+            }
+        }
+
+        self.space.map_element(window.clone(), loc, false);
 
         // Ask the client to resize its surface — but only if the size actually
         // changed. Sending a configure with the same size on every relayout used
@@ -164,15 +185,14 @@ impl AppState {
         // window again. Comparing against the already-acked `current_state`
         // breaks that feedback loop after a single round-trip.
         if let Some(toplevel) = window.toplevel() {
-            let already = toplevel
-                .current_state()
-                .size
-                .map(|s| s == rect.size)
-                .unwrap_or(false);
-            if !already {
-                toplevel.with_pending_state(|state| {
+            let mut changed = false;
+            toplevel.with_pending_state(|state| {
+                if state.size != Some(rect.size.into()) {
                     state.size = Some(rect.size.into());
-                });
+                    changed = true;
+                }
+            });
+            if changed {
                 toplevel.send_configure();
             }
         }
@@ -267,24 +287,19 @@ impl CompositorHandler for AppState {
     fn commit(&mut self, surface: &WlSurface) {
         // Обновляем буферы рендера
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
-        // Обновляем bbox окна, используя эту поверхность.
-        // ВАЖНО: recalculate_layout() здесь не вызываем — это создаёт петлю:
-        // commit → configure → commit → configure → ...  (~30–40% CPU).
-        // Тайловые позиции уже сохранены в space при map_element.
-        // Нужно только обновить внутреннее состояние окна через on_commit()
-        // и переприложить текущую позицию из space (без отправки нового configure).
+        
         for window in self.space.elements().cloned().collect::<Vec<_>>() {
             if window.wl_surface().as_ref().map(|s| s.as_ref()) == Some(surface) {
                 window.on_commit();
-                // Повторно маппируем на текущей позиции, чтобы обновить bbox (как просил пользователь),
-                // но используем чистую позицию из space (element_location),
-                // чтобы избежать сдвигов из-за теней/декораций (element_geometry).
-                if let Some(loc) = self.space.element_location(&window) {
-                    self.space.map_element(window, loc, false);
-                }
                 break;
             }
         }
+        
+        // Keep tiled geometry after client commits, allows gravity anchor to re-sync
+        if self.tile_tree.is_some() {
+            self.recalculate_layout();
+        }
+        
         // Новый буфер — экран нужно перерисовать.
         self.needs_render = true;
     }

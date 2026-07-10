@@ -15,7 +15,7 @@ use smithay::{
     utils::SERIAL_COUNTER,
 };
 use crate::state::AppState;
-use crate::tiling::SplitDir;
+
 
 // BTN_LEFT = 272 (0x110)
 const BTN_LEFT: u32 = 272;
@@ -89,8 +89,7 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
             let serial = SERIAL_COUNTER.next_serial();
             let dx = event.delta_x();
             let dy = event.delta_y();
-            let Some(ptr) = state.seat.get_pointer() else { return };
-            let cur = ptr.current_location();
+            let cur = state.pointer_location;
             let new_pos = (cur.x + dx, cur.y + dy);
 
             handle_pointer_motion(state, new_pos.0, new_pos.1, serial, event.time_msec());
@@ -263,15 +262,15 @@ fn handle_pointer_motion(
     state.pointer_location = pos;
 
     // --- Super+LMB tile resize ---
-    if let (Some(resize_win), Some((start_x, start_y)), Some(_start_geo)) = (
+    if let (Some(resize_win), Some((start_x, start_y)), Some((drag_left, drag_top))) = (
         state.resize_window.clone(),
         state.resize_start_ptr,
-        state.resize_start_geo,
+        state.resize_edges,
     ) {
-        let dx = (x - start_x) as i32;
-        let dy = (y - start_y) as i32;
+        let dx = x - start_x;
+        let dy = y - start_y;
 
-        if dx == 0 && dy == 0 {
+        if dx == 0.0 && dy == 0.0 {
             return;
         }
 
@@ -282,26 +281,8 @@ fn handle_pointer_motion(
             (screen.w - gaps_out * 2, screen.h - gaps_out * 2).into()
         );
 
-        let delta = state
-            .tile_tree
-            .as_ref()
-            .and_then(|tree| {
-                let dir = tree.split_dir_for(&resize_win)?;
-                let parent_area = tree.parent_area_for(&resize_win, screen_rect)?;
-                Some((dir, parent_area))
-            })
-            .map(|(dir, parent_area)| match dir {
-                SplitDir::H => dx as f64 / parent_area.size.w as f64,
-                SplitDir::V => dy as f64 / parent_area.size.h as f64,
-            })
-            .unwrap_or(0.0);
-
-        if delta == 0.0 {
-            return;
-        }
-
         if let Some(mut tree) = state.tile_tree.take() {
-            if tree.adjust_ratio(&resize_win, delta) {
+            if tree.resize_target(&resize_win, dx, dy, drag_left, drag_top, screen_rect) {
                 state.tile_tree = Some(tree);
                 state.resize_start_ptr = Some((x, y));
                 state.recalculate_layout();
@@ -346,9 +327,16 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
         let win = state.space.element_under(pos).map(|(w, _)| w.clone());
         if let Some(win) = win {
             let geo = state.space.element_geometry(&win).unwrap_or_default();
+            
+            // Determine which quadrant the user clicked in to decide which edges to move
+            let rel_x = (pos.x - geo.loc.x as f64) / geo.size.w as f64;
+            let rel_y = (pos.y - geo.loc.y as f64) / geo.size.h as f64;
+            let drag_left = rel_x < 0.5;
+            let drag_top = rel_y < 0.5;
+
             state.resize_window = Some(win);
             state.resize_start_ptr = Some((pos.x, pos.y));
-            state.resize_start_geo = Some(geo);
+            state.resize_edges = Some((drag_left, drag_top));
         }
         return;
     }
