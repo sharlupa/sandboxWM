@@ -28,7 +28,8 @@ pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) 
             let keycode = event.key_code();
             let key_state = event.state();
 
-            state.seat.get_keyboard().unwrap().input(
+            let Some(kbd) = state.seat.get_keyboard() else { return };
+            kbd.input(
                 state,
                 keycode,
                 key_state,
@@ -70,7 +71,8 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
             let keycode = event.key_code();
             let key_state = event.state();
 
-            state.seat.get_keyboard().unwrap().input(
+            let Some(kbd) = state.seat.get_keyboard() else { return };
+            kbd.input(
                 state,
                 keycode,
                 key_state,
@@ -205,7 +207,10 @@ fn handle_key(
 
         // Super+W → close focused window
         xkb::KEY_w | xkb::KEY_W => {
-            let focused = app_state.seat.get_keyboard().unwrap().current_focus();
+            let Some(kbd) = app_state.seat.get_keyboard() else {
+                return FilterResult::Intercept(());
+            };
+            let focused = kbd.current_focus();
             if let Some(surf) = focused {
                 if let Some(win) = app_state.space.elements()
                     .find(|w| {

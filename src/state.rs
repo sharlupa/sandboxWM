@@ -202,20 +202,29 @@ impl AppState {
     pub fn focus_window(&mut self, window: &Window) {
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
 
-        // Deactivate all windows first, then activate the target
+        // Deactivate all windows first, then activate the target.
+        // Dirty-check: only send a configure to windows whose activated state
+        // actually changed. Previously every focus switch sent a configure to
+        // ALL N windows, triggering an O(N) burst of client re-commits.
         let windows: Vec<Window> = self.space.elements().cloned().collect();
         for w in &windows {
             let is_target = w == window;
-            w.set_activated(is_target);
             if let Some(toplevel) = w.toplevel() {
+                let mut changed = false;
                 toplevel.with_pending_state(|state| {
-                    if is_target {
+                    let already = state.states.contains(xdg_toplevel::State::Activated);
+                    if is_target && !already {
                         state.states.set(xdg_toplevel::State::Activated);
-                    } else {
+                        changed = true;
+                    } else if !is_target && already {
                         state.states.unset(xdg_toplevel::State::Activated);
+                        changed = true;
                     }
                 });
-                toplevel.send_configure();
+                w.set_activated(is_target);
+                if changed {
+                    toplevel.send_configure();
+                }
             }
         }
 
@@ -287,19 +296,29 @@ impl CompositorHandler for AppState {
     fn commit(&mut self, surface: &WlSurface) {
         // Обновляем буферы рендера
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
-        
-        for window in self.space.elements().cloned().collect::<Vec<_>>() {
+
+        // Найдём окно, которому принадлежит эта поверхность, и обновим его bbox.
+        // ВАЖНО: recalculate_layout() здесь НЕ вызываем — это создаёт петлю
+        // commit → configure → commit → ... (~30–40% CPU на простое рабочем столе,
+        // т.к. мигание курсора терминала триггерит commit). Тайловые позиции
+        // выставляются в new_toplevel / toplevel_destroyed / handle_pointer_motion.
+        let mut found = None;
+        for window in self.space.elements() {
             if window.wl_surface().as_ref().map(|s| s.as_ref()) == Some(surface) {
-                window.on_commit();
+                found = Some(window.clone());
                 break;
             }
         }
-        
-        // Keep tiled geometry after client commits, allows gravity anchor to re-sync
-        if self.tile_tree.is_some() {
-            self.recalculate_layout();
+        if let Some(window) = found {
+            window.on_commit();
+            // Только во время активного resize переприменяем позицию из дерева,
+            // чтобы gravity-anchor корректно синхронизировался. На простое
+            // (мигание курсора) позиция уже выставлена и перерасчёт не нужен.
+            if self.resize_window.is_some() {
+                self.recalculate_layout();
+            }
         }
-        
+
         // Новый буфер — экран нужно перерисовать.
         self.needs_render = true;
     }
