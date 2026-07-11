@@ -92,14 +92,61 @@ fn run_winit(
     state.space.map_output(&output, (0, 0));
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
+    // DMA-BUF (zero-copy) for winit/nested mode.
+    //
+    // Bind the GLES renderer's EGL reader to the display (Mesa clients need
+    // either this wl_drm binding or a v4 dmabuf feedback). Then advertise the
+    // linux-dmabuf global built from the renderer's supported formats, so GPU
+    // clients can submit buffers as dmabuf file descriptors instead of wl_shm.
+    use smithay::backend::renderer::{ImportEgl, ImportDma};
+    if let Err(e) = backend.renderer().bind_wl_display(&state.display_handle) {
+        eprintln!("[Winit] EGL bind_wl_display failed: {e:?}");
+    }
+
+    let dmabuf_formats = backend.renderer().dmabuf_formats();
+    use smithay::backend::egl::EGLDevice;
+    let render_node = EGLDevice::device_for_display(backend.renderer().egl_context().display())
+        .and_then(|device| device.try_get_render_node());
+    let dmabuf_state = &mut state.dmabuf_state;
+    match render_node {
+        Ok(Some(node)) => {
+            let feedback =
+                smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats)
+                    .build()
+                    .expect("failed to build dmabuf feedback");
+            let global = dmabuf_state
+                .create_global_with_default_feedback::<AppState>(&state.display_handle, &feedback);
+            state.dmabuf_global = Some(global);
+        }
+        _ => {
+            // No render node (e.g. running on a non-Mesa stack): fall back to
+            // the simpler v3 global that advertises only the format list.
+            eprintln!("[Winit] render node not found, dmabuf using v3 fallback");
+            let global =
+                dmabuf_state.create_global::<AppState>(&state.display_handle, dmabuf_formats);
+            state.dmabuf_global = Some(global);
+        }
+    }
+
     loop_handle.insert_source(winit_loop, move |event, _, state| {
         match event {
             WinitEvent::Resized { size, .. } => {
                 let new_mode = Mode { size, refresh: 60_000 };
                 output.change_current_state(Some(new_mode), None, None, None);
+                // Defer layout to the Redraw handler — during drag-resize
+                // of the winit window, Resized fires at the mouse event rate
+                // (100-1000 Hz). layout_dirty batches them to ~60 Hz.
+                state.layout_dirty = true;
+                state.needs_render = true;
+                backend.window().request_redraw();
             }
             WinitEvent::Input(input_event) => {
                 input::process_input_event(state, input_event);
+                // If input set needs_render (resize, etc.), schedule a
+                // Redraw so the render loop picks it up.
+                if state.needs_render {
+                    backend.window().request_redraw();
+                }
             }
             WinitEvent::Redraw => {
                 let size = backend.window_size();
@@ -107,11 +154,14 @@ fn run_winit(
                     return;
                 }
 
-                // Damage-gated redraw: only do the heavy render_output / send_frame
-                // work when something actually changed. The outer event loop is
-                // already throttled by dispatch(16ms), so even a no-op Redraw is
-                // cheap; this just avoids burning a full GPU frame on an idle
-                // desktop. Always request the next redraw to keep the loop alive.
+                // Process deferred layout (resize, winit window resize).
+                // This runs at most once per frame (~60 Hz) instead of
+                // once per mouse event (100-1000 Hz).
+                if state.layout_dirty {
+                    state.recalculate_layout();
+                    state.layout_dirty = false;
+                }
+
                 if state.needs_render {
                     let age = backend.buffer_age().unwrap_or(0);
                     let render_res = if let Ok((renderer, mut fb)) = backend.bind() {
@@ -156,7 +206,16 @@ fn run_winit(
                     state.needs_render = false;
                 }
 
-                backend.window().request_redraw();
+                // Only request the next frame when there is something to
+                // draw. Previously this was UNCONDITIONAL — it kept a
+                // Redraw event permanently in the winit event queue, so
+                // calloop's dispatch(16ms) NEVER actually blocked, turning
+                // the main loop into a busy-spin that constantly ran
+                // dispatch_clients + flush_clients even on a fully idle
+                // desktop.
+                if state.needs_render || state.layout_dirty {
+                    backend.window().request_redraw();
+                }
             }
             WinitEvent::CloseRequested => {
                 state.running = false;

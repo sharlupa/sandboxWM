@@ -163,6 +163,34 @@ pub fn run_tty(
 
     println!("=====> DRM compositor готов!");
 
+    // DMA-BUF (zero-copy): advertise the linux-dmabuf global so GPU clients
+    // (Alacritty, Kitty, browsers...) can hand us video memory directly instead
+    // of round-tripping pixels through wl_shm / RAM.
+    //
+    // Also bind the renderer's EGL buffer reader to our Wayland display. On
+    // Mesa this gives clients the EGL wl_drm interface and lets the GLES
+    // renderer import their dmabufs as textures — the actual zero-copy path.
+    use smithay::backend::renderer::{ImportEgl, ImportDma};
+    match renderer.bind_wl_display(&display_handle) {
+        Ok(()) => println!("=====> EGL hardware-acceleration enabled"),
+        Err(e) => eprintln!("[DRM] EGL bind_wl_display failed: {e:?}"),
+    }
+
+    let dmabuf_formats = renderer.dmabuf_formats();
+    // The GBM device wraps the same DRM node we render on; its dev_id is the
+    // main device clients should target when allocating buffers for us.
+    let main_device = DrmNode::from_path(&gpu_path)
+        .map(|n| n.dev_id())
+        .unwrap_or_else(|_| drm_fd.dev_id().unwrap_or(0));
+    let default_feedback =
+        smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(main_device, dmabuf_formats)
+            .build()
+            .expect("failed to build dmabuf feedback");
+    let dmabuf_global = state.dmabuf_state
+        .create_global_with_default_feedback::<AppState>(&display_handle, &default_feedback);
+    state.dmabuf_global = Some(dmabuf_global);
+    println!("=====> DMA-BUF (zero-copy) global создан");
+
     // 7.4. libinput
     use smithay::reexports::input as libinput_raw;
     let mut libinput_ctx =
@@ -228,6 +256,12 @@ pub fn run_tty(
                 return smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
                     Duration::from_millis(16),
                 );
+            }
+
+            // Process deferred layout (resize, etc.) once per frame.
+            if state.layout_dirty {
+                state.recalculate_layout();
+                state.layout_dirty = false;
             }
 
             // Окна из space, маппим в общий enum с курсором.

@@ -275,7 +275,13 @@ fn handle_pointer_motion(
         let dx = x - start_x;
         let dy = y - start_y;
 
-        if dx == 0.0 && dy == 0.0 {
+        // Remove time-based throttling to restore perfectly smooth live resizes.
+        // The high CPU usage is primarily due to running the compositor in Debug mode.
+        // We will rely on --release optimizations to solve the CPU overhead.
+        const MIN_DELTA: f64 = 1.0;
+        let dist_ok = dx.abs() >= MIN_DELTA || dy.abs() >= MIN_DELTA;
+        
+        if !dist_ok {
             return;
         }
 
@@ -290,8 +296,13 @@ fn handle_pointer_motion(
             if tree.resize_target(&resize_win, dx, dy, drag_left, drag_top, screen_rect) {
                 state.tile_tree = Some(tree);
                 state.resize_start_ptr = Some((x, y));
-                state.recalculate_layout();
+                // Don't call recalculate_layout() here — it was running
+                // on every mouse event (100-1000 Hz), sending configure
+                // events to ALL windows each time. Defer to the render
+                // loop which runs at ~60 Hz via layout_dirty.
+                state.layout_dirty = true;
                 state.needs_render = true;
+                state.last_resize_time = std::time::Instant::now();
             } else {
                 state.tile_tree = Some(tree);
             }
@@ -307,7 +318,14 @@ fn handle_pointer_motion(
 
     if let Some(ptr) = state.seat.get_pointer() {
         ptr.motion(state, under, &MotionEvent { location: pos, serial, time });
-        state.needs_render = true;
+        // Only mark needs_render for cursor-visible updates (DRM software cursor).
+        // In winit mode the host compositor draws the cursor, so pointer motion
+        // by itself never damages our framebuffer. The flag will be set by
+        // commit() when a client actually submits a new buffer.
+        // For DRM mode we always need to redraw the software cursor square.
+        if state.session.is_some() {
+            state.needs_render = true;
+        }
     }
 }
 

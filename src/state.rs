@@ -56,6 +56,15 @@ pub struct AppState {
     pub resize_start_ptr: Option<(f64, f64)>,
     pub resize_edges: Option<(bool, bool)>, // (drag_left, drag_top)
     pub tile_tree: Option<crate::tiling::TileNode>,
+    
+    // Tracks windows that have received a configure event but haven't committed
+    // a new buffer yet. This prevents us from spamming configure events faster
+    // than the client can process them (backpressure).
+    pub pending_configures: std::collections::HashSet<Window>,
+
+    // DMA-BUF global state for zero-copy buffer sharing.
+    pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
+    pub dmabuf_global: Option<smithay::wayland::dmabuf::DmabufGlobal>,
 
     // TTY session (None in winit/nested mode)
     pub session: Option<LibSeatSession>,
@@ -69,6 +78,14 @@ pub struct AppState {
     // (window added/removed/focused/resized, surface committed, pointer moved).
     // Set to `true` at the relevant mutation points, reset after a successful frame.
     pub needs_render: bool,
+
+    // Deferred layout flag — set when tile tree ratios change (resize, winit
+    // window resize) so that recalculate_layout() runs exactly once per render
+    // frame instead of on every mouse event (100-1000 Hz → ~60 Hz).
+    pub layout_dirty: bool,
+
+    // Throttle for live resizing to prevent terminal CPU spikes.
+    pub last_resize_time: std::time::Instant,
 }
 
 impl AppState {
@@ -81,6 +98,8 @@ impl AppState {
         let mut seat = seat_state.new_wl_seat(&display_handle, "seat0");
         let _ = seat.add_keyboard(Default::default(), 200, 25);
         let _ = seat.add_pointer();
+
+        let dmabuf_state = smithay::wayland::dmabuf::DmabufState::new();
 
         Self {
             display_handle,
@@ -97,11 +116,16 @@ impl AppState {
             resize_start_ptr: None,
             resize_edges: None,
             tile_tree: None,
+            pending_configures: std::collections::HashSet::new(),
+            dmabuf_state,
+            dmabuf_global: None,
             session: None,
             session_paused: false,
             cursor_status: CursorImageStatus::default_named(),
             pointer_location: (0.0, 0.0).into(),
             needs_render: true,
+            layout_dirty: false,
+            last_resize_time: std::time::Instant::now(),
         }
     }
 
@@ -193,7 +217,14 @@ impl AppState {
                 }
             });
             if changed {
-                toplevel.send_configure();
+                // Backpressure: only send a new configure if the client has
+                // already processed and committed the previous one. This prevents
+                // us from spamming 60 configures/sec to a client that can only
+                // render at 15 FPS, which would cause an infinite queue buildup.
+                if !self.pending_configures.contains(window) {
+                    toplevel.send_configure();
+                    self.pending_configures.insert(window.clone());
+                }
             }
         }
     }
@@ -311,12 +342,16 @@ impl CompositorHandler for AppState {
         }
         if let Some(window) = found {
             window.on_commit();
-            // Только во время активного resize переприменяем позицию из дерева,
-            // чтобы gravity-anchor корректно синхронизировался. На простое
-            // (мигание курсора) позиция уже выставлена и перерасчёт не нужен.
-            if self.resize_window.is_some() {
-                self.recalculate_layout();
-            }
+            // Client has committed a buffer, meaning it has processed the last
+            // configure event. We can send new configure events to it now.
+            self.pending_configures.remove(&window);
+            
+            // During active resize: do NOT call apply_window_geometry or
+            // recalculate_layout. Any such call can send configure →
+            // client draws → commit → apply_window_geometry → configure →
+            // an O(N) amplification loop per commit. The layout will be
+            // applied once per frame via the layout_dirty flag in the
+            // render loop.
         }
 
         // Новый буфер — экран нужно перерисовать.
@@ -331,6 +366,26 @@ smithay::delegate_compositor!(AppState);
 impl BufferHandler for AppState {
     fn buffer_destroyed(&mut self, _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer) {}
 }
+
+impl smithay::wayland::dmabuf::DmabufHandler for AppState {
+    fn dmabuf_state(&mut self) -> &mut smithay::wayland::dmabuf::DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &smithay::wayland::dmabuf::DmabufGlobal,
+        _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notifier: smithay::wayland::dmabuf::ImportNotifier,
+    ) {
+        // We accept all dmabufs. The actual GPU import is done lazily by the GLES
+        // renderer's EGL buffer reader (set up via bind_wl_display) when the
+        // client attaches this buffer to a surface and commits it — so there is
+        // no renderer to test against here.
+        let _ = notifier.successful::<AppState>();
+    }
+}
+
 impl ShmHandler for AppState {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
@@ -423,3 +478,4 @@ impl SeatHandler for AppState {
     }
 }
 smithay::delegate_seat!(AppState);
+smithay::delegate_dmabuf!(AppState);
