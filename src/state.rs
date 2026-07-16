@@ -30,6 +30,22 @@ pub struct ClientState {
     pub compositor_state: CompositorClientState,
 }
 
+/// Режим раскладки окон. Переключается горячей клавишей Super+G.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Жёсткий тайлинг (BSP/Dwindle) — поведение до Phase 1.
+    Tiling,
+    /// Физический режим: окна = динамические тела rapier2d на бесконечном
+    /// холсте с гравитацией и полом.
+    Physics,
+}
+
+impl Default for LayoutMode {
+    fn default() -> Self {
+        LayoutMode::Tiling
+    }
+}
+
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
@@ -56,6 +72,26 @@ pub struct AppState {
     pub resize_start_ptr: Option<(f64, f64)>,
     pub resize_edges: Option<(bool, bool)>, // (drag_left, drag_top)
     pub tile_tree: Option<crate::tiling::TileNode>,
+
+    // ── Физический режим (Phase 1) ──────────────────────────────────────
+    // Текущий режим раскладки. Tiling — жёсткий тайлинг (поведение до Phase 1,
+    // безопасный откат). Physics — окна становятся динамическими телами rapier2d
+    // на бесконечном холсте с гравитацией и полом.
+    pub layout_mode: LayoutMode,
+    // Физический мир; None в Tiling-режиме, инициализируется при переключении.
+    pub physics: Option<crate::physics::WindowPhysics>,
+    // Связь окна Smithay ↔ тело rapier. Window — клонируемый Rc-хендл
+    // (Hash+Eq), поэтому работает как ключ HashMap.
+    pub window_bodies: std::collections::HashMap<Window, rapier2d::prelude::RigidBodyHandle>,
+    // Смещение камеры в мировых координатах. Камера реализуется через
+    // map_output(&output, (-cam_x, -cam_y)) — Smithay сам конвертирует мир→экран.
+    pub camera_offset: (f64, f64),
+    // Окно, которое сейчас таскают мышью в физическом режиме, и его тело.
+    pub drag_body: Option<(Window, rapier2d::prelude::RigidBodyHandle)>,
+    pub drag_last_ptr: Option<(f64, f64)>,
+    // Таймстеп симуляции (совпадает с тем, что задан в physics.set_dt()).
+    // Нужен в step_physics для расчёта скорости drag_to.
+    pub physics_dt: f32,
     
     // Tracks windows that have received a configure event but haven't committed
     // a new buffer yet. This prevents us from spamming configure events faster
@@ -116,6 +152,13 @@ impl AppState {
             resize_start_ptr: None,
             resize_edges: None,
             tile_tree: None,
+            layout_mode: LayoutMode::default(),
+            physics: None,
+            window_bodies: std::collections::HashMap::new(),
+            camera_offset: (0.0, 0.0),
+            drag_body: None,
+            drag_last_ptr: None,
+            physics_dt: 1.0 / 60.0,
             pending_configures: std::collections::HashSet::new(),
             dmabuf_state,
             dmabuf_global: None,
@@ -138,6 +181,214 @@ impl AppState {
         self.resize_edges = None;
         self.recalculate_layout();
         self.needs_render = true;
+    }
+
+    // ── Физический режим (Phase 1) ──────────────────────────────────────
+
+    /// Переключает между Tiling и Physics. Вызывается по Super+G.
+    pub fn toggle_physics(&mut self) {
+        match self.layout_mode {
+            LayoutMode::Tiling => self.enter_physics_mode(),
+            LayoutMode::Physics => self.exit_physics_mode(),
+        }
+        self.needs_render = true;
+    }
+
+    /// Tiling → Physics. Создаёт физический мир и спавнит тело для каждого
+    /// уже отрисованного окна по его текущей позиции/размеру в Space.
+    fn enter_physics_mode(&mut self) {
+        let mut phys = crate::physics::WindowPhysics::new();
+        phys.set_dt(self.physics_dt);
+        self.window_bodies.clear();
+
+        // Снимаем снапшот геометрий до borrow phys.
+        let geoms: Vec<(Window, Rectangle<i32, Logical>)> = self
+            .space
+            .elements()
+            .filter_map(|w| {
+                let geo = self.space.element_geometry(w)?;
+                Some((w.clone(), geo))
+            })
+            .collect();
+
+        for (win, geo) in geoms {
+            // Центр окна в мировых координатах. Камера сейчас (0,0), поэтому
+            // мировые координаты = экранные на момент переключения.
+            let cx = geo.loc.x as f32 + geo.size.w as f32 * 0.5;
+            let cy = geo.loc.y as f32 + geo.size.h as f32 * 0.5;
+            let handle = phys.spawn_window(cx, cy, geo.size.w as f32, geo.size.h as f32);
+            self.window_bodies.insert(win, handle);
+        }
+
+        self.physics = Some(phys);
+        self.layout_mode = LayoutMode::Physics;
+        self.drag_body = None;
+        self.drag_last_ptr = None;
+        println!("[physics] режим включён, {} окон", self.window_bodies.len());
+    }
+
+    /// Physics → Tiling. Убирает все тела и возвращается к жёсткому тайлингу.
+    fn exit_physics_mode(&mut self) {
+        self.physics = None;
+        self.window_bodies.clear();
+        self.drag_body = None;
+        self.drag_last_ptr = None;
+        self.camera_offset = (0.0, 0.0);
+        self.layout_mode = LayoutMode::Tiling;
+        // Пересчитываем тайлы — окна встанут на свои места.
+        self.recalculate_layout();
+        println!("[physics] режим выключен, возврат к тайлингу");
+    }
+
+    /// Один шаг физики + применение трансформ тел к окнам. Вызывается из
+    /// рендер-цикла (~60 Hz) только в физическом режиме.
+    pub fn step_physics(&mut self) {
+        let Some(phys) = self.physics.as_mut() else {
+            return;
+        };
+        // Если таскаем тело мышью — двигаем его к курсору через скорость
+        // (drag_to), а не телепортом. Телепорт динамического тела каждый
+        // кадр заставлял solver разрешать внезапное проникновение в пол/
+        // соседние окна как жёсткий контакт — отсюда были рывки при drag,
+        // даже когда CPU/RAM были в норме.
+        let dt = self.physics_dt;
+        if let Some((_, handle)) = self.drag_body {
+            if let Some((x, y)) = self.drag_last_ptr {
+                phys.drag_to(handle, x as f32, y as f32, dt);
+            }
+        }
+        phys.step();
+        // Держим needs_render поднятым, пока хоть одно тело двигается — иначе
+        // рендер-цикл уснёт и симуляция застынет. Когда всё улеглось, рендер
+        // засыпает (это и нужно для энергосбережения на idle столе).
+        let moving = phys.any_moving() || self.drag_body.is_some();
+        self.apply_physics_layout();
+        if moving {
+            self.needs_render = true;
+        }
+    }
+
+    /// Читает трансформы всех тел и применяет их к окнам через существующий
+    /// apply_window_geometry (он делает map_element + backpressured configure).
+    fn apply_physics_layout(&mut self) {
+        // Собираем (окно, трансформ, размер) полностью, отпуская borrow phys,
+        // и только потом мутируем self через apply_window_geometry.
+        let transforms: Vec<(Window, (f32, f32), smithay::utils::Size<i32, Logical>)> = {
+            let Some(phys) = self.physics.as_ref() else {
+                return;
+            };
+            self.window_bodies
+                .iter()
+                .filter_map(|(win, handle)| {
+                    let (cx, cy, _angle) = phys.body_transform(*handle)?;
+                    let size = self
+                        .space
+                        .element_geometry(win)
+                        .map(|g| g.size)
+                        .unwrap_or_else(|| (100, 100).into());
+                    Some((win.clone(), (cx, cy), size))
+                })
+                .collect()
+        };
+        for (win, (cx, cy), size) in transforms {
+            // Позиция тела = центр; переводим в top-left для Space.
+            let loc = (
+                (cx - size.w as f32 * 0.5).round() as i32,
+                (cy - size.h as f32 * 0.5).round() as i32,
+            ).into();
+            let rect = Rectangle::new(loc, size);
+            self.apply_window_geometry(&win, rect);
+        }
+    }
+
+    /// Смещает камеру на `(dx, dy)` в мировых координатах. Фактическое
+    /// смещение вида применяется в рендер-цикле через map_output.
+    pub fn move_camera(&mut self, dx: f64, dy: f64) {
+        self.camera_offset.0 += dx;
+        self.camera_offset.1 += dy;
+        self.needs_render = true;
+    }
+
+    /// Спавнит тело для нового окна в физическом режиме. Окно появляется
+    /// сверху видимой области и падает на пол/на другие окна.
+    pub fn physics_spawn_window(&mut self, win: &Window) {
+        // Вычисляем координаты до borrow phys, чтобы не конфликтовать с
+        //borrow self.physics и self.output_size()/window_bodies.
+        let spawn_x = self.camera_offset.0 as f32
+            + self.output_size().w as f32 * 0.5
+            + (self.window_bodies.len() as f32 % 8.0 - 4.0) * 40.0;
+        let spawn_y = self.camera_offset.1 as f32 - 100.0; // чуть выше верхнего края
+        let geo_size = win.geometry().size;
+        let w = geo_size.w.max(100) as f32;
+        let h = geo_size.h.max(100) as f32;
+        let Some(phys) = self.physics.as_mut() else {
+            return;
+        };
+        let handle = phys.spawn_window(spawn_x, spawn_y, w, h);
+        self.window_bodies.insert(win.clone(), handle);
+    }
+
+    /// Убирает тело окна при его закрытии в физическом режиме.
+    pub fn physics_remove_window(&mut self, win: &Window) {
+        if let Some(handle) = self.window_bodies.remove(win) {
+            if let Some(phys) = self.physics.as_mut() {
+                phys.remove_window(handle);
+            }
+        }
+    }
+
+    /// Находит тело окна под курсором (мировые координаты) для drag. Возвращает
+    /// окно + хендл тела, если курсор попадает в bounding-box тела.
+    pub fn physics_pick(&self, world_x: f64, world_y: f64) -> Option<(Window, rapier2d::prelude::RigidBodyHandle)> {
+        let phys = self.physics.as_ref()?;
+        for (win, handle) in self.window_bodies.iter() {
+            if let Some((cx, cy, _)) = phys.body_transform(*handle) {
+                let size = self
+                    .space
+                    .element_geometry(win)
+                    .map(|g| g.size)
+                    .unwrap_or_else(|| (100, 100).into());
+                let hw = size.w as f64 * 0.5;
+                let hh = size.h as f64 * 0.5;
+                if (world_x - cx as f64).abs() <= hw && (world_y - cy as f64).abs() <= hh {
+                    return Some((win.clone(), *handle));
+                }
+            }
+        }
+        None
+    }
+
+    /// Начинает/обновляет/заканчивает drag тела в физическом режиме.
+    pub fn physics_drag_begin(&mut self, world_x: f64, world_y: f64) -> bool {
+        if self.layout_mode != LayoutMode::Physics {
+            return false;
+        }
+        if let Some(picked) = self.physics_pick(world_x, world_y) {
+            self.drag_body = Some(picked);
+            self.drag_last_ptr = Some((world_x, world_y));
+            // Будим тело, чтобы оно не спало во время drag.
+            if let Some(phys) = self.physics.as_mut() {
+                if let Some((_, h)) = self.drag_body {
+                    phys.set_window_velocity(h, 0.0, 0.0);
+                }
+            }
+            self.needs_render = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn physics_drag_update(&mut self, world_x: f64, world_y: f64) {
+        if self.drag_body.is_some() {
+            self.drag_last_ptr = Some((world_x, world_y));
+            self.needs_render = true;
+        }
+    }
+
+    pub fn physics_drag_end(&mut self) {
+        self.drag_body = None;
+        self.drag_last_ptr = None;
     }
 
     /// Get the screen size from the first mapped output.
@@ -412,20 +663,25 @@ impl XdgShellHandler for AppState {
         surface.send_configure();
 
         let window = Window::new_wayland_window(surface);
-        // Пока кладём наверху (будет перемещён layout-ом)
+        // Пока кладём наверху (будет перемещён layout-ом / физикой)
         self.space.map_element(window.clone(), (0, 0), true);
 
-        // Обновляем BSP дерево
-        let focused = self.get_focused_window();
-        if let Some(tree) = self.tile_tree.take() {
-            let target = focused.unwrap_or_else(|| window.clone());
-            self.tile_tree = Some(tree.insert(&target, window.clone(), self.output_rect()));
+        if self.layout_mode == LayoutMode::Physics {
+            // В физическом режиме окно становится телом; позицию выставит
+            // apply_physics_layout в следующем кадре. Тайл-дерево не трогаем.
+            self.physics_spawn_window(&window);
         } else {
-            self.tile_tree = Some(crate::tiling::TileNode::Leaf(window.clone()));
+            // Обновляем BSP дерево
+            let focused = self.get_focused_window();
+            if let Some(tree) = self.tile_tree.take() {
+                let target = focused.unwrap_or_else(|| window.clone());
+                self.tile_tree = Some(tree.insert(&target, window.clone(), self.output_rect()));
+            } else {
+                self.tile_tree = Some(crate::tiling::TileNode::Leaf(window.clone()));
+            }
+            // Пересчитываем тайловую раскладку для всех окон
+            self.recalculate_layout();
         }
-
-        // Пересчитываем тайловую раскладку для всех окон
-        self.recalculate_layout();
 
         // Передаём клавиатурный фокус новому окну
         self.focus_window(&window);
@@ -439,13 +695,19 @@ impl XdgShellHandler for AppState {
             .cloned();
         if let Some(window) = window {
             self.space.unmap_elem(&window);
-            
-            if let Some(tree) = self.tile_tree.take() {
+
+            if self.layout_mode == LayoutMode::Physics {
+                self.physics_remove_window(&window);
+                // Если таскали именно это окно — сбрасываем drag.
+                if self.drag_body.as_ref().map(|(w, _)| w == &window).unwrap_or(false) {
+                    self.physics_drag_end();
+                }
+            } else if let Some(tree) = self.tile_tree.take() {
                 self.tile_tree = tree.remove(&window);
+                // Пересчитываем тайловую раскладку
+                self.recalculate_layout();
             }
-            
-            // Пересчитываем тайловую раскладку
-            self.recalculate_layout();
+
             // Фокус — последнее окно если есть (clone раньше borrow)
             let next_win = self.space.elements().next_back().cloned();
             if let Some(win) = next_win {

@@ -15,6 +15,7 @@ use smithay::{
     utils::SERIAL_COUNTER,
 };
 use crate::state::AppState;
+use crate::state::LayoutMode;
 
 
 // BTN_LEFT = 272 (0x110)
@@ -169,6 +170,12 @@ fn handle_key(
             FilterResult::Intercept(())
         }
 
+        // Super+G → toggle Tiling ↔ Physics
+        xkb::KEY_g | xkb::KEY_G => {
+            app_state.toggle_physics();
+            FilterResult::Intercept(())
+        }
+
         // Super+Q → quit WM
         xkb::KEY_q | xkb::KEY_Q => {
             app_state.running = false;
@@ -181,27 +188,40 @@ fn handle_key(
             FilterResult::Intercept(())
         }
 
-        // Super+Right → focus next window
+        // Super+Right/Left/Up/Down → focus (Tiling) или камера (Physics)
         xkb::KEY_Right => {
-            app_state.focus_next(true);
+            if app_state.layout_mode == LayoutMode::Physics {
+                app_state.move_camera(120.0, 0.0);
+            } else {
+                app_state.focus_next(true);
+            }
             FilterResult::Intercept(())
         }
 
-        // Super+Left → focus previous window
         xkb::KEY_Left => {
-            app_state.focus_next(false);
+            if app_state.layout_mode == LayoutMode::Physics {
+                app_state.move_camera(-120.0, 0.0);
+            } else {
+                app_state.focus_next(false);
+            }
             FilterResult::Intercept(())
         }
 
-        // Super+Up → focus next window (same as Right)
         xkb::KEY_Up => {
-            app_state.focus_next(true);
+            if app_state.layout_mode == LayoutMode::Physics {
+                app_state.move_camera(0.0, -120.0);
+            } else {
+                app_state.focus_next(true);
+            }
             FilterResult::Intercept(())
         }
 
-        // Super+Down → focus previous window (same as Left)
         xkb::KEY_Down => {
-            app_state.focus_next(false);
+            if app_state.layout_mode == LayoutMode::Physics {
+                app_state.move_camera(0.0, 120.0);
+            } else {
+                app_state.focus_next(false);
+            }
             FilterResult::Intercept(())
         }
 
@@ -258,6 +278,23 @@ fn handle_pointer_motion(
     serial: smithay::utils::Serial,
     time: u32,
 ) {
+    // ── Физический режим: drag тела мышью ───────────────────────────────
+    // Курсор здесь — экранные координаты; переводим в мировые (+ camera_offset).
+    // В физическом режиме нет clamp к экрану — мир бесконечен, но сам курсор
+    // устройства ограничен output'ом, что нормально.
+    if state.layout_mode == LayoutMode::Physics {
+        let world_x = x + state.camera_offset.0;
+        let world_y = y + state.camera_offset.1;
+        state.physics_drag_update(world_x, world_y);
+        // Обновим позицию устройства (для курсора/фокуса).
+        let pos: smithay::utils::Point<f64, smithay::utils::Logical> = (x, y).into();
+        state.pointer_location = pos;
+        if let Some(ptr) = state.seat.get_pointer() {
+            ptr.motion(state, None, &MotionEvent { location: pos, serial, time });
+        }
+        return;
+    }
+
     // Clamp to screen bounds
     let screen = state.output_size();
     let x = x.clamp(0.0, (screen.w - 1) as f64);
@@ -280,7 +317,7 @@ fn handle_pointer_motion(
         // We will rely on --release optimizations to solve the CPU overhead.
         const MIN_DELTA: f64 = 1.0;
         let dist_ok = dx.abs() >= MIN_DELTA || dy.abs() >= MIN_DELTA;
-        
+
         if !dist_ok {
             return;
         }
@@ -329,10 +366,29 @@ fn handle_pointer_motion(
     }
 }
 
-/// Shared click-to-focus + Super+LMB tile resize
+/// Shared click-to-focus + Super+LMB tile resize (Tiling) / LMB drag body (Physics)
 fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonState, time_msec: u32) {
     let serial = SERIAL_COUNTER.next_serial();
     let pos = state.pointer_location;
+
+    // ── Физический режим: ЛКМ тащит тело ────────────────────────────────
+    if state.layout_mode == LayoutMode::Physics && button == BTN_LEFT {
+        let world_x = pos.x + state.camera_offset.0;
+        let world_y = pos.y + state.camera_offset.1;
+        if btn_state == ButtonState::Pressed {
+            // Фокусируем окно под курсором и начинаем drag тела.
+            if state.physics_drag_begin(world_x, world_y) {
+                // Возьмём окно из drag_body для фокуса.
+                if let Some((win, _)) = state.drag_body.clone() {
+                    state.focus_window(&win);
+                }
+            }
+        } else if btn_state == ButtonState::Released {
+            state.physics_drag_end();
+        }
+        state.needs_render = true;
+        return;
+    }
 
     // End resize on LMB release even if Super was released first
     if button == BTN_LEFT && btn_state == ButtonState::Released && state.resize_window.is_some() {
@@ -350,7 +406,7 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
         let win = state.space.element_under(pos).map(|(w, _)| w.clone());
         if let Some(win) = win {
             let geo = state.space.element_geometry(&win).unwrap_or_default();
-            
+
             // Determine which quadrant the user clicked in to decide which edges to move
             let rel_x = (pos.x - geo.loc.x as f64) / geo.size.w as f64;
             let rel_y = (pos.y - geo.loc.y as f64) / geo.size.h as f64;

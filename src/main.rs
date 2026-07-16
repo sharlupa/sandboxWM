@@ -3,6 +3,7 @@ pub mod input;
 pub mod backend_drm;
 pub mod tiling;
 pub mod render;
+pub mod physics;
 
 use std::sync::Arc;
 use smithay::reexports::calloop::EventLoop;
@@ -21,10 +22,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let in_tty = std::env::var("WAYLAND_DISPLAY").is_err()
         && std::env::var("DISPLAY").is_err();
 
-    let mut event_loop: EventLoop<AppState> = EventLoop::try_new()?;
+    let event_loop: EventLoop<AppState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
-    let mut display: Display<AppState> = Display::new()?;
+    let display: Display<AppState> = Display::new()?;
     let display_handle = display.handle();
 
     let mut state = AppState::new(display_handle.clone());
@@ -44,18 +45,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if in_tty {
         // ── TTY / DRM режим ──────────────────────────────────────────────
+        // run_tty() takes ownership of event_loop + display, runs the main
+        // dispatch loop internally, and handles all DRM/EGL/GBM resource
+        // cleanup in the correct order before returning.
+        //
+        // state.session (the last LibSeatSession Arc) drops when main()
+        // returns — AFTER all native DRM/EGL resources are already gone.
         println!("=====> Режим: DRM/KMS (TTY)");
-        backend_drm::run_tty(&mut event_loop, display_handle, &mut state)?;
-
-        while state.running {
-            event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)?;
-            display.dispatch_clients(&mut state)?;
-            display.flush_clients()?;
-        }
+        drop(loop_handle);
+        backend_drm::run_tty(event_loop, display, &mut state)?;
     } else {
         // ── Winit режим (вложенное окно в X11 / Wayland) ─────────────────
         println!("=====> Режим: Winit (вложенное окно)");
         run_winit(event_loop, display, state, socket_name)?;
+        return Ok(());
     }
 
     Ok(())
@@ -152,6 +155,20 @@ fn run_winit(
                 let size = backend.window_size();
                 if size.w == 0 || size.h == 0 {
                     return;
+                }
+
+                // ── Физический режим: шаг симуляции + камера ─────────────
+                // map_output смещает вид: world = screen + camera_offset.
+                // В Tiling-режиме камера всегда (0,0) — output на месте.
+                if state.layout_mode == crate::state::LayoutMode::Physics {
+                    state.space.map_output(
+                        &output,
+                        (-state.camera_offset.0 as i32, -state.camera_offset.1 as i32),
+                    );
+                    // Шаг физики продвигает симуляцию и применяет трансформы
+                    // тел к окнам. Держит needs_render поднятым, пока тела
+                    // двигаются; когда всё улеглось — рендер уснёт.
+                    state.step_physics();
                 }
 
                 // Process deferred layout (resize, winit window resize).

@@ -12,7 +12,7 @@ sandboxWM is an experiment at the intersection of a Window Manager and a physics
 
 A detailed description of the final vision is available in [`sandboxWM_concept_EN.md`](./sandboxWM_concept_EN.md).
 
-> ⚠️ **Status:** Early version (`0.1.0`). A basic tiling WM based on Smithay is currently implemented, featuring an optimized renderer and a software cursor. The physics engine, drawing, deformations, and slicing are the **goals**, not yet finished features (see the "Current Implementation vs. Final Concept" section).
+> ⚠️ **Status:** Early version (`0.1.0`). A basic tiling WM based on Smithay with optimized rendering and a software cursor. Phase 1 physics is now implemented: pressing `Super+G` switches to physics mode where windows become dynamic rapier2d bodies with gravity on an infinite canvas, and the camera is moved with arrow keys. Drawing, deformations, joints, and slicing are still **goals** (see the "Current Implementation vs. Final Concept" section).
 
 ---
 
@@ -28,7 +28,7 @@ This project is actively developed in collaboration with AI coding assistants (n
 |------|------------|:-------------------:|
 | Language | Rust | ✅ |
 | Wayland Compositor | Smithay 0.7 | ✅ |
-| Physics Engine | rapier2d | 📋 Planned |
+| Physics Engine | rapier2d | ✅ Phase 1 (gravity, bodies, camera) |
 | Rendering | wgpu / glow | 📋 Planned (currently GLES via Smithay) |
 
 ---
@@ -93,7 +93,7 @@ A "knife" tool cuts a single application (e.g., Telegram) into pieces — the co
 | VT Switching (`Ctrl+Alt+F1..F12`) | ✅ Implemented |
 | On-demand Rendering (damage-gating) | ✅ Implemented |
 | Software Cursor in DRM/KMS mode | ✅ Implemented |
-| Physics engine rapier2d / gravity | 📋 Concept |
+| Physics engine rapier2d / gravity (Phase 1) | ✅ `Super+G` toggle, infinite canvas, camera, window drag |
 | Drawing physical lines (steel/glue/trampoline/rope) | 📋 Concept |
 | Session persistence (serde → JSON/TOML) | 📋 Concept |
 | Window joining (Weld/Spring joints) | 📋 Concept |
@@ -117,6 +117,9 @@ src/
 │                     hotkeys, click-to-focus, mouse tiling resize.
 ├── tiling.rs       — BSP/Dwindle tile tree (TileNode): insert, remove,
 │                     recalculate geometries, resize ratios.
+├── physics.rs      — rapier2d wrapper (WindowPhysics): physics world,
+│                     gravity, static floor, spawn/remove window bodies,
+│                     simulation step, body transform → window mapping.
 └── render.rs       — CustomRenderElements (enum macro wrapper),
                       combines window surface elements and the software cursor.
 sandboxWM_concept.md — Final project vision (concept in Russian).
@@ -143,9 +146,11 @@ Split direction is chosen automatically based on aspect ratio; deleting a leaf c
 | `Super + Enter` | Spawn terminal `kitty` |
 | `Super + Q` / `Esc` | Quit WM |
 | `Super + W` | Close active window |
-| `Super + ← / → / ↑ / ↓` | Switch focus |
-| `Super + LMB + drag` | Resize tiling layout |
-| LMB on window | Focus window |
+| `Super + G` | Toggle mode: tiling ↔ physics |
+| `Super + ← / → / ↑ / ↓` | Tiling: switch focus · Physics: move camera |
+| `Super + LMB + drag` | Resize tiling layout (tiling mode) |
+| `LMB + drag (on window)` | Physics mode: drag window body |
+| `LMB on window` | Focus window |
 | `Ctrl + Alt + F1..F12` | Switch VT (TTY/DRM mode only) |
 
 ---

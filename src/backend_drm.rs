@@ -31,7 +31,7 @@ use smithay::{
     reexports::{
         calloop::{timer::Timer, EventLoop},
         drm::control::{connector, Device as ControlDevice, ModeTypeFlags},
-        wayland_server::DisplayHandle,
+        wayland_server::Display,
     },
     utils::{DeviceFd, Transform},
 };
@@ -41,11 +41,12 @@ use crate::render::CustomRenderElements;
 use crate::state::AppState;
 
 pub fn run_tty(
-    event_loop: &mut EventLoop<AppState>,
-    display_handle: DisplayHandle,
+    mut event_loop: EventLoop<AppState>,
+    mut display: Display<AppState>,
     state: &mut AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let loop_handle = event_loop.handle();
+    let display_handle = state.display_handle.clone();
 
     // 1. libseat сессия
     let (session, notifier) = LibSeatSession::new()
@@ -264,6 +265,16 @@ pub fn run_tty(
                 state.layout_dirty = false;
             }
 
+            // ── Физический режим: шаг симуляции + камера ─────────────
+            // map_output смещает вид: world = screen + camera_offset.
+            if state.layout_mode == crate::state::LayoutMode::Physics {
+                state.space.map_output(
+                    &output_t,
+                    (-state.camera_offset.0 as i32, -state.camera_offset.1 as i32),
+                );
+                state.step_physics();
+            }
+
             // Окна из space, маппим в общий enum с курсором.
             let mut elements: Vec<CustomRenderElements> = state
                 .space
@@ -320,6 +331,55 @@ pub fn run_tty(
             )
         },
     )?;
+
+    // ── Main dispatch loop ──────────────────────────────────────────────────
+    while state.running {
+        event_loop.dispatch(Duration::from_millis(16), state)?;
+        display.dispatch_clients(state)?;
+        display.flush_clients()?;
+    }
+
+    // ── Explicit cleanup (correct destruction order) ────────────────────────
+    //
+    // The key invariant: DRM/EGL/GBM native resources must be destroyed
+    // BEFORE the libseat session closes (which revokes the DRM master fd).
+    // Calling any EGL/DRM/GBM function on a revoked fd → SIGSEGV in the
+    // native driver (not a Rust panic — it's FFI).
+    //
+    // event_loop owns all calloop sources whose closures captured:
+    //   • `renderer` (GlesRenderer, moved into the render-timer closure)
+    //   • `compositor_*` (Rc<RefCell<DrmCompositor>> clones)
+    //   • libinput backend (holds a session clone)
+    //
+    // Dropping event_loop releases those closures.  Their Drop impls call
+    // eglDestroyContext, drmModeRmFB, libinput_unref, etc.  At this point
+    // all DRM locals in this function scope (drm, gbm, egl_display, the
+    // original compositor Rc) are still alive, keeping the DRM fd valid.
+    //
+    // After event_loop, we drop display (Wayland server teardown — no DRM).
+    //
+    // Then this function returns.  Rust drops locals in reverse declaration
+    // order: compositor Rc (last ref → DrmCompositor::drop → DRM ioctls),
+    // egl_display (EGL teardown), gbm (GBM device destroy), drm (DRM
+    // device cleanup), session clone (Arc decrement, NOT the last ref).
+    //
+    // Finally, back in main(), `state` drops.  state.session (the last
+    // LibSeatSession Arc) drops → libseat_close_seat() → fd revoked.
+    // By that point every native resource is already gone.  No SIGSEGV.
+
+    // Clear physics state while everything is alive (avoids rapier handles
+    // referencing a partially-torn-down world during field-order drops).
+    state.drag_body = None;
+    state.window_bodies.clear();
+    state.physics = None;
+
+    drop(loop_handle);
+    drop(event_loop);
+    drop(display);
+
+    // Locals (compositor, egl_display, gbm, drm, session clone) drop here
+    // in reverse declaration order — all safe because the DRM fd is still
+    // valid (state.session is the last Arc ref, dropped later in main()).
 
     Ok(())
 }
