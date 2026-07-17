@@ -86,6 +86,7 @@ pub struct AppState {
     // Смещение камеры в мировых координатах. Камера реализуется через
     // map_output(&output, (-cam_x, -cam_y)) — Smithay сам конвертирует мир→экран.
     pub camera_offset: (f64, f64),
+    pub target_camera_offset: (f64, f64),
     // Окно, которое сейчас таскают мышью в физическом режиме, и его тело.
     pub drag_body: Option<(Window, rapier2d::prelude::RigidBodyHandle)>,
     pub drag_last_ptr: Option<(f64, f64)>,
@@ -156,6 +157,7 @@ impl AppState {
             physics: None,
             window_bodies: std::collections::HashMap::new(),
             camera_offset: (0.0, 0.0),
+            target_camera_offset: (0.0, 0.0),
             drag_body: None,
             drag_last_ptr: None,
             physics_dt: 1.0 / 60.0,
@@ -234,6 +236,7 @@ impl AppState {
         self.drag_body = None;
         self.drag_last_ptr = None;
         self.camera_offset = (0.0, 0.0);
+        self.target_camera_offset = (0.0, 0.0);
         self.layout_mode = LayoutMode::Tiling;
         // Пересчитываем тайлы — окна встанут на свои места.
         self.recalculate_layout();
@@ -257,11 +260,29 @@ impl AppState {
                 phys.drag_to(handle, x as f32, y as f32, dt);
             }
         }
-        phys.step();
+        let step_dur = phys.step();
+        
+        // --- ДИАГНОСТИКА ЛАГОВ ---
+        // Печатаем только если шаг занял больше 2мс или идет drag, чтобы не спамить в 60fps
+        if step_dur.as_millis() > 2 || self.drag_body.is_some() {
+            eprintln!("[DEBUG] phys.step() took {:?} | bodies: {}", step_dur, phys.body_count());
+        }
         // Держим needs_render поднятым, пока хоть одно тело двигается — иначе
         // рендер-цикл уснёт и симуляция застынет. Когда всё улеглось, рендер
         // засыпает (это и нужно для энергосбережения на idle столе).
-        let moving = phys.any_moving() || self.drag_body.is_some();
+        let mut moving = phys.any_moving() || self.drag_body.is_some();
+        
+        // Плавная камера (Lerp)
+        let cam_dx = self.target_camera_offset.0 - self.camera_offset.0;
+        let cam_dy = self.target_camera_offset.1 - self.camera_offset.1;
+        if cam_dx * cam_dx + cam_dy * cam_dy > 0.5 {
+            self.camera_offset.0 += cam_dx * 0.15;
+            self.camera_offset.1 += cam_dy * 0.15;
+            moving = true; // продолжаем форсировать 60 FPS, пока камера едет
+        } else {
+            self.camera_offset = self.target_camera_offset;
+        }
+
         self.apply_physics_layout();
         if moving {
             self.needs_render = true;
@@ -304,8 +325,8 @@ impl AppState {
     /// Смещает камеру на `(dx, dy)` в мировых координатах. Фактическое
     /// смещение вида применяется в рендер-цикле через map_output.
     pub fn move_camera(&mut self, dx: f64, dy: f64) {
-        self.camera_offset.0 += dx;
-        self.camera_offset.1 += dy;
+        self.target_camera_offset.0 += dx;
+        self.target_camera_offset.1 += dy;
         self.needs_render = true;
     }
 
@@ -597,6 +618,12 @@ impl CompositorHandler for AppState {
             // configure event. We can send new configure events to it now.
             self.pending_configures.remove(&window);
             
+            // Если мы в физическом режиме, но тело ещё не создано — самое время это сделать!
+            // Теперь геометрия окна будет правильной (а не 0x0).
+            if self.layout_mode == LayoutMode::Physics && !self.window_bodies.contains_key(&window) {
+                self.physics_spawn_window(&window);
+            }
+
             // During active resize: do NOT call apply_window_geometry or
             // recalculate_layout. Any such call can send configure →
             // client draws → commit → apply_window_geometry → configure →
@@ -666,19 +693,19 @@ impl XdgShellHandler for AppState {
         // Пока кладём наверху (будет перемещён layout-ом / физикой)
         self.space.map_element(window.clone(), (0, 0), true);
 
-        if self.layout_mode == LayoutMode::Physics {
-            // В физическом режиме окно становится телом; позицию выставит
-            // apply_physics_layout в следующем кадре. Тайл-дерево не трогаем.
-            self.physics_spawn_window(&window);
+        // Обновляем BSP дерево ВСЕГДА, чтобы при возврате из физического режима
+        // окно корректно стало в тайл.
+        let focused = self.get_focused_window();
+        if let Some(tree) = self.tile_tree.take() {
+            let target = focused.unwrap_or_else(|| window.clone());
+            self.tile_tree = Some(tree.insert(&target, window.clone(), self.output_rect()));
         } else {
-            // Обновляем BSP дерево
-            let focused = self.get_focused_window();
-            if let Some(tree) = self.tile_tree.take() {
-                let target = focused.unwrap_or_else(|| window.clone());
-                self.tile_tree = Some(tree.insert(&target, window.clone(), self.output_rect()));
-            } else {
-                self.tile_tree = Some(crate::tiling::TileNode::Leaf(window.clone()));
-            }
+            self.tile_tree = Some(crate::tiling::TileNode::Leaf(window.clone()));
+        }
+
+        if self.layout_mode == LayoutMode::Physics {
+            // Тело заспавнится в commit() когда клиент впервые отрисует окно
+        } else {
             // Пересчитываем тайловую раскладку для всех окон
             self.recalculate_layout();
         }

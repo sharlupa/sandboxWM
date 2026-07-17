@@ -291,6 +291,9 @@ fn handle_pointer_motion(
         state.pointer_location = pos;
         if let Some(ptr) = state.seat.get_pointer() {
             ptr.motion(state, None, &MotionEvent { location: pos, serial, time });
+            if state.session.is_some() {
+                state.needs_render = true;
+            }
         }
         return;
     }
@@ -348,13 +351,18 @@ fn handle_pointer_motion(
     }
 
     // Find surface under pointer for hover focus
-    let under = state.space.element_under(pos).and_then(|(w, loc)| {
+    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (pos.x + state.camera_offset.0, pos.y + state.camera_offset.1).into();
+    let under = state.space.element_under(world_pos).and_then(|(w, loc)| {
         let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc.x as f64, loc.y as f64).into();
-        w.toplevel().map(|t| (t.wl_surface().clone(), loc_f64))
+        let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
+        w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL).map(|(surf, surf_loc)| {
+            let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64).into();
+            (surf, surf_loc_f64)
+        })
     });
 
     if let Some(ptr) = state.seat.get_pointer() {
-        ptr.motion(state, under, &MotionEvent { location: pos, serial, time });
+        ptr.motion(state, under, &MotionEvent { location: world_pos, serial, time });
         // Only mark needs_render for cursor-visible updates (DRM software cursor).
         // In winit mode the host compositor draws the cursor, so pointer motion
         // by itself never damages our framebuffer. The flag will be set by
@@ -371,23 +379,30 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
     let serial = SERIAL_COUNTER.next_serial();
     let pos = state.pointer_location;
 
-    // ── Физический режим: ЛКМ тащит тело ────────────────────────────────
+    // Check if Super is held
+    let super_held = state.seat.get_keyboard().map(|k| k.modifier_state().logo).unwrap_or(false);
+
+    // ── Физический режим: Super + ЛКМ тащит тело ────────────────────────────────
     if state.layout_mode == LayoutMode::Physics && button == BTN_LEFT {
         let world_x = pos.x + state.camera_offset.0;
         let world_y = pos.y + state.camera_offset.1;
-        if btn_state == ButtonState::Pressed {
+        if btn_state == ButtonState::Pressed && super_held {
             // Фокусируем окно под курсором и начинаем drag тела.
             if state.physics_drag_begin(world_x, world_y) {
                 // Возьмём окно из drag_body для фокуса.
                 if let Some((win, _)) = state.drag_body.clone() {
                     state.focus_window(&win);
                 }
+                state.needs_render = true;
+                return; // Intercept click
             }
         } else if btn_state == ButtonState::Released {
-            state.physics_drag_end();
+            if state.drag_body.is_some() {
+                state.physics_drag_end();
+                state.needs_render = true;
+                return; // Intercept click
+            }
         }
-        state.needs_render = true;
-        return;
     }
 
     // End resize on LMB release even if Super was released first
@@ -396,13 +411,8 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
         return;
     }
 
-    // Check if Super is held
-    // No keyboard yet (early init) — can't determine Super state, bail safely.
-    let Some(kbd) = state.seat.get_keyboard() else { return };
-    let super_held = kbd.modifier_state().logo;
-
-    // Super + Left Mouse Button → start tile resize
-    if button == BTN_LEFT && super_held && btn_state == ButtonState::Pressed {
+    // Super + Left Mouse Button → start tile resize (TILING ONLY)
+    if state.layout_mode == LayoutMode::Tiling && button == BTN_LEFT && super_held && btn_state == ButtonState::Pressed {
         let win = state.space.element_under(pos).map(|(w, _)| w.clone());
         if let Some(win) = win {
             let geo = state.space.element_geometry(&win).unwrap_or_default();
@@ -425,8 +435,26 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
         return;
     }
 
+    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (pos.x + state.camera_offset.0, pos.y + state.camera_offset.1).into();
+    
+    // DEBUG
     if btn_state == ButtonState::Pressed {
-        let window = state.space.element_under(pos).map(|(w, _)| w.clone());
+        if let Some(ptr) = state.seat.get_pointer() {
+            let has_focus = ptr.current_focus().is_some();
+            let msg = format!("[DEBUG] Click at world {:?}! Pointer focus exists: {}\n", world_pos, has_focus);
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/physics_debug.log")
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    f.write_all(msg.as_bytes())
+                });
+        }
+    }
+
+    if btn_state == ButtonState::Pressed {
+        let window = state.space.element_under(world_pos).map(|(w, _)| w.clone());
         if let Some(window) = window {
             let win_clone = window.clone();
             state.focus_window(&win_clone);

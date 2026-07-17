@@ -163,7 +163,7 @@ fn run_winit(
                 if state.layout_mode == crate::state::LayoutMode::Physics {
                     state.space.map_output(
                         &output,
-                        (-state.camera_offset.0 as i32, -state.camera_offset.1 as i32),
+                        (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
                     );
                     // Шаг физики продвигает симуляцию и применяет трансформы
                     // тел к окнам. Держит needs_render поднятым, пока тела
@@ -230,7 +230,8 @@ fn run_winit(
                 // the main loop into a busy-spin that constantly ran
                 // dispatch_clients + flush_clients even on a fully idle
                 // desktop.
-                if state.needs_render || state.layout_dirty {
+                let physics_moving = state.physics.as_ref().map_or(false, |p| p.any_moving()) || state.drag_body.is_some();
+                if state.needs_render || state.layout_dirty || physics_moving {
                     backend.window().request_redraw();
                 }
             }

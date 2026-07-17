@@ -74,8 +74,16 @@ impl WindowPhysics {
     }
 
     /// Продвигает симуляцию на один шаг (`integration_parameters.dt`).
-    pub fn step(&mut self) {
+    /// Возвращает время, затраченное на `world.step()`, для диагностики лагов.
+    pub fn step(&mut self) -> std::time::Duration {
+        let start = std::time::Instant::now();
         self.world.step();
+        start.elapsed()
+    }
+
+    /// Возвращает количество тел в мире.
+    pub fn body_count(&self) -> usize {
+        self.world.bodies.len()
     }
 
     /// Задаёт timestep. Обычно = 1/60. Rapier не принимает dt в `step()`

@@ -253,6 +253,13 @@ pub fn run_tty(
     loop_handle.insert_source(
         Timer::from_duration(Duration::from_millis(16)),
         move |_, _, state| {
+            // ── Физический режим: шаг симуляции ─────────────
+            // Выполняем шаг ДО проверки `needs_render`. Если тела движутся,
+            // `step_physics` сам выставит `needs_render = true`, разбудив рендер.
+            if state.layout_mode == crate::state::LayoutMode::Physics {
+                state.step_physics();
+            }
+
             if state.session_paused || !state.needs_render {
                 return smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
                     Duration::from_millis(16),
@@ -265,14 +272,13 @@ pub fn run_tty(
                 state.layout_dirty = false;
             }
 
-            // ── Физический режим: шаг симуляции + камера ─────────────
+            // ── Физический режим: смещение камеры ─────────────
             // map_output смещает вид: world = screen + camera_offset.
             if state.layout_mode == crate::state::LayoutMode::Physics {
                 state.space.map_output(
                     &output_t,
-                    (-state.camera_offset.0 as i32, -state.camera_offset.1 as i32),
+                    (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
                 );
-                state.step_physics();
             }
 
             // Окна из space, маппим в общий enum с курсором.
