@@ -244,6 +244,11 @@ pub fn run_tty(
     // Курсор — простой белый квадрат 12x12 (рисуется программно как render-element,
     // т.к. в Smithay 0.7 у DrmCompositor нет API для hardware cursor plane).
     let cursor_buf = SolidColorBuffer::new((12, 12), [1.0f32, 1.0, 1.0, 1.0]);
+    // Визуальный пол
+    let floor_buf = SolidColorBuffer::new((10000, 4), [0.8f32, 0.8, 0.8, 1.0]);
+    // Буферы для псевдо-круглых точек 6x6 (состоят из 3-х прямоугольников)
+    let dot_buf_6 = SolidColorBuffer::new((6, 2), [0.8f32, 0.8, 0.8, 1.0]);
+    let dot_buf_2 = SolidColorBuffer::new((2, 2), [0.8f32, 0.8, 0.8, 1.0]);
 
     // 11. Рендер-таймер ~60 fps. Renders only when something changed
     //     (`state.needs_render`); an idle desktop costs ~0 GPU/CPU instead of a
@@ -288,11 +293,64 @@ pub fn run_tty(
                 .map(CustomRenderElements::Space)
                 .collect();
 
+            // Вставляем визуальный пол в конец вектора (рендерится позади окон)
+            if state.layout_mode == crate::state::LayoutMode::Physics {
+                // Пол находится на Y = 2000
+                let screen_w = output_t.current_mode().map(|m| m.size.w).unwrap_or(1920);
+                let floor_y = 2000 - state.camera_offset.1 as i32;
+                
+                // Если пол попадает в экран, рисуем его
+                if floor_y > -100 && floor_y < 4000 {
+                    // Сама полоса (белая) — центрируем по X
+                    elements.push(CustomRenderElements::Cursor(
+                        SolidColorRenderElement::from_buffer(
+                            &floor_buf,
+                            (-5000 + screen_w / 2, floor_y),
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        ),
+                    ));
+
+                    // Два ряда круглых точек (6x6 px) под полом
+                    for row in 0..2 {
+                        let dot_y = floor_y + 20 + row * 20;
+                        let mut offset_x = (state.camera_offset.0 as i32) % 40;
+                        // Смещаем второй ряд (в шахматном порядке)
+                        if row == 1 {
+                            offset_x -= 20;
+                        }
+                        
+                        for col in -2..(screen_w / 40 + 3) {
+                            let dot_x = col * 40 - offset_x;
+                            
+                            // Рисуем псевдо-круг (крест 6x6)
+                            // Верхняя часть (2x2)
+                            elements.push(CustomRenderElements::Cursor(
+                                SolidColorRenderElement::from_buffer(
+                                    &dot_buf_2, (dot_x + 2, dot_y), 1.0, 1.0, Kind::Unspecified
+                                )
+                            ));
+                            // Средняя часть (6x2)
+                            elements.push(CustomRenderElements::Cursor(
+                                SolidColorRenderElement::from_buffer(
+                                    &dot_buf_6, (dot_x, dot_y + 2), 1.0, 1.0, Kind::Unspecified
+                                )
+                            ));
+                            // Нижняя часть (2x2)
+                            elements.push(CustomRenderElements::Cursor(
+                                SolidColorRenderElement::from_buffer(
+                                    &dot_buf_2, (dot_x + 2, dot_y + 4), 1.0, 1.0, Kind::Unspecified
+                                )
+                            ));
+                        }
+                    }
+                }
+            }
+
             // Программный курсор поверх окон. `render_frame` принимает элементы
             // в порядке front-to-back: первый элемент в слайсе рисуется поверх
             // всех остальных. Поэтому вставляем курсор в начало вектора.
-            // `pointer_location` хранится в logical координатах; from_buffer
-            // принимает physical-позицию, поэтому переводим через to_physical(1.0).
             let cursor_loc = state.pointer_location.to_physical(1.0).to_i32_round();
             elements.insert(0, CustomRenderElements::Cursor(
                 SolidColorRenderElement::from_buffer(

@@ -19,6 +19,7 @@ use smithay::{
         seat::WaylandFocus,
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            decoration::{XdgDecorationState, XdgDecorationHandler},
         },
         output::{OutputHandler, OutputManagerState},
         shm::{ShmHandler, ShmState},
@@ -61,6 +62,7 @@ pub struct AppState {
     pub xdg_shell_state: XdgShellState,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
+    pub xdg_decoration_state: XdgDecorationState,
 
     // WM states
     pub space: Space<Window>,
@@ -130,6 +132,7 @@ impl AppState {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "seat0");
@@ -146,6 +149,7 @@ impl AppState {
             xdg_shell_state,
             output_manager_state,
             seat_state,
+            xdg_decoration_state,
             space: Space::default(),
             seat,
             running: true,
@@ -340,8 +344,8 @@ impl AppState {
             + (self.window_bodies.len() as f32 % 8.0 - 4.0) * 40.0;
         let spawn_y = self.camera_offset.1 as f32 - 100.0; // чуть выше верхнего края
         let geo_size = win.geometry().size;
-        let w = geo_size.w.max(100) as f32;
-        let h = geo_size.h.max(100) as f32;
+        let w = geo_size.w as f32;
+        let h = geo_size.h as f32;
         let Some(phys) = self.physics.as_mut() else {
             return;
         };
@@ -619,9 +623,26 @@ impl CompositorHandler for AppState {
             self.pending_configures.remove(&window);
             
             // Если мы в физическом режиме, но тело ещё не создано — самое время это сделать!
-            // Теперь геометрия окна будет правильной (а не 0x0).
+            // Но только когда клиент уже закоммитил реальный буфер (размер > placeholder 1x1).
+            // Первый commit часто приходит с нулевой/заглушечной геометрией.
             if self.layout_mode == LayoutMode::Physics && !self.window_bodies.contains_key(&window) {
-                self.physics_spawn_window(&window);
+                let geo = window.geometry();
+                if geo.size.w > 1 && geo.size.h > 1 {
+                    self.physics_spawn_window(&window);
+                }
+            }
+
+            // Синхронизируем размер коллайдера с реальной геометрией окна.
+            // Клиент может менять размер после первого commit — коллайдер должен следовать.
+            if self.layout_mode == LayoutMode::Physics {
+                if let Some(&handle) = self.window_bodies.get(&window) {
+                    let geo = window.geometry();
+                    if geo.size.w > 1 && geo.size.h > 1 {
+                        if let Some(phys) = self.physics.as_mut() {
+                            phys.update_collider_size(handle, geo.size.w as f32, geo.size.h as f32);
+                        }
+                    }
+                }
             }
 
             // During active resize: do NOT call apply_window_geometry or
@@ -750,6 +771,33 @@ impl XdgShellHandler for AppState {
     fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {}
 }
 smithay::delegate_xdg_shell!(AppState);
+
+// XDG Decoration — сообщаем клиентам использовать серверные декорации (без CSD)
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+
+impl XdgDecorationHandler for AppState {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+}
+smithay::delegate_xdg_decoration!(AppState);
 
 // 4. Seat / Input
 impl SeatHandler for AppState {

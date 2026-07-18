@@ -61,7 +61,8 @@ impl WindowPhysics {
         let (body, _collider) = self.world.insert(
             RigidBodyBuilder::dynamic()
                 .translation(Vector::new(x, y))
-                .linear_damping(2.0),
+                .linear_damping(2.0)
+                .lock_rotations(),
             ColliderBuilder::cuboid(w * 0.5, h * 0.5).friction(0.7),
         );
         body
@@ -71,6 +72,21 @@ impl WindowPhysics {
     /// или при выходе из физического режима.
     pub fn remove_window(&mut self, handle: RigidBodyHandle) {
         self.world.remove_body(handle);
+    }
+
+    /// Обновляет размер коллайдера тела, если окно изменило свою геометрию.
+    /// Находит первый коллайдер, прикреплённый к телу, и заменяет его shape
+    /// на cuboid с новыми half-extents.
+    pub fn update_collider_size(&mut self, handle: RigidBodyHandle, w: Real, h: Real) {
+        let collider_handles: Vec<ColliderHandle> = {
+            let Some(body) = self.world.bodies.get(handle) else { return };
+            body.colliders().to_vec()
+        };
+        if let Some(&col_handle) = collider_handles.first() {
+            if let Some(collider) = self.world.colliders.get_mut(col_handle) {
+                collider.set_shape(SharedShape::cuboid(w * 0.5, h * 0.5));
+            }
+        }
     }
 
     /// Продвигает симуляцию на один шаг (`integration_parameters.dt`).

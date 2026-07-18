@@ -94,6 +94,8 @@ A "knife" tool cuts a single application (e.g., Telegram) into pieces — the co
 | On-demand Rendering (damage-gating) | ✅ Implemented |
 | Software Cursor in DRM/KMS mode | ✅ Implemented |
 | Physics engine rapier2d / gravity (Phase 1) | ✅ `Super+G` toggle, infinite canvas, camera, window drag |
+| Advanced physics (Phase 1.1) | ✅ accurate colliders (size sync), rotation lock, visual floor and dot markers |
+| XDG Decoration Support | ✅ clients disable their CSD (titlebars/buttons) for a clean look |
 | Drawing physical lines (steel/glue/trampoline/rope) | 📋 Concept |
 | Session persistence (serde → JSON/TOML) | 📋 Concept |
 | Window joining (Weld/Spring joints) | 📋 Concept |
@@ -110,16 +112,15 @@ src/
 ├── main.rs         — Entry point; selects backend (Winit / DRM), runs event loop,
 │                     sets up Wayland socket and Output.
 ├── state.rs        — Global state (AppState), implements Smithay traits
-│                     (Compositor, Shm, XdgShell, Seat, Output), handles focus & layout.
+│                     (Compositor, Shm, XdgShell, Seat, Output, XdgDecoration), handles focus & layout.
 ├── backend_drm.rs  — Native DRM/KMS backend: libseat session, GPU, DRM device,
-│                     GBM/EGL renderer, monitor, CRTC, libinput, udev, software cursor.
+│                     GBM/EGL renderer, monitor, CRTC, libinput, udev, visual floor, software cursor.
 ├── input.rs        — Input processing (keyboard/mouse) shared between backends,
-│                     hotkeys, click-to-focus, mouse tiling resize.
+│                     hotkeys, click-to-focus, window drag.
 ├── tiling.rs       — BSP/Dwindle tile tree (TileNode): insert, remove,
 │                     recalculate geometries, resize ratios.
 ├── physics.rs      — rapier2d wrapper (WindowPhysics): physics world,
-│                     gravity, static floor, spawn/remove window bodies,
-│                     simulation step, body transform → window mapping.
+│                     gravity, static floor, spawn/remove/resize window bodies, simulation step.
 └── render.rs       — CustomRenderElements (enum macro wrapper),
                       combines window surface elements and the software cursor.
 sandboxWM_concept.md — Final project vision (concept in Russian).
@@ -148,9 +149,8 @@ Split direction is chosen automatically based on aspect ratio; deleting a leaf c
 | `Super + W` | Close active window |
 | `Super + G` | Toggle mode: tiling ↔ physics |
 | `Super + ← / → / ↑ / ↓` | Tiling: switch focus · Physics: move camera |
-| `Super + LMB + drag` | Resize tiling layout (tiling mode) |
-| `LMB + drag (on window)` | Physics mode: drag window body |
-| `LMB on window` | Focus window |
+| `Super + LMB + drag` | Tiling: resize tiling layout · Physics: drag window body |
+| `LMB on window` | Focus window and interact with UI |
 | `Ctrl + Alt + F1..F12` | Switch VT (TTY/DRM mode only) |
 
 ---
