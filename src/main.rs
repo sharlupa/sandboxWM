@@ -157,14 +157,13 @@ fn run_winit(
                     return;
                 }
 
-                // ── Физический режим: шаг симуляции + камера ─────────────
+                // ── Смещение камеры (Tiling = (0,0), Physics = Lerp) ─────────────
                 // map_output смещает вид: world = screen + camera_offset.
-                // В Tiling-режиме камера всегда (0,0) — output на месте.
+                state.space.map_output(
+                    &output,
+                    (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
+                );
                 if state.layout_mode == crate::state::LayoutMode::Physics {
-                    state.space.map_output(
-                        &output,
-                        (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
-                    );
                     // Шаг физики продвигает симуляцию и применяет трансформы
                     // тел к окнам. Держит needs_render поднятым, пока тела
                     // двигаются; когда всё улеглось — рендер уснёт.

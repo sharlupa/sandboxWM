@@ -272,14 +272,12 @@ pub fn run_tty(
                 state.layout_dirty = false;
             }
 
-            // ── Физический режим: смещение камеры ─────────────
+            // ── Смещение камеры (Tiling = (0,0), Physics = Lerp) ─────────────
             // map_output смещает вид: world = screen + camera_offset.
-            if state.layout_mode == crate::state::LayoutMode::Physics {
-                state.space.map_output(
-                    &output_t,
-                    (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
-                );
-            }
+            state.space.map_output(
+                &output_t,
+                (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
+            );
 
             // Окна из space, маппим в общий enum с курсором.
             let mut elements: Vec<CustomRenderElements> = state

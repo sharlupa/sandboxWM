@@ -273,22 +273,25 @@ fn vt_number_from_keysym(keysym: u32) -> Option<i32> {
 /// Update pointer position and find the window under cursor
 fn handle_pointer_motion(
     state: &mut AppState,
-    x: f64,
-    y: f64,
+    mut x: f64,
+    mut y: f64,
     serial: smithay::utils::Serial,
     time: u32,
 ) {
+    // Clamp to screen bounds
+    let screen = state.output_size();
+    x = x.clamp(0.0, (screen.w - 1) as f64);
+    y = y.clamp(0.0, (screen.h - 1) as f64);
+    let pos: smithay::utils::Point<f64, smithay::utils::Logical> = (x, y).into();
+    state.pointer_location = pos;
+
     // ── Физический режим: drag тела мышью ───────────────────────────────
     // Курсор здесь — экранные координаты; переводим в мировые (+ camera_offset).
-    // В физическом режиме нет clamp к экрану — мир бесконечен, но сам курсор
-    // устройства ограничен output'ом, что нормально.
     if state.layout_mode == LayoutMode::Physics {
         let world_x = x + state.camera_offset.0;
         let world_y = y + state.camera_offset.1;
         state.physics_drag_update(world_x, world_y);
-        // Обновим позицию устройства (для курсора/фокуса).
-        let pos: smithay::utils::Point<f64, smithay::utils::Logical> = (x, y).into();
-        state.pointer_location = pos;
+        
         if let Some(ptr) = state.seat.get_pointer() {
             ptr.motion(state, None, &MotionEvent { location: pos, serial, time });
             if state.session.is_some() {
@@ -297,14 +300,6 @@ fn handle_pointer_motion(
         }
         return;
     }
-
-    // Clamp to screen bounds
-    let screen = state.output_size();
-    let x = x.clamp(0.0, (screen.w - 1) as f64);
-    let y = y.clamp(0.0, (screen.h - 1) as f64);
-    let pos: smithay::utils::Point<f64, smithay::utils::Logical> = (x, y).into();
-
-    state.pointer_location = pos;
 
     // --- Super+LMB tile resize ---
     if let (Some(resize_win), Some((start_x, start_y)), Some((drag_left, drag_top))) = (
@@ -436,21 +431,17 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
     }
 
     let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (pos.x + state.camera_offset.0, pos.y + state.camera_offset.1).into();
-    
-    // DEBUG
-    if btn_state == ButtonState::Pressed {
-        if let Some(ptr) = state.seat.get_pointer() {
-            let has_focus = ptr.current_focus().is_some();
-            let msg = format!("[DEBUG] Click at world {:?}! Pointer focus exists: {}\n", world_pos, has_focus);
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/physics_debug.log")
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(msg.as_bytes())
-                });
-        }
+
+    if let Some(ptr) = state.seat.get_pointer() {
+        let under = state.space.element_under(world_pos).and_then(|(w, loc)| {
+            let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc.x as f64, loc.y as f64).into();
+            let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
+            w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL).map(|(surf, surf_loc)| {
+                let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64).into();
+                (surf, surf_loc_f64)
+            })
+        });
+        ptr.motion(state, under, &MotionEvent { location: world_pos, serial, time: time_msec });
     }
 
     if btn_state == ButtonState::Pressed {
