@@ -4,6 +4,8 @@ pub mod backend_drm;
 pub mod tiling;
 pub mod render;
 pub mod physics;
+pub mod screencopy;
+pub mod output_manager;
 
 use std::sync::Arc;
 use smithay::reexports::calloop::EventLoop;
@@ -34,7 +36,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listening_socket = ListeningSocketSource::new_auto()?;
     let socket_name = listening_socket.socket_name().to_string_lossy().into_owned();
     println!("=====> Сокет: {}", socket_name);
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
+    unsafe { 
+        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+        std::env::set_var("XDG_CURRENT_DESKTOP", "sandboxWM");
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
+    }
+    
+    // Notify dbus of the Wayland socket for xdg-desktop-portal
+    let _ = std::process::Command::new("dbus-update-activation-environment")
+        .arg("--systemd")
+        .arg("WAYLAND_DISPLAY")
+        .arg("XDG_CURRENT_DESKTOP")
+        .arg("XDG_SESSION_TYPE")
+        .spawn()
+        .map(|mut child| child.wait());
 
     loop_handle.insert_source(listening_socket, |client_stream, _, state| {
         state.display_handle.insert_client(
@@ -181,18 +196,31 @@ fn run_winit(
                 if state.needs_render {
                     let age = backend.buffer_age().unwrap_or(0);
                     let render_res = if let Ok((renderer, mut fb)) = backend.bind() {
-                        let custom: &[smithay::backend::renderer::element::solid::SolidColorRenderElement] = &[];
-                        Some(render_output(
-                            &output,
-                            renderer,
-                            &mut fb,
-                            1.0,
-                            age,
-                            [&state.space],
-                            custom,
-                            &mut damage_tracker,
-                            [0.08, 0.08, 0.12, 1.0],
-                        ))
+                        if state.layout_mode == crate::state::LayoutMode::Physics {
+                            let elements = crate::render::collect_physics_elements(renderer, state);
+                            // age=0 → полный redraw: иначе при buffer-age>1
+                            // на мгновение видна «копия» окна с прошлого кадра.
+                            Some(damage_tracker.render_output(
+                                renderer,
+                                &mut fb,
+                                0,
+                                &elements,
+                                [0.08, 0.08, 0.12, 1.0],
+                            ))
+                        } else {
+                            let custom: &[smithay::backend::renderer::element::solid::SolidColorRenderElement] = &[];
+                            Some(render_output(
+                                &output,
+                                renderer,
+                                &mut fb,
+                                1.0,
+                                age,
+                                [&state.space],
+                                custom,
+                                &mut damage_tracker,
+                                [0.08, 0.08, 0.12, 1.0],
+                            ))
+                        }
                     } else {
                         None
                     };

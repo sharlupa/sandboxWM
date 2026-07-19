@@ -1634,9 +1634,12 @@ dependencies = [
 name = "sandboxWM"
 version = "0.1.0"
 dependencies = [
+ "cgmath",
  "log",
  "rapier2d",
  "smithay",
+ "wayland-protocols-wlr",
+ "wayland-server",
 ]
 
 [[package]]

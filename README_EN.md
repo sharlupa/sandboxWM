@@ -12,7 +12,7 @@ sandboxWM is an experiment at the intersection of a Window Manager and a physics
 
 A detailed description of the final vision is available in [`sandboxWM_concept_EN.md`](./sandboxWM_concept_EN.md).
 
-> ⚠️ **Status:** Early version (`0.1.0`). A basic tiling WM based on Smithay with optimized rendering and a software cursor. Phase 1 physics is now implemented: pressing `Super+G` switches to physics mode where windows become dynamic rapier2d bodies with gravity on an infinite canvas, and the camera is moved with arrow keys. Drawing, deformations, joints, and slicing are still **goals** (see the "Current Implementation vs. Final Concept" section).
+> ⚠️ **Status:** Early version (`0.1.0`). A basic tiling WM based on Smithay with optimized rendering and a software cursor. Physics mode (Phase 1+): `Super+G` turns windows into dynamic rapier2d bodies with gravity, a floor, collisions, and **rotation**; holding `Super+A` / `Super+D` spins the focused window, and on release the angle stays put while the body becomes free again. Drawing, deformations, joints, and slicing are still **goals** (see the "Current Implementation vs. Final Concept" section).
 
 ---
 
@@ -28,7 +28,7 @@ This project is actively developed in collaboration with AI coding assistants (n
 |------|------------|:-------------------:|
 | Language | Rust | ✅ |
 | Wayland Compositor | Smithay 0.7 | ✅ |
-| Physics Engine | rapier2d | ✅ Phase 1 (gravity, bodies, camera) |
+| Physics Engine | rapier2d | ✅ Phase 1+ (gravity, bodies, rotation, camera) |
 | Rendering | wgpu / glow | 📋 Planned (currently GLES via Smithay) |
 
 ---
@@ -94,7 +94,10 @@ A "knife" tool cuts a single application (e.g., Telegram) into pieces — the co
 | On-demand Rendering (damage-gating) | ✅ Implemented |
 | Software Cursor in DRM/KMS mode | ✅ Implemented |
 | Physics engine rapier2d / gravity (Phase 1) | ✅ `Super+G` toggle, infinite canvas, camera, window drag |
-| Advanced physics (Phase 1.1) | ✅ accurate colliders (size sync), rotation lock, visual floor and dot markers |
+| Advanced physics (Phase 1.1) | ✅ accurate colliders (size sync), free rotation, collisions while spinning, visual floor |
+| Window rotation (Phase 1.2) | ✅ GLES-rotated draw, rotated hit-test, hold `Super+A`/`Super+D` (stiff spin → lock angle → free again) |
+| DMA-BUF (zero-copy) | ✅ DmabufState / client buffer import |
+| wlr-screencopy / wlr-output-management | ✅ basic globals (screen capture and output management) |
 | XDG Decoration Support | ✅ clients disable their CSD (titlebars/buttons) for a clean look |
 | Drawing physical lines (steel/glue/trampoline/rope) | 📋 Concept |
 | Session persistence (serde → JSON/TOML) | 📋 Concept |
@@ -109,22 +112,20 @@ A "knife" tool cuts a single application (e.g., Telegram) into pieces — the co
 
 ```
 src/
-├── main.rs         — Entry point; selects backend (Winit / DRM), runs event loop,
-│                     sets up Wayland socket and Output.
-├── state.rs        — Global state (AppState), implements Smithay traits
-│                     (Compositor, Shm, XdgShell, Seat, Output, XdgDecoration), handles focus & layout.
-├── backend_drm.rs  — Native DRM/KMS backend: libseat session, GPU, DRM device,
-│                     GBM/EGL renderer, monitor, CRTC, libinput, udev, visual floor, software cursor.
-├── input.rs        — Input processing (keyboard/mouse) shared between backends,
-│                     hotkeys, click-to-focus, window drag.
-├── tiling.rs       — BSP/Dwindle tile tree (TileNode): insert, remove,
-│                     recalculate geometries, resize ratios.
-├── physics.rs      — rapier2d wrapper (WindowPhysics): physics world,
-│                     gravity, static floor, spawn/remove/resize window bodies, simulation step.
-└── render.rs       — CustomRenderElements (enum macro wrapper),
-                      combines window surface elements and the software cursor.
-sandboxWM_concept.md — Final project vision (concept in Russian).
-sandboxWM_concept_EN.md — Final project vision (concept in English).
+├── main.rs            — Entry point; selects backend (Winit / DRM), runs event loop,
+│                        sets up Wayland socket and Output.
+├── state.rs           — Global state (AppState), Smithay traits, layout,
+│                        physics step, spin hold/release, rotated hit-test.
+├── backend_drm.rs     — Native DRM/KMS backend: libseat, GPU, GBM/EGL, libinput,
+│                        udev, visual floor, software cursor, screencopy frames.
+├── input.rs           — Input (keyboard/mouse), hotkeys, drag, Super+A/D spin.
+├── tiling.rs          — BSP/Dwindle tile tree (TileNode).
+├── physics.rs         — rapier2d wrapper: world, gravity, floor, window bodies, ω.
+├── render.rs          — CustomRenderElements + PhysicsElement (GLES window rotation).
+├── screencopy.rs      — wlr-screencopy-unstable-v1 (screen capture).
+└── output_manager.rs  — wlr-output-management-unstable-v1.
+sandboxWM_concept.md     — Final project vision (concept in Russian).
+sandboxWM_concept_EN.md  — Final project vision (concept in English).
 ```
 
 ---
@@ -132,7 +133,7 @@ sandboxWM_concept_EN.md — Final project vision (concept in English).
 ## Architecture Details
 
 ### Application State (`AppState`)
-The central struct in `state.rs` manages Smithay states, `Space<Window>`, BSP tile tree, TTY session (`Option<LibSeatSession>`), pointer coordinates, and the `needs_render` flag for damage-gated rendering.
+The central struct in `state.rs` manages Smithay states (Compositor, Shm, XdgShell, Output, Seat, XdgDecoration, Dmabuf, screencopy, output-management), `Space<Window>`, BSP tile tree, the physics world and window bodies, spin hold state (`physics_spin_*`), TTY session, pointer coordinates, and the `needs_render` flag for damage-gated rendering.
 
 ### Tiling Tree (`TileNode`)
 ```
@@ -148,6 +149,7 @@ Split direction is chosen automatically based on aspect ratio; deleting a leaf c
 | `Super + Q` / `Esc` | Quit WM |
 | `Super + W` | Close active window |
 | `Super + G` | Toggle mode: tiling ↔ physics |
+| `Super + A` / `Super + D` *(physics, hold)* | Spin focused window left / right; on release the angle stays, then the body is free for physics again |
 | `Super + ← / → / ↑ / ↓` | Tiling: switch focus · Physics: move camera |
 | `Super + LMB + drag` | Tiling: resize tiling layout · Physics: drag window body |
 | `LMB on window` | Focus window and interact with UI |

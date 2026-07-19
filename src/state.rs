@@ -10,7 +10,7 @@ use smithay::{
             Client, DisplayHandle,
         },
     },
-    utils::{Clock, Monotonic, Serial, Rectangle, Size, Logical},
+    utils::{Clock, Monotonic, Serial, Rectangle, Size, Logical, Point},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -63,6 +63,8 @@ pub struct AppState {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub xdg_decoration_state: XdgDecorationState,
+    pub screencopy_state: crate::screencopy::ScreencopyState,
+    pub wlr_output_manager_state: crate::output_manager::OutputManagerState,
 
     // WM states
     pub space: Space<Window>,
@@ -92,9 +94,23 @@ pub struct AppState {
     // Окно, которое сейчас таскают мышью в физическом режиме, и его тело.
     pub drag_body: Option<(Window, rapier2d::prelude::RigidBodyHandle)>,
     pub drag_last_ptr: Option<(f64, f64)>,
+    // Удержание Super+A/D: -1 влево, +1 вправо, 0 — не крутим.
+    // Пока ≠ 0 угол окна жёстко задаётся каждый кадр; при отпускании тело снова свободно.
+    pub physics_spin_dir: f32,
+    // Тело, которое крутим (фиксируем на press, чтобы не зависеть от фокуса/borrow).
+    pub physics_spin_body: Option<rapier2d::prelude::RigidBodyHandle>,
     // Таймстеп симуляции (совпадает с тем, что задан в physics.set_dt()).
     // Нужен в step_physics для расчёта скорости drag_to.
     pub physics_dt: f32,
+    // Счётчик визуальных изменений физики (угол/центр). Нужен PhysicsElement,
+    // чтобы damage-tracker перерисовывал окно даже без нового wl_buffer.
+    pub physics_visual_gen: usize,
+    // История экранных bounding-rect'ов (несколько кадров) — для union-damage
+    // с учётом buffer-age в DRM/winit swapchain (иначе остаётся «копия» окна).
+    pub physics_damage_history: std::collections::HashMap<
+        Window,
+        std::collections::VecDeque<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
+    >,
     
     // Tracks windows that have received a configure event but haven't committed
     // a new buffer yet. This prevents us from spamming configure events faster
@@ -140,6 +156,8 @@ impl AppState {
         let _ = seat.add_pointer();
 
         let dmabuf_state = smithay::wayland::dmabuf::DmabufState::new();
+        let screencopy_state = crate::screencopy::ScreencopyState::new::<Self>(&display_handle);
+        let wlr_output_manager_state = crate::output_manager::OutputManagerState::new::<Self>(&display_handle);
 
         Self {
             display_handle,
@@ -148,8 +166,10 @@ impl AppState {
             shm_state,
             xdg_shell_state,
             output_manager_state,
+            wlr_output_manager_state,
             seat_state,
             xdg_decoration_state,
+            screencopy_state,
             space: Space::default(),
             seat,
             running: true,
@@ -164,7 +184,11 @@ impl AppState {
             target_camera_offset: (0.0, 0.0),
             drag_body: None,
             drag_last_ptr: None,
+            physics_spin_dir: 0.0,
+            physics_spin_body: None,
             physics_dt: 1.0 / 60.0,
+            physics_visual_gen: 0,
+            physics_damage_history: std::collections::HashMap::new(),
             pending_configures: std::collections::HashSet::new(),
             dmabuf_state,
             dmabuf_global: None,
@@ -230,6 +254,10 @@ impl AppState {
         self.layout_mode = LayoutMode::Physics;
         self.drag_body = None;
         self.drag_last_ptr = None;
+        self.physics_spin_dir = 0.0;
+        self.physics_spin_body = None;
+        self.physics_damage_history.clear();
+        self.physics_visual_gen = 0;
         println!("[physics] режим включён, {} окон", self.window_bodies.len());
     }
 
@@ -239,6 +267,9 @@ impl AppState {
         self.window_bodies.clear();
         self.drag_body = None;
         self.drag_last_ptr = None;
+        self.physics_spin_dir = 0.0;
+        self.physics_spin_body = None;
+        self.physics_damage_history.clear();
         self.camera_offset = (0.0, 0.0);
         self.target_camera_offset = (0.0, 0.0);
         self.layout_mode = LayoutMode::Tiling;
@@ -250,6 +281,13 @@ impl AppState {
     /// Один шаг физики + применение трансформ тел к окнам. Вызывается из
     /// рендер-цикла (~60 Hz) только в физическом режиме.
     pub fn step_physics(&mut self) {
+        // Снимаем копии до mutable borrow physics — иначе conflict с focused_*.
+        let dt = self.physics_dt;
+        let drag = self.drag_body.as_ref().map(|(_, h)| *h);
+        let drag_ptr = self.drag_last_ptr;
+        let spin_dir = self.physics_spin_dir;
+        let spin_body = self.physics_spin_body;
+
         let Some(phys) = self.physics.as_mut() else {
             return;
         };
@@ -258,13 +296,25 @@ impl AppState {
         // кадр заставлял solver разрешать внезапное проникновение в пол/
         // соседние окна как жёсткий контакт — отсюда были рывки при drag,
         // даже когда CPU/RAM были в норме.
-        let dt = self.physics_dt;
-        if let Some((_, handle)) = self.drag_body {
-            if let Some((x, y)) = self.drag_last_ptr {
-                phys.drag_to(handle, x as f32, y as f32, dt);
+        if let (Some(handle), Some((x, y))) = (drag, drag_ptr) {
+            phys.drag_to(handle, x as f32, y as f32, dt);
+        }
+        // Super+A/D: задаём ω каждый кадр. Не телепортируем угол — иначе
+        // коллайдер проходит сквозь соседей, а freeze после step ломает контакты.
+        const SPIN_RATE: f32 = 2.0;
+        if spin_dir != 0.0 {
+            if let Some(handle) = spin_body {
+                phys.set_angular_velocity(handle, spin_dir * SPIN_RATE);
             }
         }
         let step_dur = phys.step();
+        // Пока держим — снова выставляем ω (контакты могли её сбить).
+        // Угол при этом остаётся от solver'а, столкновения работают.
+        if spin_dir != 0.0 {
+            if let Some(handle) = spin_body {
+                phys.set_angular_velocity(handle, spin_dir * SPIN_RATE);
+            }
+        }
         
         // --- ДИАГНОСТИКА ЛАГОВ ---
         // Печатаем только если шаг занял больше 2мс или идет drag, чтобы не спамить в 60fps
@@ -274,7 +324,7 @@ impl AppState {
         // Держим needs_render поднятым, пока хоть одно тело двигается — иначе
         // рендер-цикл уснёт и симуляция застынет. Когда всё улеглось, рендер
         // засыпает (это и нужно для энергосбережения на idle столе).
-        let mut moving = phys.any_moving() || self.drag_body.is_some();
+        let mut moving = phys.any_moving() || self.drag_body.is_some() || self.physics_spin_dir != 0.0;
         
         // Плавная камера (Lerp)
         let cam_dx = self.target_camera_offset.0 - self.camera_offset.0;
@@ -289,6 +339,7 @@ impl AppState {
 
         self.apply_physics_layout();
         if moving {
+            self.physics_visual_gen = self.physics_visual_gen.wrapping_add(1);
             self.needs_render = true;
         }
     }
@@ -355,32 +406,130 @@ impl AppState {
 
     /// Убирает тело окна при его закрытии в физическом режиме.
     pub fn physics_remove_window(&mut self, win: &Window) {
+        self.physics_damage_history.remove(win);
         if let Some(handle) = self.window_bodies.remove(win) {
+            if self.physics_spin_body == Some(handle) {
+                self.physics_spin_dir = 0.0;
+                self.physics_spin_body = None;
+            }
             if let Some(phys) = self.physics.as_mut() {
                 phys.remove_window(handle);
             }
         }
     }
 
-    /// Находит тело окна под курсором (мировые координаты) для drag. Возвращает
-    /// окно + хендл тела, если курсор попадает в bounding-box тела.
-    pub fn physics_pick(&self, world_x: f64, world_y: f64) -> Option<(Window, rapier2d::prelude::RigidBodyHandle)> {
+    /// Переводит мировые координаты курсора в локальные координаты тела
+    /// (начало в центре, оси вдоль сторон окна с учётом угла).
+    fn physics_world_to_local(
+        &self,
+        win: &Window,
+        handle: rapier2d::prelude::RigidBodyHandle,
+        world_x: f64,
+        world_y: f64,
+    ) -> Option<(f64, f64, f64, f64)> {
         let phys = self.physics.as_ref()?;
-        for (win, handle) in self.window_bodies.iter() {
-            if let Some((cx, cy, _)) = phys.body_transform(*handle) {
-                let size = self
-                    .space
-                    .element_geometry(win)
-                    .map(|g| g.size)
-                    .unwrap_or_else(|| (100, 100).into());
-                let hw = size.w as f64 * 0.5;
-                let hh = size.h as f64 * 0.5;
-                if (world_x - cx as f64).abs() <= hw && (world_y - cy as f64).abs() <= hh {
-                    return Some((win.clone(), *handle));
+        let (cx, cy, angle) = phys.body_transform(handle)?;
+        let size = self
+            .space
+            .element_geometry(win)
+            .map(|g| g.size)
+            .unwrap_or_else(|| (100, 100).into());
+        let hw = size.w as f64 * 0.5;
+        let hh = size.h as f64 * 0.5;
+        let dx = world_x - cx as f64;
+        let dy = world_y - cy as f64;
+        // Обратный поворот: из мира в локальные оси окна.
+        let cos_a = (-angle as f64).cos();
+        let sin_a = (-angle as f64).sin();
+        let local_x = dx * cos_a - dy * sin_a;
+        let local_y = dx * sin_a + dy * cos_a;
+        Some((local_x, local_y, hw, hh))
+    }
+
+    /// Находит тело окна под курсором (мировые координаты) для drag.
+    /// Обходит окна сверху вниз (как в Space), чтобы верхнее перекрывало нижнее.
+    pub fn physics_pick(&self, world_x: f64, world_y: f64) -> Option<(Window, rapier2d::prelude::RigidBodyHandle)> {
+        if self.physics.is_none() {
+            return None;
+        }
+        for win in self.space.elements().rev() {
+            let Some(&handle) = self.window_bodies.get(win) else { continue };
+            if let Some((local_x, local_y, hw, hh)) =
+                self.physics_world_to_local(win, handle, world_x, world_y)
+            {
+                if local_x.abs() <= hw && local_y.abs() <= hh {
+                    return Some((win.clone(), handle));
                 }
             }
         }
         None
+    }
+
+    /// Hit-test с учётом поворота: возвращает окно и «виртуальный» top-left,
+    /// такой что `world - loc` даёт локальные координаты поверхности (0..w, 0..h).
+    pub fn physics_element_under(&self, world_x: f64, world_y: f64) -> Option<(Window, Point<i32, Logical>)> {
+        if self.physics.is_none() {
+            return None;
+        }
+        for win in self.space.elements().rev() {
+            let Some(&handle) = self.window_bodies.get(win) else { continue };
+            if let Some((local_x, local_y, hw, hh)) =
+                self.physics_world_to_local(win, handle, world_x, world_y)
+            {
+                if local_x.abs() <= hw && local_y.abs() <= hh {
+                    let relative_x = local_x + hw;
+                    let relative_y = local_y + hh;
+                    let loc_x = (world_x - relative_x).round() as i32;
+                    let loc_y = (world_y - relative_y).round() as i32;
+                    return Some((win.clone(), Point::from((loc_x, loc_y))));
+                }
+            }
+        }
+        None
+    }
+
+    fn focused_physics_body(&self) -> Option<rapier2d::prelude::RigidBodyHandle> {
+        let surf = self.seat.get_keyboard()?.current_focus()?;
+        let win = self.space.elements().find(|w| {
+            w.toplevel()
+                .map(|t| t.wl_surface() == &surf)
+                .unwrap_or(false)
+        })?;
+        self.window_bodies.get(win).copied()
+    }
+
+    /// Начать удержание поворота (Super+A / Super+D). Пока клавиша зажата,
+    /// `step_physics` жёстко крутит угол окна (без свободной инерции).
+    pub fn physics_spin_hold(&mut self, dir: f32) {
+        if self.layout_mode != LayoutMode::Physics {
+            return;
+        }
+        let Some(handle) = self.focused_physics_body() else {
+            return;
+        };
+        self.physics_spin_dir = dir.signum();
+        self.physics_spin_body = Some(handle);
+        // Сразу гасим ω — поворот только от удержания, не от инерции.
+        if let Some(phys) = self.physics.as_mut() {
+            phys.set_angular_velocity(handle, 0.0);
+        }
+        self.needs_render = true;
+    }
+
+    /// Отпустили A/D: угол остаётся как повернули, ω = 0.
+    /// Дальше тело снова полностью свободное для физики/столкновений.
+    pub fn physics_spin_release(&mut self) {
+        if self.physics_spin_dir == 0.0 {
+            return;
+        }
+        if let Some(handle) = self.physics_spin_body {
+            if let Some(phys) = self.physics.as_mut() {
+                phys.set_angular_velocity(handle, 0.0);
+            }
+        }
+        self.physics_spin_dir = 0.0;
+        self.physics_spin_body = None;
+        self.needs_render = true;
     }
 
     /// Начинает/обновляет/заканчивает drag тела в физическом режиме.
@@ -797,7 +946,28 @@ impl XdgDecorationHandler for AppState {
         toplevel.send_configure();
     }
 }
+
+impl AsMut<crate::screencopy::ScreencopyState> for AppState {
+    fn as_mut(&mut self) -> &mut crate::screencopy::ScreencopyState {
+        &mut self.screencopy_state
+    }
+}
+
+impl AsMut<crate::output_manager::OutputManagerState> for AppState {
+    fn as_mut(&mut self) -> &mut crate::output_manager::OutputManagerState {
+        &mut self.wlr_output_manager_state
+    }
+}
+
+impl crate::output_manager::OutputManagerHandler for AppState {
+    fn outputs(&self) -> Vec<(smithay::output::Output, Option<smithay::utils::Point<i32, smithay::utils::Logical>>)> {
+        self.space.outputs().map(|o| (o.clone(), Some(self.space.output_geometry(o).unwrap_or(smithay::utils::Rectangle::from_size((0, 0).into())).loc))).collect()
+    }
+}
+
 smithay::delegate_xdg_decoration!(AppState);
+crate::delegate_screencopy!(AppState);
+crate::delegate_output_manager!(AppState);
 
 // 4. Seat / Input
 impl SeatHandler for AppState {

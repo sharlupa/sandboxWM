@@ -37,11 +37,12 @@ pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) 
                 serial,
                 time,
                 |app_state, modifiers, keysym| {
-                    if key_state == KeyState::Pressed {
-                        handle_key(app_state, modifiers, u32::from(keysym.modified_sym()))
-                    } else {
-                        FilterResult::Forward
-                    }
+                    handle_key(
+                        app_state,
+                        modifiers,
+                        u32::from(keysym.modified_sym()),
+                        key_state,
+                    )
                 },
             );
         }
@@ -80,11 +81,12 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
                 serial,
                 time,
                 |app_state, modifiers, keysym| {
-                    if key_state == KeyState::Pressed {
-                        handle_key(app_state, modifiers, u32::from(keysym.modified_sym()))
-                    } else {
-                        FilterResult::Forward
-                    }
+                    handle_key(
+                        app_state,
+                        modifiers,
+                        u32::from(keysym.modified_sym()),
+                        key_state,
+                    )
                 },
             );
         }
@@ -109,13 +111,14 @@ fn handle_key(
     app_state: &mut AppState,
     modifiers: &smithay::input::keyboard::ModifiersState,
     keysym: u32,
+    key_state: KeyState,
 ) -> FilterResult<()> {
     // Ctrl+Alt+F1..F12 → switch virtual terminal (TTY / libseat mode).
     // On standard Linux XKB keymaps, Ctrl+Alt+Fn produces XKB_KEY_XF86Switch_VT_N
     // (not KEY_Fn). We handle both cases:
     //   1. modified_sym() returns XF86Switch_VT_N directly (most common).
     //   2. modified_sym() returns KEY_Fn + Ctrl+Alt modifiers (rare layouts).
-    {
+    if key_state == KeyState::Pressed {
         let sym = keysym;
         // Case 1: XKB already mapped it to XF86Switch_VT_N
         let vt_from_xf86 = match sym {
@@ -152,6 +155,30 @@ fn handle_key(
                 }
             }
         }
+    }
+
+    // Super+A / Super+D — зажал = крутится, отпустил = угол фиксируется, тело снова свободно
+    if app_state.layout_mode == LayoutMode::Physics {
+        let is_a = keysym == xkb::KEY_a || keysym == xkb::KEY_A;
+        let is_d = keysym == xkb::KEY_d || keysym == xkb::KEY_D;
+        if is_a || is_d {
+            if key_state == KeyState::Pressed && modifiers.logo {
+                app_state.physics_spin_hold(if is_a { -1.0 } else { 1.0 });
+                return FilterResult::Intercept(());
+            }
+            if key_state == KeyState::Released && app_state.physics_spin_dir != 0.0 {
+                let holding_a = app_state.physics_spin_dir < 0.0;
+                let holding_d = app_state.physics_spin_dir > 0.0;
+                if (is_a && holding_a) || (is_d && holding_d) {
+                    app_state.physics_spin_release();
+                    return FilterResult::Intercept(());
+                }
+            }
+        }
+    }
+
+    if key_state != KeyState::Pressed {
+        return FilterResult::Forward;
     }
 
     if !modifiers.logo {
@@ -285,15 +312,42 @@ fn handle_pointer_motion(
     let pos: smithay::utils::Point<f64, smithay::utils::Logical> = (x, y).into();
     state.pointer_location = pos;
 
-    // ── Физический режим: drag тела мышью ───────────────────────────────
+    // ── Физический режим: drag тела мышью + hit-test с учётом поворота ──
     // Курсор здесь — экранные координаты; переводим в мировые (+ camera_offset).
     if state.layout_mode == LayoutMode::Physics {
         let world_x = x + state.camera_offset.0;
         let world_y = y + state.camera_offset.1;
+        let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
+            (world_x, world_y).into();
         state.physics_drag_update(world_x, world_y);
-        
+
+        let under = if state.drag_body.is_some() {
+            None
+        } else {
+            state.physics_element_under(world_x, world_y).and_then(|(w, loc)| {
+                let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
+                    (loc.x as f64, loc.y as f64).into();
+                let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
+                    (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
+                w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL)
+                    .map(|(surf, surf_loc)| {
+                        let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
+                            (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64).into();
+                        (surf, surf_loc_f64)
+                    })
+            })
+        };
+
         if let Some(ptr) = state.seat.get_pointer() {
-            ptr.motion(state, None, &MotionEvent { location: pos, serial, time });
+            ptr.motion(
+                state,
+                under,
+                &MotionEvent {
+                    location: world_pos,
+                    serial,
+                    time,
+                },
+            );
             if state.session.is_some() {
                 state.needs_render = true;
             }
@@ -347,7 +401,13 @@ fn handle_pointer_motion(
 
     // Find surface under pointer for hover focus
     let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (pos.x + state.camera_offset.0, pos.y + state.camera_offset.1).into();
-    let under = state.space.element_under(world_pos).and_then(|(w, loc)| {
+    let under = if state.layout_mode == crate::state::LayoutMode::Physics {
+        state.physics_element_under(world_pos.x, world_pos.y)
+    } else {
+        state.space.element_under(world_pos).map(|(w, loc)| (w.clone(), loc))
+    };
+    
+    let under = under.and_then(|(w, loc)| {
         let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc.x as f64, loc.y as f64).into();
         let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
         w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL).map(|(surf, surf_loc)| {
@@ -433,7 +493,13 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
     let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (pos.x + state.camera_offset.0, pos.y + state.camera_offset.1).into();
 
     if let Some(ptr) = state.seat.get_pointer() {
-        let under = state.space.element_under(world_pos).and_then(|(w, loc)| {
+        let under = if state.layout_mode == crate::state::LayoutMode::Physics {
+            state.physics_element_under(world_pos.x, world_pos.y)
+        } else {
+            state.space.element_under(world_pos).map(|(w, loc)| (w.clone(), loc))
+        };
+        
+        let under = under.and_then(|(w, loc)| {
             let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc.x as f64, loc.y as f64).into();
             let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
             w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL).map(|(surf, surf_loc)| {
@@ -445,7 +511,11 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
     }
 
     if btn_state == ButtonState::Pressed {
-        let window = state.space.element_under(world_pos).map(|(w, _)| w.clone());
+        let window = if state.layout_mode == crate::state::LayoutMode::Physics {
+            state.physics_element_under(world_pos.x, world_pos.y).map(|(w, _)| w)
+        } else {
+            state.space.element_under(world_pos).map(|(w, _)| w.clone())
+        };
         if let Some(window) = window {
             let win_clone = window.clone();
             state.focus_window(&win_clone);

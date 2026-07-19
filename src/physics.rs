@@ -58,14 +58,28 @@ impl WindowPhysics {
     /// Небольшой `linear_damping` гасит горизонтальное скольжение; окна не
     /// должны кататься по полу вечно.
     pub fn spawn_window(&mut self, x: Real, y: Real, w: Real, h: Real) -> RigidBodyHandle {
+        // Масса ∝ площади окна (density × w × h): большие окна тяжелее и
+        // инертнее, маленькие легче опрокидываются и крутятся.
+        const DENSITY: Real = 0.002; // kg/px² — подобранно визуально под GRAVITY_Y
         let (body, _collider) = self.world.insert(
             RigidBodyBuilder::dynamic()
                 .translation(Vector::new(x, y))
-                .linear_damping(2.0)
-                .lock_rotations(),
-            ColliderBuilder::cuboid(w * 0.5, h * 0.5).friction(0.7),
+                .linear_damping(1.5)
+                .angular_damping(3.5),
+            ColliderBuilder::cuboid(w * 0.5, h * 0.5)
+                .density(DENSITY)
+                .friction(0.85)
+                .restitution(0.2),
         );
         body
+    }
+
+    /// Задаёт угловую скорость (рад/с). Используется для удержания Super+A/D:
+    /// solver интегрирует поворот вместе со столкновениями (без телепорта угла).
+    pub fn set_angular_velocity(&mut self, handle: RigidBodyHandle, omega: Real) {
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            body.set_angvel(omega, true);
+        }
     }
 
     /// Удаляет тело окна (и его коллайдер). Вызывается при закрытии окна

@@ -284,14 +284,17 @@ pub fn run_tty(
                 (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
             );
 
-            // Окна из space, маппим в общий enum с курсором.
-            let mut elements: Vec<CustomRenderElements> = state
-                .space
-                .render_elements_for_output(&mut renderer, &output_t, 1.0)
-                .unwrap_or_default()
-                .into_iter()
-                .map(CustomRenderElements::Space)
-                .collect();
+            let mut elements: Vec<CustomRenderElements> = if state.layout_mode == crate::state::LayoutMode::Tiling {
+                state
+                    .space
+                    .render_elements_for_output(&mut renderer, &output_t, 1.0)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(CustomRenderElements::Space)
+                    .collect()
+            } else {
+                crate::render::collect_physics_elements(&mut renderer, state)
+            };
 
             // Вставляем визуальный пол в конец вектора (рендерится позади окон)
             if state.layout_mode == crate::state::LayoutMode::Physics {
@@ -361,13 +364,138 @@ pub fn run_tty(
                     Kind::Cursor,
                 ),
             ));
+            // --- Screencopy: capture BEFORE the DRM render so the renderer
+            //     is in a clean state and we get a reliable offscreen render. ---
+            {
+                let pending_screencopies = {
+                    let mut frames = state.screencopy_state.pending_frames.lock().unwrap();
+                    let mut ready = Vec::new();
+                    let mut i = 0;
+                    while i < frames.len() {
+                        if frames[i].buffer.is_some() {
+                            ready.push(frames.remove(i));
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    ready
+                };
+
+                if !pending_screencopies.is_empty() {
+                    use smithay::backend::renderer::{Offscreen, Bind, ExportMem, Renderer as _, Frame as _};
+                    use smithay::backend::renderer::element::{RenderElement as _, Element as _};
+                    use smithay::utils::{Size, Physical, Scale};
+                    use smithay::utils::Buffer as BufferCoords;
+
+                    let screen_size = output_t.current_mode().map(|m| m.size).unwrap_or((1920, 1080).into());
+                    let screen_size_buffer: Size<i32, BufferCoords> = Size::from((screen_size.w, screen_size.h));
+                    let screen_size_physical: Size<i32, Physical> = Size::from((screen_size.w, screen_size.h));
+                    // Use RGBA (Abgr8888 in DRM fourcc) — universally supported in GLES
+                    let format = smithay::backend::allocator::Fourcc::Abgr8888;
+
+                    let capture_result: Result<(), Box<dyn std::error::Error>> = (|| {
+                        let mut offscreen_target: smithay::backend::renderer::gles::GlesTexture =
+                            renderer.create_buffer(format, screen_size_buffer)
+                                .map_err(|e| format!("create_buffer: {e:?}"))?;
+
+                        let mut target = renderer.bind(&mut offscreen_target)
+                            .map_err(|e| format!("bind: {e:?}"))?;
+
+                        // Manual render pass (no damage tracker — always full redraw)
+                        {
+                            let mut frame = renderer.render(&mut target, screen_size_physical, Transform::Normal)
+                                .map_err(|e| format!("render: {e:?}"))?;
+
+                            let full_rect = smithay::utils::Rectangle::<i32, Physical>::from_size(screen_size_physical);
+                            frame.clear(
+                                smithay::backend::renderer::Color32F::from([0.08f32, 0.08, 0.12, 1.0]),
+                                &[full_rect],
+                            ).map_err(|e| format!("clear: {e:?}"))?;
+
+                            // Draw elements back-to-front (elements vec is front-to-back,
+                            // so iterate in reverse for correct layering)
+                            let scale = Scale::from(1.0f64);
+                            for element in elements.iter().rev() {
+                                let geo = element.geometry(scale);
+                                let _ = element.draw(&mut frame, element.src(), geo, &[geo], &[]);
+                            }
+                            // GlesFrame::drop finishes the render pass
+                        }
+
+                        // Read back pixels from the offscreen FBO
+                        let mapping = renderer.copy_framebuffer(
+                            &target,
+                            smithay::utils::Rectangle::from_size(screen_size_buffer),
+                            format,
+                        ).map_err(|e| format!("copy_framebuffer: {e:?}"))?;
+
+                        let rgba_data = renderer.map_texture(&mapping)
+                            .map_err(|e| format!("map_texture: {e:?}"))?;
+
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or(Duration::ZERO);
+                        let tv_sec_hi = (now.as_secs() >> 32) as u32;
+                        let tv_sec_lo = (now.as_secs() & 0xFFFFFFFF) as u32;
+                        let tv_nsec = now.subsec_nanos();
+
+                        let height = screen_size.h as usize;
+                        let width = screen_size.w as usize;
+                        let stride = width * 4;
+
+                        for pending in pending_screencopies {
+                            if let Some(wl_buffer) = pending.buffer {
+                                let _ = smithay::wayland::shm::with_buffer_contents_mut(
+                                    &wl_buffer,
+                                    |ptr, len, _info| {
+                                        let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                                        // Convert RGBA→BGRA (channel swap) + flip Y
+                                        // (GL reads bottom-to-top, SHM expects top-to-bottom)
+                                        for row in 0..height {
+                                            let src_row = (height - 1 - row) * stride; // Y-flip
+                                            let dst_row = row * stride;
+                                            for px in 0..width {
+                                                let si = src_row + px * 4;
+                                                let di = dst_row + px * 4;
+                                                if di + 3 < dst.len() && si + 3 < rgba_data.len() {
+                                                    dst[di]     = rgba_data[si + 2]; // B ← R
+                                                    dst[di + 1] = rgba_data[si + 1]; // G ← G
+                                                    dst[di + 2] = rgba_data[si];     // R ← B
+                                                    dst[di + 3] = rgba_data[si + 3]; // A ← A
+                                                }
+                                            }
+                                        }
+                                    },
+                                );
+                                pending.frame.flags(
+                                    wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_frame_v1::Flags::empty(),
+                                );
+                                pending.frame.ready(tv_sec_hi, tv_sec_lo, tv_nsec);
+                            }
+                        }
+                        Ok(())
+                    })();
+
+                    if let Err(e) = capture_result {
+                        eprintln!("[screencopy] capture failed: {e}");
+                    }
+                }
+            }
+            // --- End Screencopy ---
 
             let mut comp = compositor_t.borrow_mut();
+            let frame_flags = if state.layout_mode == crate::state::LayoutMode::Physics {
+                // Без plane-scanout: иначе DRM кладёт неповёрнутый буфер на
+                // плоскость рядом с GLES-поворотом → «копия» окна на кадр.
+                FrameFlags::empty()
+            } else {
+                FrameFlags::DEFAULT
+            };
             match comp.render_frame::<_, _>(
                 &mut renderer,
                 &elements,
                 [0.08, 0.08, 0.12, 1.0],
-                FrameFlags::DEFAULT,
+                frame_flags,
             ) {
                 Ok(_result) => {
                     comp.queue_frame(()).ok();
@@ -381,6 +509,8 @@ pub fn run_tty(
                             |_, _| Some(output_t.clone()),
                         );
                     }
+
+
                     // Frame submitted successfully — clear the damage flag so we
                     // don't render again until the next real change.
                     state.needs_render = false;
