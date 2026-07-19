@@ -121,12 +121,16 @@ src/
 ├── input.rs           — Input (keyboard/mouse), hotkeys, drag, Super+A/D spin.
 ├── tiling.rs          — BSP/Dwindle tile tree (TileNode).
 ├── physics.rs         — rapier2d wrapper: world, gravity, floor, window bodies, ω.
+├── config.rs          — TOML config loader (physics, keybinds; stubs for future features).
 ├── render.rs          — CustomRenderElements + PhysicsElement (GLES window rotation).
 ├── screencopy.rs      — wlr-screencopy-unstable-v1 (screen capture).
 └── output_manager.rs  — wlr-output-management-unstable-v1.
+config/sandboxWM.toml    — Example config (also ~/.config/sandboxWM/config.toml).
 sandboxWM_concept.md     — Final project vision (concept in Russian).
 sandboxWM_concept_EN.md  — Final project vision (concept in English).
 ```
+
+Config loads at startup (`SANDBOXWM_CONFIG` → XDG → `./config/sandboxWM.toml`). `[physics]` and `[controls]` are live; drawing/materials/joints/soft_body/slicing/session/window_props are empty stubs.
 
 ---
 

@@ -20,6 +20,7 @@ use crate::state::LayoutMode;
 
 // BTN_LEFT = 272 (0x110)
 const BTN_LEFT: u32 = 272;
+const BTN_MIDDLE: u32 = 274;
 
 pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) {
     match event {
@@ -157,19 +158,20 @@ fn handle_key(
         }
     }
 
-    // Super+A / Super+D — зажал = крутится, отпустил = угол фиксируется, тело снова свободно
+    // Spin hold/release (physics): клавиши из controls.spin_left / spin_right
     if app_state.layout_mode == LayoutMode::Physics {
-        let is_a = keysym == xkb::KEY_a || keysym == xkb::KEY_A;
-        let is_d = keysym == xkb::KEY_d || keysym == xkb::KEY_D;
-        if is_a || is_d {
+        let ctrl = &app_state.config.controls;
+        let is_left = crate::config::ControlsConfig::matches_key(&ctrl.spin_left, keysym);
+        let is_right = crate::config::ControlsConfig::matches_key(&ctrl.spin_right, keysym);
+        if is_left || is_right {
             if key_state == KeyState::Pressed && modifiers.logo {
-                app_state.physics_spin_hold(if is_a { -1.0 } else { 1.0 });
+                app_state.physics_spin_hold(if is_left { -1.0 } else { 1.0 });
                 return FilterResult::Intercept(());
             }
             if key_state == KeyState::Released && app_state.physics_spin_dir != 0.0 {
-                let holding_a = app_state.physics_spin_dir < 0.0;
-                let holding_d = app_state.physics_spin_dir > 0.0;
-                if (is_a && holding_a) || (is_d && holding_d) {
+                let holding_left = app_state.physics_spin_dir < 0.0;
+                let holding_right = app_state.physics_spin_dir > 0.0;
+                if (is_left && holding_left) || (is_right && holding_right) {
                     app_state.physics_spin_release();
                     return FilterResult::Intercept(());
                 }
@@ -185,98 +187,91 @@ fn handle_key(
         return FilterResult::Forward;
     }
 
-    match keysym {
-        // Super+Enter → spawn kitty
-        xkb::KEY_Return => {
-            let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
-            std::process::Command::new("kitty")
+    let ctrl = &app_state.config.controls;
+    let step = app_state.config.physics.camera_step;
+    let mk = |name: &str| crate::config::ControlsConfig::matches_key(name, keysym);
+
+    if mk(&ctrl.spawn_terminal) {
+        let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+        let mut parts = ctrl.terminal.split_whitespace();
+        if let Some(cmd) = parts.next() {
+            let mut c = std::process::Command::new(cmd);
+            c.args(parts)
                 .env("WAYLAND_DISPLAY", &wayland_display)
-                .env_remove("DISPLAY")
-                .spawn()
-                .ok();
-            FilterResult::Intercept(())
+                .env_remove("DISPLAY");
+            let _ = c.spawn();
         }
+        return FilterResult::Intercept(());
+    }
 
-        // Super+G → toggle Tiling ↔ Physics
-        xkb::KEY_g | xkb::KEY_G => {
-            app_state.toggle_physics();
-            FilterResult::Intercept(())
+    if mk(&ctrl.toggle_physics) {
+        app_state.toggle_physics();
+        return FilterResult::Intercept(());
+    }
+
+    if ctrl.is_quit(keysym) {
+        app_state.running = false;
+        return FilterResult::Intercept(());
+    }
+
+    if mk(&ctrl.camera_right) {
+        if app_state.layout_mode == LayoutMode::Physics {
+            app_state.move_camera(step, 0.0);
+        } else {
+            app_state.focus_next(true);
         }
-
-        // Super+Q → quit WM
-        xkb::KEY_q | xkb::KEY_Q => {
-            app_state.running = false;
-            FilterResult::Intercept(())
+        return FilterResult::Intercept(());
+    }
+    if mk(&ctrl.camera_left) {
+        if app_state.layout_mode == LayoutMode::Physics {
+            app_state.move_camera(-step, 0.0);
+        } else {
+            app_state.focus_next(false);
         }
-
-        // Super+Escape → quit WM
-        xkb::KEY_Escape => {
-            app_state.running = false;
-            FilterResult::Intercept(())
+        return FilterResult::Intercept(());
+    }
+    if mk(&ctrl.camera_up) {
+        if app_state.layout_mode == LayoutMode::Physics {
+            app_state.move_camera(0.0, -step);
+        } else {
+            app_state.focus_next(true);
         }
-
-        // Super+Right/Left/Up/Down → focus (Tiling) или камера (Physics)
-        xkb::KEY_Right => {
-            if app_state.layout_mode == LayoutMode::Physics {
-                app_state.move_camera(120.0, 0.0);
-            } else {
-                app_state.focus_next(true);
-            }
-            FilterResult::Intercept(())
+        return FilterResult::Intercept(());
+    }
+    if mk(&ctrl.camera_down) {
+        if app_state.layout_mode == LayoutMode::Physics {
+            app_state.move_camera(0.0, step);
+        } else {
+            app_state.focus_next(false);
         }
+        return FilterResult::Intercept(());
+    }
 
-        xkb::KEY_Left => {
-            if app_state.layout_mode == LayoutMode::Physics {
-                app_state.move_camera(-120.0, 0.0);
-            } else {
-                app_state.focus_next(false);
-            }
-            FilterResult::Intercept(())
-        }
-
-        xkb::KEY_Up => {
-            if app_state.layout_mode == LayoutMode::Physics {
-                app_state.move_camera(0.0, -120.0);
-            } else {
-                app_state.focus_next(true);
-            }
-            FilterResult::Intercept(())
-        }
-
-        xkb::KEY_Down => {
-            if app_state.layout_mode == LayoutMode::Physics {
-                app_state.move_camera(0.0, 120.0);
-            } else {
-                app_state.focus_next(false);
-            }
-            FilterResult::Intercept(())
-        }
-
-        // Super+W → close focused window
-        xkb::KEY_w | xkb::KEY_W => {
-            let Some(kbd) = app_state.seat.get_keyboard() else {
-                return FilterResult::Intercept(());
-            };
-            let focused = kbd.current_focus();
-            if let Some(surf) = focused {
-                if let Some(win) = app_state.space.elements()
-                    .find(|w| {
-                        w.toplevel()
-                            .map(|t| t.wl_surface() == &surf)
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                {
-                    if let Some(toplevel) = win.toplevel() {
-                        toplevel.send_close();
-                    }
+    if mk(&ctrl.close_window) {
+        let Some(kbd) = app_state.seat.get_keyboard() else {
+            return FilterResult::Intercept(());
+        };
+        let focused = kbd.current_focus();
+        if let Some(surf) = focused {
+            if let Some(win) = app_state
+                .space
+                .elements()
+                .find(|w| {
+                    w.toplevel()
+                        .map(|t| t.wl_surface() == &surf)
+                        .unwrap_or(false)
+                })
+                .cloned()
+            {
+                if let Some(toplevel) = win.toplevel() {
+                    toplevel.send_close();
                 }
             }
-            FilterResult::Intercept(())
         }
-
-        _ => FilterResult::Forward,
+        return FilterResult::Intercept(());
     }
+
+    FilterResult::Forward
 }
 
 fn vt_number_from_keysym(keysym: u32) -> Option<i32> {
@@ -315,6 +310,10 @@ fn handle_pointer_motion(
     // ── Физический режим: drag тела мышью + hit-test с учётом поворота ──
     // Курсор здесь — экранные координаты; переводим в мировые (+ camera_offset).
     if state.layout_mode == LayoutMode::Physics {
+        // Удержание средней кнопки двигает камеру как схваченный холст.
+        if state.physics_camera_pan_update(x, y) {
+            return;
+        }
         let world_x = x + state.camera_offset.0;
         let world_y = y + state.camera_offset.1;
         let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
@@ -436,6 +435,17 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
 
     // Check if Super is held
     let super_held = state.seat.get_keyboard().map(|k| k.modifier_state().logo).unwrap_or(false);
+
+    // ── Физический режим: средняя кнопка панорамирует камеру ──────────────────
+    if state.layout_mode == LayoutMode::Physics && button == BTN_MIDDLE {
+        if btn_state == ButtonState::Pressed {
+            state.physics_camera_pan_begin(pos.x, pos.y);
+        } else {
+            state.physics_camera_pan_end();
+        }
+        state.needs_render = true;
+        return;
+    }
 
     // ── Физический режим: Super + ЛКМ тащит тело ────────────────────────────────
     if state.layout_mode == LayoutMode::Physics && button == BTN_LEFT {

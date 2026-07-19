@@ -56,6 +56,9 @@ pub struct AppState {
     pub display_handle: DisplayHandle,
     pub clock: Clock<Monotonic>,
 
+    /// Загруженный при старте TOML-конфиг (управление / физика / время + заглушки).
+    pub config: crate::config::Config,
+
     // Smithay states
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
@@ -91,6 +94,9 @@ pub struct AppState {
     // map_output(&output, (-cam_x, -cam_y)) — Smithay сам конвертирует мир→экран.
     pub camera_offset: (f64, f64),
     pub target_camera_offset: (f64, f64),
+    // Панорамирование камеры удержанием средней кнопки мыши.
+    pub camera_pan_active: bool,
+    pub camera_pan_last_ptr: Option<(f64, f64)>,
     // Окно, которое сейчас таскают мышью в физическом режиме, и его тело.
     pub drag_body: Option<(Window, rapier2d::prelude::RigidBodyHandle)>,
     pub drag_last_ptr: Option<(f64, f64)>,
@@ -99,9 +105,6 @@ pub struct AppState {
     pub physics_spin_dir: f32,
     // Тело, которое крутим (фиксируем на press, чтобы не зависеть от фокуса/borrow).
     pub physics_spin_body: Option<rapier2d::prelude::RigidBodyHandle>,
-    // Таймстеп симуляции (совпадает с тем, что задан в physics.set_dt()).
-    // Нужен в step_physics для расчёта скорости drag_to.
-    pub physics_dt: f32,
     // Счётчик визуальных изменений физики (угол/центр). Нужен PhysicsElement,
     // чтобы damage-tracker перерисовывал окно даже без нового wl_buffer.
     pub physics_visual_gen: usize,
@@ -145,6 +148,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(display_handle: DisplayHandle) -> Self {
+        let config = crate::config::Config::load();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
@@ -162,6 +166,7 @@ impl AppState {
         Self {
             display_handle,
             clock: Clock::new(),
+            config,
             compositor_state,
             shm_state,
             xdg_shell_state,
@@ -182,11 +187,12 @@ impl AppState {
             window_bodies: std::collections::HashMap::new(),
             camera_offset: (0.0, 0.0),
             target_camera_offset: (0.0, 0.0),
+            camera_pan_active: false,
+            camera_pan_last_ptr: None,
             drag_body: None,
             drag_last_ptr: None,
             physics_spin_dir: 0.0,
             physics_spin_body: None,
-            physics_dt: 1.0 / 60.0,
             physics_visual_gen: 0,
             physics_damage_history: std::collections::HashMap::new(),
             pending_configures: std::collections::HashSet::new(),
@@ -227,8 +233,8 @@ impl AppState {
     /// Tiling → Physics. Создаёт физический мир и спавнит тело для каждого
     /// уже отрисованного окна по его текущей позиции/размеру в Space.
     fn enter_physics_mode(&mut self) {
-        let mut phys = crate::physics::WindowPhysics::new();
-        phys.set_dt(self.physics_dt);
+        let mut phys = crate::physics::WindowPhysics::new(self.config.physics.clone());
+        phys.set_dt(self.config.physics.physics_dt);
         self.window_bodies.clear();
 
         // Снимаем снапшот геометрий до borrow phys.
@@ -272,6 +278,8 @@ impl AppState {
         self.physics_damage_history.clear();
         self.camera_offset = (0.0, 0.0);
         self.target_camera_offset = (0.0, 0.0);
+        self.camera_pan_active = false;
+        self.camera_pan_last_ptr = None;
         self.layout_mode = LayoutMode::Tiling;
         // Пересчитываем тайлы — окна встанут на свои места.
         self.recalculate_layout();
@@ -282,7 +290,9 @@ impl AppState {
     /// рендер-цикла (~60 Hz) только в физическом режиме.
     pub fn step_physics(&mut self) {
         // Снимаем копии до mutable borrow physics — иначе conflict с focused_*.
-        let dt = self.physics_dt;
+        let dt = self.config.physics.physics_dt;
+        let spin_rate = self.config.physics.spin_rate;
+        let camera_lerp = self.config.physics.camera_lerp;
         let drag = self.drag_body.as_ref().map(|(_, h)| *h);
         let drag_ptr = self.drag_last_ptr;
         let spin_dir = self.physics_spin_dir;
@@ -301,10 +311,9 @@ impl AppState {
         }
         // Super+A/D: задаём ω каждый кадр. Не телепортируем угол — иначе
         // коллайдер проходит сквозь соседей, а freeze после step ломает контакты.
-        const SPIN_RATE: f32 = 2.0;
         if spin_dir != 0.0 {
             if let Some(handle) = spin_body {
-                phys.set_angular_velocity(handle, spin_dir * SPIN_RATE);
+                phys.set_angular_velocity(handle, spin_dir * spin_rate);
             }
         }
         let step_dur = phys.step();
@@ -312,7 +321,7 @@ impl AppState {
         // Угол при этом остаётся от solver'а, столкновения работают.
         if spin_dir != 0.0 {
             if let Some(handle) = spin_body {
-                phys.set_angular_velocity(handle, spin_dir * SPIN_RATE);
+                phys.set_angular_velocity(handle, spin_dir * spin_rate);
             }
         }
         
@@ -330,8 +339,8 @@ impl AppState {
         let cam_dx = self.target_camera_offset.0 - self.camera_offset.0;
         let cam_dy = self.target_camera_offset.1 - self.camera_offset.1;
         if cam_dx * cam_dx + cam_dy * cam_dy > 0.5 {
-            self.camera_offset.0 += cam_dx * 0.15;
-            self.camera_offset.1 += cam_dy * 0.15;
+            self.camera_offset.0 += cam_dx * camera_lerp;
+            self.camera_offset.1 += cam_dy * camera_lerp;
             moving = true; // продолжаем форсировать 60 FPS, пока камера едет
         } else {
             self.camera_offset = self.target_camera_offset;
@@ -383,6 +392,39 @@ impl AppState {
         self.target_camera_offset.0 += dx;
         self.target_camera_offset.1 += dy;
         self.needs_render = true;
+    }
+
+    /// Начинает панорамирование камеры средней кнопкой мыши.
+    pub fn physics_camera_pan_begin(&mut self, screen_x: f64, screen_y: f64) -> bool {
+        if self.layout_mode != LayoutMode::Physics {
+            return false;
+        }
+        self.camera_pan_active = true;
+        self.camera_pan_last_ptr = Some((screen_x, screen_y));
+        self.target_camera_offset = self.camera_offset;
+        self.needs_render = true;
+        true
+    }
+
+    /// Сдвигает камеру как схваченный холст и возвращает true во время pan.
+    pub fn physics_camera_pan_update(&mut self, screen_x: f64, screen_y: f64) -> bool {
+        if !self.camera_pan_active {
+            return false;
+        }
+        if let Some((last_x, last_y)) = self.camera_pan_last_ptr {
+            self.camera_offset.0 -= screen_x - last_x;
+            self.camera_offset.1 -= screen_y - last_y;
+            self.target_camera_offset = self.camera_offset;
+        }
+        self.camera_pan_last_ptr = Some((screen_x, screen_y));
+        self.needs_render = true;
+        true
+    }
+
+    /// Заканчивает панорамирование камеры.
+    pub fn physics_camera_pan_end(&mut self) {
+        self.camera_pan_active = false;
+        self.camera_pan_last_ptr = None;
     }
 
     /// Спавнит тело для нового окна в физическом режиме. Окно появляется

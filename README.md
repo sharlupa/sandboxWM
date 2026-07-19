@@ -118,12 +118,15 @@ src/
 ├── input.rs           — ввод (клавиатура/мышь), горячие клавиши, drag, Super+A/D spin
 ├── tiling.rs          — BSP/Dwindle дерево тайлов (TileNode)
 ├── physics.rs         — обёртка над rapier2d: мир, гравитация, пол, тела окон, ω
+├── config.rs          — загрузка TOML-конфига (физика, хоткеи; заглушки будущих фич)
 ├── render.rs          — CustomRenderElements + PhysicsElement (GLES-поворот окон)
 ├── screencopy.rs      — wlr-screencopy-unstable-v1 (захват экрана)
 └── output_manager.rs  — wlr-output-management-unstable-v1
+config/sandboxWM.toml  — пример конфига (см. также ~/.config/sandboxWM/config.toml)
 sandboxWM_concept.md   — финальное видение проекта (концепт)
 ```
 
+Конфиг читается при старте (`SANDBOXWM_CONFIG` → XDG → `./config/sandboxWM.toml`). Секции `[physics]` и `[controls]` уже работают; `[drawing]`, `[materials]`, `[joints]`, `[soft_body]`, `[slicing]`, `[session]`, `[window_props]` — пустые заглушки под концепт.
 ---
 
 ## Архитектура (текущая реализация)

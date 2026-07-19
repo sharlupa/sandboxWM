@@ -6,6 +6,7 @@ pub mod render;
 pub mod physics;
 pub mod screencopy;
 pub mod output_manager;
+pub mod config;
 
 use std::sync::Arc;
 use smithay::reexports::calloop::EventLoop;

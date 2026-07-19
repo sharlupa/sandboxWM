@@ -298,9 +298,9 @@ pub fn run_tty(
 
             // Вставляем визуальный пол в конец вектора (рендерится позади окон)
             if state.layout_mode == crate::state::LayoutMode::Physics {
-                // Пол находится на Y = 2000
+                // Пол: мировая Y из config.physics.floor_y
                 let screen_w = output_t.current_mode().map(|m| m.size.w).unwrap_or(1920);
-                let floor_y = 2000 - state.camera_offset.1 as i32;
+                let floor_y = state.config.physics.floor_y as i32 - state.camera_offset.1 as i32;
                 
                 // Если пол попадает в экран, рисуем его
                 if floor_y > -100 && floor_y < 4000 {

@@ -14,40 +14,38 @@
 use rapier2d::math::Real;
 use rapier2d::prelude::*;
 
-/// Мировая Y-координата пола. Окна падают сверху и ложатся на эту высоту.
-/// Физический мир уходит в бесконечность во все стороны; пол — единственная
-/// граница снизу.
-const FLOOR_Y: Real = 2000.0;
-/// Гравитация в px/s². Реалистичные 9.81 на экране выглядят как невесомость
-/// (окна падают часами); 1500 даёт ощутимое, но не мгновенное падение.
-/// ВАЖНО: положительный знак — Logical/Smithay Y растёт ВНИЗ, а пол лежит
-/// на FLOOR_Y = +2000 (больший Y). Отрицательная гравитация тянула бы тела
-/// к меньшим Y, то есть вверх по экрану — именно так проявлялся баг
-/// "окна падают вверх".
-const GRAVITY_Y: Real = 1500.0;
-/// Полутолщина пола по X (он тянется от -FLOOR_HALF_W до +FLOOR_HALF_W).
-/// Достаточно велика, чтобы окна не улетали за край при обычной работе.
-const FLOOR_HALF_W: Real = 50_000.0;
-/// Полутолщина пола по Y (rapier принимает half-extents в `cuboid`).
-const FLOOR_HALF_H: Real = 100.0;
+use crate::config::PhysicsConfig;
 
 pub struct WindowPhysics {
     world: PhysicsWorld,
+    /// Копия physics-секции конфига (density/damping/drag и т.д.).
+    cfg: PhysicsConfig,
 }
 
 impl WindowPhysics {
-    pub fn new() -> Self {
+    /// Создаёт мир с гравитацией и полом из [`PhysicsConfig`].
+    ///
+    /// Гравитация в px/s² (не реалистичные 9.81 — на экране это выглядело бы
+    /// как невесомость). Положительный знак: Logical/Smithay Y растёт вниз.
+    pub fn new(cfg: PhysicsConfig) -> Self {
         let mut world = PhysicsWorld::new();
-        world.gravity = Vector::new(0.0, GRAVITY_Y);
+        world.gravity = Vector::new(0.0, cfg.gravity_y);
+        // Пиксельный масштаб и усиленный solver уменьшают взаимное проникновение.
+        world.integration_parameters.length_unit = 100.0;
+        world.integration_parameters.num_solver_iterations = 12;
+        world.integration_parameters.num_internal_pgs_iterations = 2;
+        world.integration_parameters.num_internal_stabilization_iterations = 4;
+        world.integration_parameters.max_ccd_substeps = 8;
 
         // Статический пол. fixed-тело не двигается под гравитацией и служит
         // бесконечной горизонтальной плоскостью, на которую падают окна.
         world.insert(
-            RigidBodyBuilder::fixed().translation(Vector::new(0.0, FLOOR_Y + FLOOR_HALF_H)),
-            ColliderBuilder::cuboid(FLOOR_HALF_W, FLOOR_HALF_H),
+            RigidBodyBuilder::fixed()
+                .translation(Vector::new(0.0, cfg.floor_y + cfg.floor_half_h)),
+            ColliderBuilder::cuboid(cfg.floor_half_w, cfg.floor_half_h),
         );
 
-        Self { world }
+        Self { world, cfg }
     }
 
     /// Спавнит динамическое окно заданного размера (`w`×`h`, логические px)
@@ -60,16 +58,18 @@ impl WindowPhysics {
     pub fn spawn_window(&mut self, x: Real, y: Real, w: Real, h: Real) -> RigidBodyHandle {
         // Масса ∝ площади окна (density × w × h): большие окна тяжелее и
         // инертнее, маленькие легче опрокидываются и крутятся.
-        const DENSITY: Real = 0.002; // kg/px² — подобранно визуально под GRAVITY_Y
         let (body, _collider) = self.world.insert(
             RigidBodyBuilder::dynamic()
                 .translation(Vector::new(x, y))
-                .linear_damping(1.5)
-                .angular_damping(3.5),
+                // Drag может разгонять окно достаточно быстро для tunneling.
+                // CCD проверяет весь путь тела между физическими шагами.
+                .ccd_enabled(true)
+                .linear_damping(self.cfg.linear_damping)
+                .angular_damping(self.cfg.angular_damping),
             ColliderBuilder::cuboid(w * 0.5, h * 0.5)
-                .density(DENSITY)
-                .friction(0.85)
-                .restitution(0.2),
+                .density(self.cfg.density)
+                .friction(self.cfg.friction)
+                .restitution(self.cfg.restitution),
         );
         body
     }
@@ -108,6 +108,29 @@ impl WindowPhysics {
     pub fn step(&mut self) -> std::time::Duration {
         let start = std::time::Instant::now();
         self.world.step();
+
+        // Аварийная координата под полом. Если CCD/solver всё же пропустили
+        // тело, возвращаем его над полом и гасим накопленную скорость.
+        let rescue_y = self.cfg.floor_y + self.cfg.floor_half_h / 0.25;
+        let escaped: Vec<RigidBodyHandle> = self.world.bodies.iter()
+            .filter(|(_, body)| body.is_dynamic() && body.translation().y > rescue_y)
+            .map(|(handle, _)| handle)
+            .collect();
+        for handle in escaped {
+            let vertical_extent = self.world.bodies.get(handle)
+                .and_then(|body| body.colliders().first().copied().map(|collider| (body.rotation().angle(), collider)))
+                .and_then(|(angle, collider)| self.world.colliders.get(collider).and_then(|c| c.shape().as_cuboid()).map(|cuboid| {
+                    let half = cuboid.half_extents;
+                    angle.sin().abs() / half.x.recip() + angle.cos().abs() / half.y.recip()
+                }))
+                .unwrap_or(50.0);
+            if let Some(body) = self.world.bodies.get_mut(handle) {
+                let safe_y = self.cfg.floor_y - vertical_extent - 4.0;
+                body.set_translation(Vector::new(body.translation().x, safe_y), true);
+                body.set_linvel(Vector::new(0.0, 0.0), true);
+                body.set_angvel(0.0, true);
+            }
+        }
         start.elapsed()
     }
 
@@ -159,16 +182,36 @@ impl WindowPhysics {
     /// полом/другими окнами solver был вынужден разрешать сильный удар за
     /// один шаг — это и есть лаг именно в момент release.
     pub fn drag_to(&mut self, handle: RigidBodyHandle, target_x: Real, target_y: Real, dt: Real) {
-        const MAX_DRAG_SPEED: Real = 4000.0; // px/s — быстрое, но не взрывное перетаскивание
+        // Жёсткий верхний предел дополняет CCD и не даёт drag создать
+        // экстремальный импульс, способный продавить стопку окон.
+        let max_speed = self.cfg.max_drag_speed;
+
+        // Во время drag курсор может уйти под пол, поэтому одна только контактная
+        // реакция solver'а недостаточна: каждый кадр мы снова задавали телу
+        // скорость вниз. Ограничиваем целевой центр верхней гранью пола с учётом
+        // текущего поворота прямоугольного коллайдера.
+        let floor_limit = self.world.bodies.get(handle).and_then(|body| {
+            let angle = body.rotation().angle();
+            let collider = body
+                .colliders()
+                .first()
+                .and_then(|collider_handle| self.world.colliders.get(*collider_handle))?;
+            let cuboid = collider.shape().as_cuboid()?;
+            let half = cuboid.half_extents;
+            let vertical_extent = angle.sin().abs() * half.x + angle.cos().abs() * half.y;
+            Some(self.cfg.floor_y - vertical_extent)
+        });
+        let target_y = floor_limit.map_or(target_y, |limit| target_y.min(limit));
+
         if let Some(body) = self.world.bodies.get_mut(handle) {
             let cur = body.translation();
             let mut vx = (target_x - cur.x) / dt;
             let mut vy = (target_y - cur.y) / dt;
-            let speed = (vx * vx + vy * vy).sqrt();
-            if speed > MAX_DRAG_SPEED {
-                let scale = MAX_DRAG_SPEED / speed;
-                vx *= scale;
-                vy *= scale;
+            let speed = vx.hypot(vy);
+            if speed > max_speed {
+                let scale = max_speed / speed;
+                vx = vx / scale.recip();
+                vy = vy / scale.recip();
             }
             body.set_linvel(Vector::new(vx, vy), true);
         }
