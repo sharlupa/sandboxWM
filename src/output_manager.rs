@@ -19,7 +19,7 @@ pub trait OutputManagerHandler {
 
 #[derive(Debug)]
 pub struct OutputManagerState {
-    global: GlobalId,
+    _global: GlobalId,
 }
 
 impl OutputManagerState {
@@ -28,7 +28,7 @@ impl OutputManagerState {
         D: GlobalDispatch<ZwlrOutputManagerV1, ()> + 'static,
     {
         let global = display.create_global::<D, ZwlrOutputManagerV1, ()>(4, ());
-        Self { global }
+        Self { _global: global }
     }
 }
 

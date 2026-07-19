@@ -15,7 +15,7 @@ use wayland_server::{
 // or ready to be fulfilled by the compositor's render loop.
 
 pub struct ScreencopyState {
-    global: GlobalId,
+    _global: GlobalId,
     // Frames that the client created but hasn't called `copy` on yet,
     // OR has called `copy` on and are waiting for the next render.
     pub pending_frames: Arc<Mutex<Vec<PendingFrame>>>,
@@ -37,7 +37,7 @@ impl ScreencopyState {
     {
         let global = display.create_global::<D, ZwlrScreencopyManagerV1, ()>(3, ());
         Self {
-            global,
+            _global: global,
             pending_frames: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -189,4 +189,3 @@ macro_rules! delegate_screencopy {
         ] => $crate::screencopy::ScreencopyState);
     };
 }
-
