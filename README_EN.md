@@ -6,6 +6,20 @@
 
 > ⚠️ **Status: early version (0.1.0).** This is a working prototype. Drawing tools, persistence, window joints, deformation, and slicing describe the project direction rather than shipping features.
 
+## Feature status
+
+| Feature | Status |
+|---|---|
+| Wayland compositor, BSP/Dwindle, and DRM/Winit | Implemented |
+| Window physics: gravity, collisions, floor, drag, rotation, and camera | Implemented |
+| Physics camera zoom and panning | Implemented |
+| wlr-screencopy screen capture | Basic implementation |
+| wlr-output-management | Read-only output state |
+| Cursor line drawing and physical materials | Not implemented |
+| Session persistence and window joints | Not implemented |
+| Soft windows, deformation, and slicing | Not implemented |
+ 
+
 ## Implemented
 
 - A **Smithay 0.7** Wayland compositor with `xdg_shell`, SHM, seat/input, outputs, server-side decorations, and clipboard support.
