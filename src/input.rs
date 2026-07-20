@@ -1,7 +1,7 @@
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, Event, InputEvent, KeyboardKeyEvent,
+            AbsolutePositionEvent, Event, InputEvent, KeyboardKeyEvent, Axis, PointerAxisEvent,
             PointerButtonEvent, PointerMotionEvent, ButtonState, KeyState,
         },
         session::Session,
@@ -58,6 +58,9 @@ pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) 
 
             handle_pointer_motion(state, pos.x, pos.y, serial, event.time_msec());
         }
+        InputEvent::PointerAxis { event } => {
+            handle_pointer_axis(state, event.amount(Axis::Vertical).unwrap_or(0.0));
+        }
         InputEvent::PointerButton { event } => {
             handle_pointer_button(state, event.button_code(), event.state(), event.time_msec());
         }
@@ -100,10 +103,19 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
 
             handle_pointer_motion(state, new_pos.0, new_pos.1, serial, event.time_msec());
         }
+        InputEvent::PointerAxis { event } => {
+            handle_pointer_axis(state, event.amount(Axis::Vertical).unwrap_or(0.0));
+        }
         InputEvent::PointerButton { event } => {
             handle_pointer_button(state, event.button_code(), event.state(), event.time_msec());
         }
         _ => {}
+    }
+}
+
+fn handle_pointer_axis(state: &mut AppState, vertical: f64) {
+    if state.layout_mode == LayoutMode::Physics && state.seat.get_keyboard().map(|keyboard| keyboard.modifier_state().logo).unwrap_or(false) && vertical != 0.0 {
+        state.zoom_camera(if vertical < 0.0 { 1.1 } else { 0.9 });
     }
 }
 
@@ -160,7 +172,9 @@ fn handle_key(
 
     // Spin hold/release (physics): клавиши из controls.spin_left / spin_right
     if app_state.layout_mode == LayoutMode::Physics {
-        let ctrl = &app_state.config.controls;
+        if app_state.layout_mode == LayoutMode::Physics && modifiers.logo && key_state == KeyState::Pressed { if keysym == xkb::KEY_minus { app_state.zoom_camera(0.9); return FilterResult::Intercept(()); } if keysym == xkb::KEY_equal { app_state.zoom_camera(1.1); return FilterResult::Intercept(()); } if keysym == xkb::KEY_0 { app_state.reset_camera(); return FilterResult::Intercept(()); } }
+
+    let ctrl = &app_state.config.controls;
         let is_left = crate::config::ControlsConfig::matches_key(&ctrl.spin_left, keysym);
         let is_right = crate::config::ControlsConfig::matches_key(&ctrl.spin_right, keysym);
         if is_left || is_right {
@@ -317,8 +331,7 @@ fn handle_pointer_motion(
         if state.physics_camera_pan_update(x, y) {
             return;
         }
-        let world_x = x + state.camera_offset.0;
-        let world_y = y + state.camera_offset.1;
+        let (world_x, world_y) = state.screen_to_world(x, y);
         let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
             (world_x, world_y).into();
         state.physics_drag_update(world_x, world_y);
@@ -402,7 +415,7 @@ fn handle_pointer_motion(
     }
 
     // Find surface under pointer for hover focus
-    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (pos.x + state.camera_offset.0, pos.y + state.camera_offset.1).into();
+    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = state.screen_to_world(pos.x, pos.y).into();
     let under = if state.layout_mode == crate::state::LayoutMode::Physics {
         state.physics_element_under(world_pos.x, world_pos.y)
     } else {
@@ -452,8 +465,7 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
 
     // ── Физический режим: Super + ЛКМ тащит тело ────────────────────────────────
     if state.layout_mode == LayoutMode::Physics && button == BTN_LEFT {
-        let world_x = pos.x + state.camera_offset.0;
-        let world_y = pos.y + state.camera_offset.1;
+        let (world_x, world_y) = state.screen_to_world(pos.x, pos.y);
         if btn_state == ButtonState::Pressed && super_held {
             // Фокусируем окно под курсором и начинаем drag тела.
             if state.physics_drag_begin(world_x, world_y) {
@@ -503,7 +515,7 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
         return;
     }
 
-    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (pos.x + state.camera_offset.0, pos.y + state.camera_offset.1).into();
+    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = state.screen_to_world(pos.x, pos.y).into();
 
     if let Some(ptr) = state.seat.get_pointer() {
         let under = if state.layout_mode == crate::state::LayoutMode::Physics {

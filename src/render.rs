@@ -33,6 +33,7 @@ render_elements! {
 pub struct PhysicsElement {
     pub inner: WaylandSurfaceRenderElement<GlesRenderer>,
     pub angle: f64,
+    pub zoom: f64,
     pub center: Point<f64, Physical>,
     /// Bounding rects from recent frames (buffer-age history). Unioned into
     /// damage so old silhouettes are cleared on every back-buffer.
@@ -42,7 +43,7 @@ pub struct PhysicsElement {
 }
 
 impl PhysicsElement {
-    fn bounding_geometry(center: Point<f64, Physical>, inner_geo: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+    fn bounding_geometry(center: Point<f64, Physical>, inner_geo: Rectangle<i32, Physical>, zoom: f64) -> Rectangle<i32, Physical> {
         let corners: [Point<f64, Physical>; 4] = [
             Point::from((inner_geo.loc.x as f64, inner_geo.loc.y as f64)),
             Point::from(((inner_geo.loc.x + inner_geo.size.w) as f64, inner_geo.loc.y as f64)),
@@ -56,7 +57,7 @@ impl PhysicsElement {
             dx * dx + dy * dy
         }).fold(0.0f64, f64::max);
 
-        let bounding_radius = max_sq_dist.sqrt().ceil() as i32;
+        let bounding_radius = (max_sq_dist.sqrt() * zoom).ceil() as i32;
         let bounding_diameter = bounding_radius * 2;
         let loc = Point::from((center.x as i32 - bounding_radius, center.y as i32 - bounding_radius));
         Rectangle::new(loc, (bounding_diameter, bounding_diameter).into())
@@ -68,7 +69,7 @@ impl Element for PhysicsElement {
     fn current_commit(&self) -> CommitCounter { self.visual_commit }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        Self::bounding_geometry(self.center, self.inner.geometry(scale))
+        Self::bounding_geometry(self.center, self.inner.geometry(scale), self.zoom)
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> { self.inner.src() }
@@ -130,6 +131,7 @@ impl RenderElement<GlesRenderer> for PhysicsElement {
         let mut mat = Matrix3::<f32>::identity();
         mat = mat * Matrix3::from_translation(Vector2::new(self.center.x as f32, self.center.y as f32));
         mat = mat * Matrix3::from_angle_z(cgmath::Rad(self.angle as f32));
+        mat = mat * Matrix3::from_scale(self.zoom as f32);
         let orig = self.inner.geometry(Scale::from(1.0));
         let dx = orig.loc.x as f32 - self.center.x as f32;
         let dy = orig.loc.y as f32 - self.center.y as f32;
@@ -182,8 +184,9 @@ pub fn collect_physics_elements(
 
     let visual_commit = CommitCounter::from(state.physics_visual_gen);
     let cam = state.camera_offset;
+    let zoom = state.camera_zoom;
 
-    let snapshots: Vec<(Window, f64, f64, f64, i32, i32)> = {
+    let snapshots: Vec<(Window, f64, f64, f64, f64, i32, i32)> = {
         let Some(phys) = state.physics.as_ref() else {
             return phys_elements;
         };
@@ -194,13 +197,14 @@ pub fn collect_physics_elements(
                 let &handle = state.window_bodies.get(win)?;
                 let (cx, cy, angle) = phys.body_transform(handle)?;
                 let win_geom = state.space.element_geometry(win).unwrap_or_default();
-                let screen_cx = cx as f64 - cam.0;
-                let screen_cy = cy as f64 - cam.1;
+                let screen_cx = (cx as f64 - cam.0) * zoom;
+                let screen_cy = (cy as f64 - cam.1) * zoom;
                 Some((
                     win.clone(),
                     screen_cx,
                     screen_cy,
                     angle as f64,
+                    zoom,
                     win_geom.size.w,
                     win_geom.size.h,
                 ))
@@ -208,7 +212,7 @@ pub fn collect_physics_elements(
             .collect()
     };
 
-    for (win, screen_cx, screen_cy, angle, w, h) in snapshots {
+    for (win, screen_cx, screen_cy, angle, zoom, w, h) in snapshots {
         let location = (
             (screen_cx - w as f64 / 2.0).round() as i32,
             (screen_cy - h as f64 / 2.0).round() as i32,
@@ -236,6 +240,7 @@ pub fn collect_physics_elements(
             let elem = PhysicsElement {
                 inner: e,
                 angle,
+                zoom,
                 center,
                 damage_history: damage_history.clone(),
                 visual_commit,

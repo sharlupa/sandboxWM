@@ -106,6 +106,7 @@ pub struct AppState {
     // map_output(&output, (-cam_x, -cam_y)) — Smithay сам конвертирует мир→экран.
     pub camera_offset: (f64, f64),
     pub target_camera_offset: (f64, f64),
+    pub camera_zoom: f64,
     // Панорамирование камеры удержанием средней кнопки мыши.
     pub camera_pan_active: bool,
     pub camera_pan_last_ptr: Option<(f64, f64)>,
@@ -204,6 +205,7 @@ impl AppState {
             window_bodies: std::collections::HashMap::new(),
             camera_offset: (0.0, 0.0),
             target_camera_offset: (0.0, 0.0),
+            camera_zoom: 1.0,
             camera_pan_active: false,
             camera_pan_last_ptr: None,
             drag_body: None,
@@ -295,6 +297,7 @@ impl AppState {
         self.physics_damage_history.clear();
         self.camera_offset = (0.0, 0.0);
         self.target_camera_offset = (0.0, 0.0);
+        self.camera_zoom = 1.0;
         self.camera_pan_active = false;
         self.camera_pan_last_ptr = None;
         self.layout_mode = LayoutMode::Tiling;
@@ -400,6 +403,26 @@ impl AppState {
 
     /// Смещает камеру на `(dx, dy)` в мировых координатах. Фактическое
     /// смещение вида применяется в рендер-цикле через map_output.
+    pub fn screen_to_world(&self, x: f64, y: f64) -> (f64, f64) {
+        (x / self.camera_zoom + self.camera_offset.0, y / self.camera_zoom + self.camera_offset.1)
+    }
+
+    pub fn zoom_camera(&mut self, factor: f64) {
+        if self.layout_mode != LayoutMode::Physics { return; }
+        self.camera_zoom = (self.camera_zoom * factor).clamp(0.25, 3.0);
+        self.physics_visual_gen = self.physics_visual_gen.wrapping_add(1);
+        self.needs_render = true;
+    }
+
+    pub fn reset_camera(&mut self) {
+        if self.layout_mode != LayoutMode::Physics { return; }
+        self.camera_offset = (0.0, 0.0);
+        self.target_camera_offset = (0.0, 0.0);
+        self.camera_zoom = 1.0;
+        self.physics_visual_gen = self.physics_visual_gen.wrapping_add(1);
+        self.needs_render = true;
+    }
+
     pub fn move_camera(&mut self, dx: f64, dy: f64) {
         self.target_camera_offset.0 += dx;
         self.target_camera_offset.1 += dy;
