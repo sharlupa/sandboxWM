@@ -6,19 +6,29 @@
 
 > ⚠️ **Status: early version (0.1.0).** This is a working prototype. Drawing tools, persistence, window joints, deformation, and slicing describe the project direction rather than shipping features.
 
-## Feature status
+## Current Implementation vs. Final Concept
 
 | Feature | Status |
-|---|---|
-| Wayland compositor, BSP/Dwindle, and DRM/Winit | Implemented |
-| Window physics: gravity, collisions, floor, drag, rotation, and camera | Implemented |
-| Physics camera zoom and panning | Implemented |
-| wlr-screencopy screen capture | Basic implementation |
-| wlr-output-management | Read-only output state |
-| Cursor line drawing and physical materials | Not implemented |
-| Session persistence and window joints | Not implemented |
-| Soft windows, deformation, and slicing | Not implemented |
- 
+|---------|--------|
+| Wayland compositor: compositor, shm, xdg_shell, seat, output | ✅ Implemented |
+| Dual backends: Winit and DRM/KMS from TTY | ✅ Implemented |
+| BSP/Dwindle tiling manager | ✅ Implemented |
+| Hotkeys, focus, and mouse tile resizing | ✅ Implemented |
+| VT switching | ✅ Implemented |
+| On-demand rendering: damage-gating | ✅ Implemented |
+| Software cursor in DRM/KMS | ✅ Implemented |
+| Window physics: gravity, floor, collisions, drag, and camera | ✅ Implemented |
+| Physics camera zoom and panning | ✅ Super+-/Super+=, Super+0, Super+wheel, and middle-button pan |
+| Window rotation in physics mode | ✅ Implemented |
+| DMA-BUF client buffer import | ✅ Implemented |
+| wlr-screencopy and wlr-output-management | ✅ Basic globals |
+| XDG Decoration | ✅ Implemented |
+| Physical line drawing: steel, glue, trampoline, rope | 📋 Concept, not implemented |
+| Session persistence | 📋 Concept, not implemented |
+| Window joining: Weld and Spring joints | 📋 Concept, not implemented |
+| Window deformation: soft bodies and mesh | 📋 Concept, not implemented |
+| Inverse projection for distorted text | 📋 Concept, not implemented |
+| Window slicing through wp_viewporter | 📋 Concept, not implemented |
 
 ## Implemented
 
