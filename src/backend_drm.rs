@@ -265,6 +265,19 @@ pub fn run_tty(
                 state.step_physics();
             }
 
+            // Screencopy-клиент (OBS через portal-wlr) ждёт кадр — будим рендер,
+            // даже если сцена статична: иначе захват замирает/чернеет.
+            if !state.needs_render
+                && state
+                    .screencopy_state
+                    .pending_frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f.buffer.is_some())
+            {
+                state.needs_render = true;
+            }
             if state.session_paused || !state.needs_render {
                 return smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
                     Duration::from_millis(16),
@@ -415,9 +428,22 @@ pub fn run_tty(
                             // Draw elements back-to-front (elements vec is front-to-back,
                             // so iterate in reverse for correct layering)
                             let scale = Scale::from(1.0f64);
+                            let mut draw_errors: Vec<String> = Vec::new();
                             for element in elements.iter().rev() {
                                 let geo = element.geometry(scale);
-                                let _ = element.draw(&mut frame, element.src(), geo, &[geo], &[]);
+                                // damage должен быть в ЛОКАЛЬНЫХ координатах элемента
+                                // (относительно dst), а не в абсолютных: иначе элементы
+                                // с большим loc (правые окна, пол, курсор) обрезаются.
+                                let local_damage = [smithay::utils::Rectangle::<i32, Physical>::from_size(geo.size)];
+                                if let Err(e) = element.draw(&mut frame, element.src(), geo, &local_damage, &[]) {
+                                    draw_errors.push(format!("{e:?}"));
+                                }
+                            }
+                            if !draw_errors.is_empty() {
+                                use std::io::Write as _;
+                                if let Ok(mut lf) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sandboxwm-capture.log") {
+                                    let _ = writeln!(lf, "draw errors: {} first: {}", draw_errors.len(), draw_errors[0]);
+                                }
                             }
                             // GlesFrame::drop finishes the render pass
                         }
@@ -443,16 +469,29 @@ pub fn run_tty(
                         let width = screen_size.w as usize;
                         let stride = width * 4;
 
+                        {
+                            use std::io::Write as _;
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static CAP_LOG: AtomicU32 = AtomicU32::new(0);
+                            let n = CAP_LOG.fetch_add(1, Ordering::Relaxed);
+                            if n % 60 == 0 {
+                                let mode_str = if state.layout_mode == crate::state::LayoutMode::Physics { "phys" } else { "tile" };
+                                if let Ok(mut lf) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sandboxwm-capture.log") {
+                                    let _ = writeln!(lf, "capture #{n} mode={mode_str} elements={}", elements.len());
+                                }
+                            }
+                        }
                         for pending in pending_screencopies {
                             if let Some(wl_buffer) = pending.buffer {
                                 let _ = smithay::wayland::shm::with_buffer_contents_mut(
                                     &wl_buffer,
                                     |ptr, len, _info| {
                                         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                                        // Convert RGBA→BGRA (channel swap) + flip Y
-                                        // (GL reads bottom-to-top, SHM expects top-to-bottom)
+                                        // Convert RGBA→BGRA (channel swap).
+                                        // Без Y-флипа: offscreen-текстура уже отдаётся
+                                        // строками сверху-вниз, ручной флип переворачивал картинку.
                                         for row in 0..height {
-                                            let src_row = (height - 1 - row) * stride; // Y-flip
+                                            let src_row = row * stride;
                                             let dst_row = row * stride;
                                             for px in 0..width {
                                                 let si = src_row + px * 4;
@@ -478,6 +517,10 @@ pub fn run_tty(
 
                     if let Err(e) = capture_result {
                         eprintln!("[screencopy] capture failed: {e}");
+                        use std::io::Write as _;
+                        if let Ok(mut lf) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sandboxwm-capture.log") {
+                            let _ = writeln!(lf, "capture failed: {e}");
+                        }
                     }
                 }
             }

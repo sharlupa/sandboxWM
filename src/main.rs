@@ -43,14 +43,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
     }
     
+    if in_tty {
     // Notify dbus of the Wayland socket for xdg-desktop-portal
-    let _ = std::process::Command::new("dbus-update-activation-environment")
-        .arg("--systemd")
-        .arg("WAYLAND_DISPLAY")
-        .arg("XDG_CURRENT_DESKTOP")
-        .arg("XDG_SESSION_TYPE")
-        .spawn()
-        .map(|mut child| child.wait());
+        let _ = std::process::Command::new("dbus-update-activation-environment")
+            .arg("--systemd")
+            .arg("WAYLAND_DISPLAY")
+            .arg("XDG_CURRENT_DESKTOP")
+            .arg("XDG_SESSION_TYPE")
+            .spawn()
+            .map(|mut child| child.wait());
+
+        // Перезапускаем портальный стек, чтобы он подхватил новое окружение.
+        // Уже работающий xdg-desktop-portal мог быть активирован из другой
+        // сессии (например, Hyprland) со старым XDG_CURRENT_DESKTOP и не
+        // перечитывает окружение сам — из-за этого запрос ScreenCast от OBS
+        // уходил в бэкенд чужого композитора (диалог выбора экрана появлялся
+        // в Hyprland). После рестарта портал увидит
+        // XDG_CURRENT_DESKTOP=sandboxWM, возьмёт sandboxWM-portals.conf и
+        // активирует xdg-desktop-portal-wlr, привязанный уже к нашему сокету.
+        //
+        // ВАЖНО: --no-block обязателен. Без него systemctl ждёт полного
+        // старта сервисов, а xdg-desktop-portal-wlr при старте подключается
+        // к нашему Wayland-сокету, event loop которого здесь ещё не запущен —
+        // блокирующий вызов привёл бы к взаимной блокировке.
+        // Отложенный и упорядоченный рестарт в фоне: сначала ждём пару
+        // секунд, пока DRM-бэкенд поднимет выходы и начнётся диспетчеризация,
+        // затем стартуем wlr-бэкенд и только после него — основной портал.
+        // Основной портал опрашивает бэкенды один раз на старте: если wlr
+        // ещё не на шине, интерфейс ScreenCast не экспортируется вовсе
+        // (симптом: в OBS нет пункта «Захват экрана (PipeWire)»).
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2; systemctl --user restart --no-block xdg-desktop-portal-wlr.service; sleep 1; systemctl --user restart --no-block xdg-desktop-portal.service")
+            .spawn();
+    }
 
     loop_handle.insert_source(listening_socket, |client_stream, _, state| {
         state.display_handle.insert_client(

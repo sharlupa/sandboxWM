@@ -1,6 +1,6 @@
 use smithay::{
     backend::session::libseat::LibSeatSession,
-    desktop::{Space, Window},
+    desktop::{PopupKind, PopupManager, Space, Window},
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -63,6 +63,7 @@ pub struct AppState {
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
     pub xdg_shell_state: XdgShellState,
+    pub popup_manager: PopupManager,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub xdg_decoration_state: XdgDecorationState,
@@ -170,6 +171,7 @@ impl AppState {
             compositor_state,
             shm_state,
             xdg_shell_state,
+            popup_manager: PopupManager::default(),
             output_manager_state,
             wlr_output_manager_state,
             seat_state,
@@ -792,6 +794,8 @@ impl CompositorHandler for AppState {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
     fn commit(&mut self, surface: &WlSurface) {
+        self.popup_manager.commit(surface);
+        self.popup_manager.cleanup();
         // Обновляем буферы рендера
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
@@ -957,9 +961,17 @@ impl XdgShellHandler for AppState {
         }
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        let _ = self.popup_manager.track_popup(PopupKind::Xdg(surface.clone()));
+        let _ = surface.send_configure();
+        self.needs_render = true;
+    }
     fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
-    fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {}
+    fn reposition_request(&mut self, surface: PopupSurface, _positioner: PositionerState, token: u32) {
+        surface.send_repositioned(token);
+        let _ = surface.send_configure();
+        self.needs_render = true;
+    }
 }
 smithay::delegate_xdg_shell!(AppState);
 

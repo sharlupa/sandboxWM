@@ -7,7 +7,7 @@ use wayland_protocols_wlr::screencopy::v1::server::{
 use wayland_server::{
     backend::GlobalId,
     protocol::{wl_buffer, wl_output},
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
 
 // We store pending captures.
@@ -90,6 +90,12 @@ where
                 // Send buffer information to client (ARGB8888 as standard format).
                 // wl_shm::Format::Argb8888 is 0.
                 frame.buffer(wayland_server::protocol::wl_shm::Format::Argb8888, width as u32, height as u32, (width * 4) as u32);
+                // Протокол v3: после перечисления всех типов буферов клиент
+                // ждёт buffer_done. Без него xdg-desktop-portal-wlr зависает
+                // и захват экрана не стартует.
+                if frame.version() >= 3 {
+                    frame.buffer_done();
+                }
                 
                 screencopy_state.pending_frames.lock().unwrap().push(PendingFrame {
                     frame,
@@ -112,6 +118,12 @@ where
                 
                 // wl_shm::Format::Argb8888 is 0.
                 frame.buffer(wayland_server::protocol::wl_shm::Format::Argb8888, width as u32, height as u32, (width * 4) as u32);
+                // Протокол v3: после перечисления всех типов буферов клиент
+                // ждёт buffer_done. Без него xdg-desktop-portal-wlr зависает
+                // и захват экрана не стартует.
+                if frame.version() >= 3 {
+                    frame.buffer_done();
+                }
                 
                 screencopy_state.pending_frames.lock().unwrap().push(PendingFrame {
                     frame,

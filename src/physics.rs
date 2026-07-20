@@ -134,6 +134,48 @@ impl WindowPhysics {
         start.elapsed()
     }
 
+    /// Жёстко удерживает всё повёрнутое окно внутри видимой области.
+    /// Возвращает true, если тело пришлось вернуть за границу экрана.
+    #[allow(dead_code)]
+    pub fn constrain_to_rect(
+        &mut self,
+        handle: RigidBodyHandle,
+        min_x: Real,
+        min_y: Real,
+        max_x: Real,
+        max_y: Real,
+    ) -> bool {
+        let Some(body) = self.world.bodies.get(handle) else { return false };
+        let Some(&collider_handle) = body.colliders().first() else { return false };
+        let Some(collider) = self.world.colliders.get(collider_handle) else { return false };
+        let Some(cuboid) = collider.shape().as_cuboid() else { return false };
+        let angle = body.rotation().angle();
+        let half = cuboid.half_extents;
+        let extent_x = angle.cos().abs() / half.x.recip() + angle.sin().abs() / half.y.recip();
+        let extent_y = angle.sin().abs() / half.x.recip() + angle.cos().abs() / half.y.recip();
+        let pos = body.translation();
+        let old_vel = body.linvel();
+
+        let low_x = min_x + extent_x;
+        let high_x = max_x - extent_x;
+        let low_y = min_y + extent_y;
+        let high_y = max_y - extent_y;
+        let mut x = if low_x <= high_x { pos.x.clamp(low_x, high_x) } else { (min_x + max_x) / 2.0 };
+        let mut y = if low_y <= high_y { pos.y.clamp(low_y, high_y) } else { (min_y + max_y) / 2.0 };
+        if !x.is_finite() { x = pos.x; }
+        if !y.is_finite() { y = pos.y; }
+        if x == pos.x && y == pos.y { return false; }
+
+        let mut vx = old_vel.x;
+        let mut vy = old_vel.y;
+        if x != pos.x && ((x <= low_x && vx < 0.0) || (x >= high_x && vx > 0.0)) { vx = 0.0; }
+        if y != pos.y && ((y <= low_y && vy < 0.0) || (y >= high_y && vy > 0.0)) { vy = 0.0; }
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            body.set_translation(Vector::new(x, y), true);
+            body.set_linvel(Vector::new(vx, vy), true);
+        }
+        true
+    }
     /// Возвращает количество тел в мире.
     pub fn body_count(&self) -> usize {
         self.world.bodies.len()
