@@ -313,7 +313,7 @@ pub fn run_tty(
             if state.layout_mode == crate::state::LayoutMode::Physics {
                 // Пол: мировая Y из config.physics.floor_y
                 let screen_w = output_t.current_mode().map(|m| m.size.w).unwrap_or(1920);
-                let floor_y = state.config.physics.floor_y as i32 - state.camera_offset.1 as i32;
+                let floor_y = ((state.config.physics.floor_y as f64 - state.camera_offset.1) * state.camera_zoom) as i32;
                 
                 // Если пол попадает в экран, рисуем его
                 if floor_y > -100 && floor_y < 4000 {
@@ -321,7 +321,7 @@ pub fn run_tty(
                     elements.push(CustomRenderElements::Cursor(
                         SolidColorRenderElement::from_buffer(
                             &floor_buf,
-                            (-5000 + screen_w / 2, floor_y),
+                            (state.camera_zoom.mul_add(-5000.0, 0.0) as i32 + screen_w / 2, floor_y),
                             1.0,
                             1.0,
                             Kind::Unspecified,

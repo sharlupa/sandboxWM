@@ -29,6 +29,10 @@
 | `Super+G` | Toggle tiling ↔ physics |
 | `Super+A` / `Super+D` | Hold to spin the focused window in physics mode |
 | `Super+Arrow keys` | Tiling: change focus; Physics: move camera |
+| `Super+-` / `Super+=` | Physics: zoom camera out / in |
+| `Super+0` | Physics: reset camera position and zoom |
+| `Super+wheel` | Physics: zoom camera (only while Super is held) |
+| Middle mouse button + drag | Physics: pan camera |
 | `Super+LMB` + drag | Tiling: resize split; Physics: drag a window body |
 | `LMB` | Focus and interact with a window |
 | `Ctrl+Alt+F1…F12` | Switch VT in TTY/DRM mode |
