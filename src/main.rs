@@ -41,6 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
         std::env::set_var("XDG_CURRENT_DESKTOP", "sandboxWM");
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
+        // Electron/Chromium (Discord, VS Code, ...): без этой подсказки ozone
+        // выбирает X11, а X-сервера/XWayland у нас нет →
+        // "Missing X server or $DISPLAY". С auto они берут Wayland-сокет.
+        std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "auto");
     }
     
     if in_tty {

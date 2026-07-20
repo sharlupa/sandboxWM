@@ -25,6 +25,15 @@ use smithay::{
         shm::{ShmHandler, ShmState},
     },
 };
+use smithay::reexports::wayland_server::Resource;
+use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::data_device::{
+    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+    ServerDndGrabHandler,
+};
+use smithay::wayland::selection::primary_selection::{
+    set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
+};
 
 #[derive(Default)]
 pub struct ClientState {
@@ -68,6 +77,8 @@ pub struct AppState {
     pub seat_state: SeatState<Self>,
     pub xdg_decoration_state: XdgDecorationState,
     pub screencopy_state: crate::screencopy::ScreencopyState,
+    pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
     pub wlr_output_manager_state: crate::output_manager::OutputManagerState,
 
     // WM states
@@ -162,6 +173,8 @@ impl AppState {
 
         let dmabuf_state = smithay::wayland::dmabuf::DmabufState::new();
         let screencopy_state = crate::screencopy::ScreencopyState::new::<Self>(&display_handle);
+        let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
         let wlr_output_manager_state = crate::output_manager::OutputManagerState::new::<Self>(&display_handle);
 
         Self {
@@ -177,6 +190,8 @@ impl AppState {
             seat_state,
             xdg_decoration_state,
             screencopy_state,
+            data_device_state,
+            primary_selection_state,
             space: Space::default(),
             seat,
             running: true,
@@ -1032,7 +1047,13 @@ impl SeatHandler for AppState {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Буфер обмена привязан к клиенту с клавиатурным фокусом: без этого
+        // клиент не получает wl_data_offer и копирование/вставка не работают.
+        let client = focused.and_then(|s| self.display_handle.get_client(s.id()).ok());
+        set_data_device_focus(&self.display_handle, seat, client.clone());
+        set_primary_focus(&self.display_handle, seat, client);
+    }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
@@ -1040,3 +1061,26 @@ impl SeatHandler for AppState {
 }
 smithay::delegate_seat!(AppState);
 smithay::delegate_dmabuf!(AppState);
+
+// 5. Буфер обмена: wl_data_device_manager + primary selection
+impl SelectionHandler for AppState {
+    type SelectionUserData = ();
+}
+
+impl DataDeviceHandler for AppState {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+
+impl ClientDndGrabHandler for AppState {}
+impl ServerDndGrabHandler for AppState {}
+
+impl PrimarySelectionHandler for AppState {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+smithay::delegate_data_device!(AppState);
+smithay::delegate_primary_selection!(AppState);

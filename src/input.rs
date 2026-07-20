@@ -197,8 +197,11 @@ fn handle_key(
         if let Some(cmd) = parts.next() {
             let mut c = std::process::Command::new(cmd);
             c.args(parts)
-                .env("WAYLAND_DISPLAY", &wayland_display)
-                .env_remove("DISPLAY");
+                // DISPLAY не вырезаем: нативные модули Electron-приложений
+                // например discord_utils используют X11 для idle/хоткеев
+                // и падают с SIGSEGV без X-сервера. Окна всё равно идут
+                // в наш Wayland через WAYLAND_DISPLAY.
+                .env("WAYLAND_DISPLAY", &wayland_display);
             let _ = c.spawn();
         }
         return FilterResult::Intercept(());
