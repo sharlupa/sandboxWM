@@ -247,8 +247,8 @@ pub fn run_tty(
     // Визуальный пол
     let floor_buf = SolidColorBuffer::new((10000, 4), [0.8f32, 0.8, 0.8, 1.0]);
     // Буферы для псевдо-круглых точек 6x6 (состоят из 3-х прямоугольников)
-    let dot_buf_6 = SolidColorBuffer::new((6, 2), [0.8f32, 0.8, 0.8, 1.0]);
-    let dot_buf_2 = SolidColorBuffer::new((2, 2), [0.8f32, 0.8, 0.8, 1.0]);
+
+
 
     // 11. Рендер-таймер ~60 fps. Renders only when something changed
     //     (`state.needs_render`); an idle desktop costs ~0 GPU/CPU instead of a
@@ -328,40 +328,7 @@ pub fn run_tty(
                         ),
                     ));
 
-                    // Два ряда круглых точек (6x6 px) под полом
-                    for row in 0..2 {
-                        let dot_y = floor_y + 20 + row * 20;
-                        let mut offset_x = (state.camera_offset.0 as i32) % 40;
-                        // Смещаем второй ряд (в шахматном порядке)
-                        if row == 1 {
-                            offset_x -= 20;
-                        }
-                        
-                        for col in -2..(screen_w / 40 + 3) {
-                            let dot_x = col * 40 - offset_x;
-                            
-                            // Рисуем псевдо-круг (крест 6x6)
-                            // Верхняя часть (2x2)
-                            elements.push(CustomRenderElements::Cursor(
-                                SolidColorRenderElement::from_buffer(
-                                    &dot_buf_2, (dot_x + 2, dot_y), 1.0, 1.0, Kind::Unspecified
-                                )
-                            ));
-                            // Средняя часть (6x2)
-                            elements.push(CustomRenderElements::Cursor(
-                                SolidColorRenderElement::from_buffer(
-                                    &dot_buf_6, (dot_x, dot_y + 2), 1.0, 1.0, Kind::Unspecified
-                                )
-                            ));
-                            // Нижняя часть (2x2)
-                            elements.push(CustomRenderElements::Cursor(
-                                SolidColorRenderElement::from_buffer(
-                                    &dot_buf_2, (dot_x + 2, dot_y + 4), 1.0, 1.0, Kind::Unspecified
-                                )
-                            ));
-                        }
-                    }
-                }
+                                    }
             }
 
             // Программный курсор поверх окон. `render_frame` принимает элементы

@@ -333,7 +333,7 @@ impl AppState {
                 phys.set_angular_velocity(handle, spin_dir * spin_rate);
             }
         }
-        let step_dur = phys.step();
+        phys.step();
         // Пока держим — снова выставляем ω (контакты могли её сбить).
         // Угол при этом остаётся от solver'а, столкновения работают.
         if spin_dir != 0.0 {
@@ -342,11 +342,6 @@ impl AppState {
             }
         }
         
-        // --- ДИАГНОСТИКА ЛАГОВ ---
-        // Печатаем только если шаг занял больше 2мс или идет drag, чтобы не спамить в 60fps
-        if step_dur.as_millis() > 2 || self.drag_body.is_some() {
-            eprintln!("[DEBUG] phys.step() took {:?} | bodies: {}", step_dur, phys.body_count());
-        }
         // Держим needs_render поднятым, пока хоть одно тело двигается — иначе
         // рендер-цикл уснёт и симуляция застынет. Когда всё улеглось, рендер
         // засыпает (это и нужно для энергосбережения на idle столе).
