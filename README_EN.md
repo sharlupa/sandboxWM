@@ -23,6 +23,7 @@
 | DMA-BUF client buffer import | ✅ Implemented |
 | wlr-screencopy and wlr-output-management | ✅ Basic globals |
 | XDG Decoration | ✅ Implemented |
+| XWayland: X11 app support (Steam, Discord, etc.), window stacking and focus sync | ✅ Implemented |
 | Physical line drawing: steel, glue, trampoline, rope | 📋 Concept, not implemented |
 | Session persistence | 📋 Concept, not implemented |
 | Window joining: Weld and Spring joints | 📋 Concept, not implemented |
@@ -41,6 +42,7 @@
 - Window rotation using GLES texture transforms, rotation-aware hit testing, and `Super+A` / `Super+D` spin controls.
 - Damage-gated rendering, DMA-BUF client-buffer import, and a software cursor in DRM mode.
 - Basic `wlr-screencopy` and read-only `wlr-output-management` protocol globals.
+- X11 application support via **XWayland** (rootless): window stacking and focus synchronization with clients like Steam, correct pointer event delivery (clicks, motion, scrolling) to X11/CEF clients.
 - A visible floor line in DRM mode. The decorative dot grid was removed because its hundreds of render elements caused micro-stutters near the floor.
 
 ## Controls
@@ -86,6 +88,7 @@ All `*.conf` files in that directory are combined as TOML. `[physics]` and `[con
 - `src/backend_drm.rs` — DRM/KMS, EGL/GBM, libinput, cursor, floor, and screencopy.
 - `src/state.rs` — application state, layouts, physics, camera, and Wayland handlers.
 - `src/input.rs` — keyboard, pointer, and shortcuts.
+- `src/xwm.rs` — XWayland (X11 window manager) integration: window stacking and focus sync for X11 clients.
 - `src/physics.rs` — rapier2d wrapper.
 - `src/render.rs` — GLES render elements and rotated windows.
 - `src/tiling.rs` — BSP/Dwindle tree.
