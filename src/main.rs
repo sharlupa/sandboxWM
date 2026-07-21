@@ -1,29 +1,29 @@
-pub mod state;
-pub mod input;
 pub mod backend_drm;
-pub mod tiling;
-pub mod render;
-pub mod physics;
-pub mod screencopy;
-pub mod output_manager;
 pub mod config;
+pub mod input;
+pub mod output_manager;
+pub mod physics;
+pub mod render;
+pub mod screencopy;
+pub mod state;
+pub mod tiling;
+pub mod xwm;
 
-use std::sync::Arc;
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::winit::{self, WinitEvent};
+use smithay::desktop::space::render_output;
+use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
-use smithay::wayland::socket::ListeningSocketSource;
-use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::utils::Transform;
-use smithay::desktop::space::render_output;
-use smithay::backend::winit::{self, WinitEvent};
+use smithay::wayland::socket::ListeningSocketSource;
+use std::sync::Arc;
 
 use crate::state::{AppState, ClientState};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Определяем, где запущены: в TTY или в графической сессии
-    let in_tty = std::env::var("WAYLAND_DISPLAY").is_err()
-        && std::env::var("DISPLAY").is_err();
+    let in_tty = std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_err();
 
     let event_loop: EventLoop<AppState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
@@ -35,9 +35,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Запускаем Wayland сокет (для клиентских приложений)
     let listening_socket = ListeningSocketSource::new_auto()?;
-    let socket_name = listening_socket.socket_name().to_string_lossy().into_owned();
+    let socket_name = listening_socket
+        .socket_name()
+        .to_string_lossy()
+        .into_owned();
     println!("=====> Сокет: {}", socket_name);
-    unsafe { 
+    unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
         std::env::set_var("XDG_CURRENT_DESKTOP", "sandboxWM");
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
@@ -46,9 +49,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // "Missing X server or $DISPLAY". С auto они берут Wayland-сокет.
         std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "auto");
     }
-    
+
     if in_tty {
-    // Notify dbus of the Wayland socket for xdg-desktop-portal
+        // Notify dbus of the Wayland socket for xdg-desktop-portal
         let _ = std::process::Command::new("dbus-update-activation-environment")
             .arg("--systemd")
             .arg("WAYLAND_DISPLAY")
@@ -83,11 +86,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     loop_handle.insert_source(listening_socket, |client_stream, _, state| {
-        state.display_handle.insert_client(
-            client_stream,
-            Arc::new(ClientState::default()),
-        ).unwrap();
+        state
+            .display_handle
+            .insert_client(client_stream, Arc::new(ClientState::default()))
+            .unwrap();
     })?;
+
+    // XWayland: встроенный X-сервер для X11-приложений (Steam, старые игры).
+    // Steam — X11-клиент: без X-сервера он падает с "XOpenDisplay failed".
+    if let Err(e) = crate::xwm::spawn_xwayland(&loop_handle, &display_handle) {
+        eprintln!("[xwayland] не удалось запустить Xwayland: {e}");
+    }
 
     if in_tty {
         // ── TTY / DRM режим ──────────────────────────────────────────────
@@ -125,7 +134,10 @@ fn run_winit(
     let size = backend.window_size();
     backend.window().request_redraw();
 
-    let mode = Mode { size, refresh: 60_000 };
+    let mode = Mode {
+        size,
+        refresh: 60_000,
+    };
     let output = Output::new(
         "winit".to_string(),
         PhysicalProperties {
@@ -136,7 +148,12 @@ fn run_winit(
         },
     );
     let _global = output.create_global::<AppState>(&state.display_handle);
-    output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
     state.space.map_output(&output, (0, 0));
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
@@ -147,7 +164,7 @@ fn run_winit(
     // either this wl_drm binding or a v4 dmabuf feedback). Then advertise the
     // linux-dmabuf global built from the renderer's supported formats, so GPU
     // clients can submit buffers as dmabuf file descriptors instead of wl_shm.
-    use smithay::backend::renderer::{ImportEgl, ImportDma};
+    use smithay::backend::renderer::{ImportDma, ImportEgl};
     if let Err(e) = backend.renderer().bind_wl_display(&state.display_handle) {
         eprintln!("[Winit] EGL bind_wl_display failed: {e:?}");
     }
@@ -214,6 +231,7 @@ fn run_winit(
                     // тел к окнам. Держит needs_render поднятым, пока тела
                     // двигаются; когда всё улеглось — рендер уснёт.
                     state.step_physics();
+                    state.sync_x11_with_physics();
                 }
 
                 // Process deferred layout (resize, winit window resize).

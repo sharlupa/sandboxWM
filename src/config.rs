@@ -115,8 +115,7 @@ impl Config {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| {
-                path.is_file()
-                    && path.extension().and_then(|ext| ext.to_str()) == Some("conf")
+                path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("conf")
             })
             .collect();
         files.sort();

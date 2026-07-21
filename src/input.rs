@@ -1,22 +1,22 @@
+use crate::state::AppState;
+use crate::state::LayoutMode;
+use smithay::wayland::seat::WaylandFocus;
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, Event, InputEvent, KeyboardKeyEvent, Axis, PointerAxisEvent,
-            PointerButtonEvent, PointerMotionEvent, ButtonState, KeyState,
+            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputEvent, KeyState,
+            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
         },
+        libinput::LibinputInputBackend,
         session::Session,
         winit::WinitInput,
-        libinput::LibinputInputBackend,
     },
     input::{
         keyboard::{FilterResult, keysyms as xkb},
-        pointer::{ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     utils::SERIAL_COUNTER,
 };
-use crate::state::AppState;
-use crate::state::LayoutMode;
-
 
 // BTN_LEFT = 272 (0x110)
 const BTN_LEFT: u32 = 272;
@@ -30,7 +30,9 @@ pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) 
             let keycode = event.key_code();
             let key_state = event.state();
 
-            let Some(kbd) = state.seat.get_keyboard() else { return };
+            let Some(kbd) = state.seat.get_keyboard() else {
+                return;
+            };
             kbd.input(
                 state,
                 keycode,
@@ -51,15 +53,30 @@ pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) 
             let serial = SERIAL_COUNTER.next_serial();
             // No output mapped yet (hotplug / early init) — ignore the event
             // instead of panicking on the missing mode.
-            let Some(out) = state.space.outputs().next() else { return };
-            let Some(mode) = out.current_mode() else { return };
-            let logical_size = smithay::utils::Size::<i32, smithay::utils::Logical>::from((mode.size.w, mode.size.h));
+            let Some(out) = state.space.outputs().next() else {
+                return;
+            };
+            let Some(mode) = out.current_mode() else {
+                return;
+            };
+            let logical_size = smithay::utils::Size::<i32, smithay::utils::Logical>::from((
+                mode.size.w,
+                mode.size.h,
+            ));
             let pos = event.position_transformed(logical_size);
 
             handle_pointer_motion(state, pos.x, pos.y, serial, event.time_msec());
         }
         InputEvent::PointerAxis { event } => {
-            handle_pointer_axis(state, event.amount(Axis::Vertical).unwrap_or(0.0));
+            handle_pointer_axis(
+                state,
+                event.amount(Axis::Horizontal).unwrap_or(0.0),
+                event.amount(Axis::Vertical).unwrap_or(0.0),
+                event.amount_v120(Axis::Horizontal),
+                event.amount_v120(Axis::Vertical),
+                event.source(),
+                event.time_msec(),
+            );
         }
         InputEvent::PointerButton { event } => {
             handle_pointer_button(state, event.button_code(), event.state(), event.time_msec());
@@ -77,7 +94,9 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
             let keycode = event.key_code();
             let key_state = event.state();
 
-            let Some(kbd) = state.seat.get_keyboard() else { return };
+            let Some(kbd) = state.seat.get_keyboard() else {
+                return;
+            };
             kbd.input(
                 state,
                 keycode,
@@ -104,7 +123,15 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
             handle_pointer_motion(state, new_pos.0, new_pos.1, serial, event.time_msec());
         }
         InputEvent::PointerAxis { event } => {
-            handle_pointer_axis(state, event.amount(Axis::Vertical).unwrap_or(0.0));
+            handle_pointer_axis(
+                state,
+                event.amount(Axis::Horizontal).unwrap_or(0.0),
+                event.amount(Axis::Vertical).unwrap_or(0.0),
+                event.amount_v120(Axis::Horizontal),
+                event.amount_v120(Axis::Vertical),
+                event.source(),
+                event.time_msec(),
+            );
         }
         InputEvent::PointerButton { event } => {
             handle_pointer_button(state, event.button_code(), event.state(), event.time_msec());
@@ -113,10 +140,56 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
     }
 }
 
-fn handle_pointer_axis(state: &mut AppState, vertical: f64) {
-    if state.layout_mode == LayoutMode::Physics && state.seat.get_keyboard().map(|keyboard| keyboard.modifier_state().logo).unwrap_or(false) && vertical != 0.0 {
+fn handle_pointer_axis(
+    state: &mut AppState,
+    horizontal: f64,
+    vertical: f64,
+    horizontal_discrete: Option<f64>,
+    vertical_discrete: Option<f64>,
+    source: AxisSource,
+    time: u32,
+) {
+    // Super+колесо в физическом режиме — зум камеры, событие клиенту не шлём.
+    if state.layout_mode == LayoutMode::Physics
+        && state
+            .seat
+            .get_keyboard()
+            .map(|keyboard| keyboard.modifier_state().logo)
+            .unwrap_or(false)
+        && vertical != 0.0
+    {
         state.zoom_camera(if vertical < 0.0 { 1.1 } else { 0.9 });
+        return;
     }
+
+    // Раньше событие прокрутки никуда не прокидывалось — Steam (CEF) никогда
+    // не получал wl_pointer.axis, поэтому колесо не работало вообще.
+    let Some(ptr) = state.seat.get_pointer() else {
+        return;
+    };
+
+    let mut frame = AxisFrame::new(time).source(source);
+
+    if horizontal != 0.0 {
+        frame = frame.value(Axis::Horizontal, horizontal);
+        if let Some(discrete) = horizontal_discrete {
+            frame = frame.v120(Axis::Horizontal, discrete as i32);
+        }
+    } else if source == AxisSource::Finger {
+        frame = frame.stop(Axis::Horizontal);
+    }
+
+    if vertical != 0.0 {
+        frame = frame.value(Axis::Vertical, vertical);
+        if let Some(discrete) = vertical_discrete {
+            frame = frame.v120(Axis::Vertical, discrete as i32);
+        }
+    } else if source == AxisSource::Finger {
+        frame = frame.stop(Axis::Vertical);
+    }
+
+    ptr.axis(state, frame);
+    ptr.frame(state);
 }
 
 /// Centralized keyboard shortcut handler (shared between winit & libinput)
@@ -172,9 +245,25 @@ fn handle_key(
 
     // Spin hold/release (physics): клавиши из controls.spin_left / spin_right
     if app_state.layout_mode == LayoutMode::Physics {
-        if app_state.layout_mode == LayoutMode::Physics && modifiers.logo && key_state == KeyState::Pressed { if keysym == xkb::KEY_minus { app_state.zoom_camera(0.9); return FilterResult::Intercept(()); } if keysym == xkb::KEY_equal { app_state.zoom_camera(1.1); return FilterResult::Intercept(()); } if keysym == xkb::KEY_0 { app_state.reset_camera(); return FilterResult::Intercept(()); } }
+        if app_state.layout_mode == LayoutMode::Physics
+            && modifiers.logo
+            && key_state == KeyState::Pressed
+        {
+            if keysym == xkb::KEY_minus {
+                app_state.zoom_camera(0.9);
+                return FilterResult::Intercept(());
+            }
+            if keysym == xkb::KEY_equal {
+                app_state.zoom_camera(1.1);
+                return FilterResult::Intercept(());
+            }
+            if keysym == xkb::KEY_0 {
+                app_state.reset_camera();
+                return FilterResult::Intercept(());
+            }
+        }
 
-    let ctrl = &app_state.config.controls;
+        let ctrl = &app_state.config.controls;
         let is_left = crate::config::ControlsConfig::matches_key(&ctrl.spin_left, keysym);
         let is_right = crate::config::ControlsConfig::matches_key(&ctrl.spin_right, keysym);
         if is_left || is_right {
@@ -273,15 +362,13 @@ fn handle_key(
             if let Some(win) = app_state
                 .space
                 .elements()
-                .find(|w| {
-                    w.toplevel()
-                        .map(|t| t.wl_surface() == &surf)
-                        .unwrap_or(false)
-                })
+                .find(|w| w.wl_surface().map(|s| s.as_ref() == &surf).unwrap_or(false))
                 .cloned()
             {
                 if let Some(toplevel) = win.toplevel() {
                     toplevel.send_close();
+                } else if let Some(x11) = win.x11_surface() {
+                    let _ = x11.close();
                 }
             }
         }
@@ -339,18 +426,21 @@ fn handle_pointer_motion(
         let under = if state.drag_body.is_some() {
             None
         } else {
-            state.physics_element_under(world_x, world_y).and_then(|(w, loc)| {
-                let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
-                    (loc.x as f64, loc.y as f64).into();
-                let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
-                    (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
-                w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL)
-                    .map(|(surf, surf_loc)| {
-                        let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
-                            (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64).into();
-                        (surf, surf_loc_f64)
-                    })
-            })
+            state
+                .physics_element_under(world_x, world_y)
+                .and_then(|(w, loc)| {
+                    let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
+                        (loc.x as f64, loc.y as f64).into();
+                    let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
+                        (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
+                    w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL)
+                        .map(|(surf, surf_loc)| {
+                            let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
+                                (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64)
+                                    .into();
+                            (surf, surf_loc_f64)
+                        })
+                })
         };
 
         if let Some(ptr) = state.seat.get_pointer() {
@@ -363,6 +453,7 @@ fn handle_pointer_motion(
                     time,
                 },
             );
+            ptr.frame(state);
             if state.session.is_some() {
                 state.needs_render = true;
             }
@@ -393,7 +484,7 @@ fn handle_pointer_motion(
         let gaps_out = 8i32;
         let screen_rect = smithay::utils::Rectangle::new(
             (gaps_out, gaps_out).into(),
-            (screen.w - gaps_out * 2, screen.h - gaps_out * 2).into()
+            (screen.w - gaps_out * 2, screen.h - gaps_out * 2).into(),
         );
 
         if let Some(mut tree) = state.tile_tree.take() {
@@ -415,24 +506,41 @@ fn handle_pointer_motion(
     }
 
     // Find surface under pointer for hover focus
-    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = state.screen_to_world(pos.x, pos.y).into();
+    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
+        state.screen_to_world(pos.x, pos.y).into();
     let under = if state.layout_mode == crate::state::LayoutMode::Physics {
         state.physics_element_under(world_pos.x, world_pos.y)
     } else {
-        state.space.element_under(world_pos).map(|(w, loc)| (w.clone(), loc))
+        state
+            .space
+            .element_under(world_pos)
+            .map(|(w, loc)| (w.clone(), loc))
     };
-    
+
     let under = under.and_then(|(w, loc)| {
-        let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc.x as f64, loc.y as f64).into();
-        let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
-        w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL).map(|(surf, surf_loc)| {
-            let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64).into();
-            (surf, surf_loc_f64)
-        })
+        let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
+            (loc.x as f64, loc.y as f64).into();
+        let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
+            (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
+        w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL)
+            .map(|(surf, surf_loc)| {
+                let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
+                    (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64).into();
+                (surf, surf_loc_f64)
+            })
     });
 
     if let Some(ptr) = state.seat.get_pointer() {
-        ptr.motion(state, under, &MotionEvent { location: world_pos, serial, time });
+        ptr.motion(
+            state,
+            under,
+            &MotionEvent {
+                location: world_pos,
+                serial,
+                time,
+            },
+        );
+        ptr.frame(state);
         // Only mark needs_render for cursor-visible updates (DRM software cursor).
         // In winit mode the host compositor draws the cursor, so pointer motion
         // by itself never damages our framebuffer. The flag will be set by
@@ -445,12 +553,21 @@ fn handle_pointer_motion(
 }
 
 /// Shared click-to-focus + Super+LMB tile resize (Tiling) / LMB drag body (Physics)
-fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonState, time_msec: u32) {
+fn handle_pointer_button(
+    state: &mut AppState,
+    button: u32,
+    btn_state: ButtonState,
+    time_msec: u32,
+) {
     let serial = SERIAL_COUNTER.next_serial();
     let pos = state.pointer_location;
 
     // Check if Super is held
-    let super_held = state.seat.get_keyboard().map(|k| k.modifier_state().logo).unwrap_or(false);
+    let super_held = state
+        .seat
+        .get_keyboard()
+        .map(|k| k.modifier_state().logo)
+        .unwrap_or(false);
 
     // ── Физический режим: средняя кнопка панорамирует камеру ──────────────────
     if state.layout_mode == LayoutMode::Physics && button == BTN_MIDDLE {
@@ -492,7 +609,11 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
     }
 
     // Super + Left Mouse Button → start tile resize (TILING ONLY)
-    if state.layout_mode == LayoutMode::Tiling && button == BTN_LEFT && super_held && btn_state == ButtonState::Pressed {
+    if state.layout_mode == LayoutMode::Tiling
+        && button == BTN_LEFT
+        && super_held
+        && btn_state == ButtonState::Pressed
+    {
         let win = state.space.element_under(pos).map(|(w, _)| w.clone());
         if let Some(win) = win {
             let geo = state.space.element_geometry(&win).unwrap_or_default();
@@ -515,35 +636,95 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
         return;
     }
 
-    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> = state.screen_to_world(pos.x, pos.y).into();
+    let world_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
+        state.screen_to_world(pos.x, pos.y).into();
 
     if let Some(ptr) = state.seat.get_pointer() {
         let under = if state.layout_mode == crate::state::LayoutMode::Physics {
             state.physics_element_under(world_pos.x, world_pos.y)
         } else {
-            state.space.element_under(world_pos).map(|(w, loc)| (w.clone(), loc))
+            state
+                .space
+                .element_under(world_pos)
+                .map(|(w, loc)| (w.clone(), loc))
         };
-        
+
         let under = under.and_then(|(w, loc)| {
-            let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc.x as f64, loc.y as f64).into();
-            let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> = (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
-            w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL).map(|(surf, surf_loc)| {
-                let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> = (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64).into();
-                (surf, surf_loc_f64)
-            })
+            let loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
+                (loc.x as f64, loc.y as f64).into();
+            let relative_pos: smithay::utils::Point<f64, smithay::utils::Logical> =
+                (world_pos.x - loc_f64.x, world_pos.y - loc_f64.y).into();
+            w.surface_under(relative_pos, smithay::desktop::WindowSurfaceType::ALL)
+                .map(|(surf, surf_loc)| {
+                    let surf_loc_f64: smithay::utils::Point<f64, smithay::utils::Logical> =
+                        (loc_f64.x + surf_loc.x as f64, loc_f64.y + surf_loc.y as f64).into();
+                    (surf, surf_loc_f64)
+                })
         });
-        ptr.motion(state, under, &MotionEvent { location: world_pos, serial, time: time_msec });
+        ptr.motion(
+            state,
+            under,
+            &MotionEvent {
+                location: world_pos,
+                serial,
+                time: time_msec,
+            },
+        );
     }
 
     if btn_state == ButtonState::Pressed {
         let window = if state.layout_mode == crate::state::LayoutMode::Physics {
-            state.physics_element_under(world_pos.x, world_pos.y).map(|(w, _)| w)
+            state
+                .physics_element_under(world_pos.x, world_pos.y)
+                .map(|(w, _)| w)
         } else {
             state.space.element_under(world_pos).map(|(w, _)| w.clone())
         };
+        {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/wm_click.log")
+            {
+                use std::io::Write;
+                let info = window.as_ref().map(|w| {
+                    (
+                        w.x11_surface().map(|x| (x.class(), x.geometry())),
+                        state.space.element_geometry(w),
+                        w.geometry(),
+                    )
+                });
+                let _ = writeln!(
+                    f,
+                    "click physics={} screen=({:.1},{:.1}) world=({:.1},{:.1}) cam=({:.1},{:.1}) zoom={:.2} target={:?}",
+                    state.layout_mode == crate::state::LayoutMode::Physics,
+                    pos.x,
+                    pos.y,
+                    world_pos.x,
+                    world_pos.y,
+                    state.camera_offset.0,
+                    state.camera_offset.1,
+                    state.camera_zoom,
+                    info
+                );
+            }
+        }
         if let Some(window) = window {
-            let win_clone = window.clone();
-            state.focus_window(&win_clone);
+            // Do not churn focus on every click. Steam/CEF popup menus are
+            // locally-active X11 windows: a redundant focus transition before
+            // ButtonPress makes the click land on the window behind the menu.
+            if !window
+                .x11_surface()
+                .map_or(false, |x| x.is_override_redirect())
+            {
+                let already_focused = state
+                    .get_focused_window()
+                    .as_ref()
+                    .map_or(false, |focused| focused == &window);
+                if !already_focused {
+                    state.focus_window(&window);
+                }
+            }
         } else {
             // Click on empty space → unfocus
             let serial2 = SERIAL_COUNTER.next_serial();
@@ -564,6 +745,12 @@ fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonSta
                 time: time_msec,
             },
         );
+        // wl_pointer.frame must terminate the logical event group (motion +
+        // button) sent for this click. Without it, strict frame-based
+        // Wayland clients (Chromium/CEF, which backs Steam) may buffer or
+        // misapply the button event, turning a plain click into what looks
+        // like a drag / text-selection.
+        ptr.frame(state);
         state.needs_render = true;
     }
 }

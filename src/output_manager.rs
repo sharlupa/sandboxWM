@@ -1,16 +1,15 @@
 use smithay::output::Output;
-use smithay::utils::{Point, Logical};
+use smithay::utils::{Logical, Point};
 use wayland_protocols_wlr::output_management::v1::server::{
-    zwlr_output_manager_v1::{self, ZwlrOutputManagerV1},
-    zwlr_output_head_v1::{self, ZwlrOutputHeadV1},
-    zwlr_output_mode_v1::{self, ZwlrOutputModeV1},
-    zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
     zwlr_output_configuration_head_v1::{self, ZwlrOutputConfigurationHeadV1},
+    zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
+    zwlr_output_head_v1::{self, ZwlrOutputHeadV1},
+    zwlr_output_manager_v1::{self, ZwlrOutputManagerV1},
+    zwlr_output_mode_v1::{self, ZwlrOutputModeV1},
 };
 use wayland_server::{
-    backend::GlobalId,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, backend::GlobalId,
     protocol::wl_output,
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
 
 pub trait OutputManagerHandler {
@@ -38,12 +37,12 @@ impl OutputManagerState {
 
 impl<D> GlobalDispatch<ZwlrOutputManagerV1, (), D> for OutputManagerState
 where
-    D: GlobalDispatch<ZwlrOutputManagerV1, ()> 
-     + Dispatch<ZwlrOutputManagerV1, ()> 
-     + Dispatch<ZwlrOutputHeadV1, ()> 
-     + Dispatch<ZwlrOutputModeV1, ()> 
-     + OutputManagerHandler
-     + AsMut<OutputManagerState>,
+    D: GlobalDispatch<ZwlrOutputManagerV1, ()>
+        + Dispatch<ZwlrOutputManagerV1, ()>
+        + Dispatch<ZwlrOutputHeadV1, ()>
+        + Dispatch<ZwlrOutputModeV1, ()>
+        + OutputManagerHandler
+        + AsMut<OutputManagerState>,
 {
     fn bind(
         state: &mut D,
@@ -54,30 +53,34 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         let manager = data_init.init(resource, ());
-        
+
         let mut serial = 0;
-        
+
         for (output, loc) in state.outputs() {
-            let head = client.create_resource::<ZwlrOutputHeadV1, _, D>(_handle, manager.version(), ()).unwrap();
+            let head = client
+                .create_resource::<ZwlrOutputHeadV1, _, D>(_handle, manager.version(), ())
+                .unwrap();
             manager.head(&head);
-            
+
             head.name(output.name());
             head.description(output.description());
-            
+
             let props = output.physical_properties();
             head.physical_size(props.size.w, props.size.h);
-            
+
             // Just output the current mode for now
             if let Some(mode) = output.current_mode() {
-                let wlr_mode = client.create_resource::<ZwlrOutputModeV1, _, D>(_handle, head.version(), ()).unwrap();
+                let wlr_mode = client
+                    .create_resource::<ZwlrOutputModeV1, _, D>(_handle, head.version(), ())
+                    .unwrap();
                 head.mode(&wlr_mode);
                 wlr_mode.size(mode.size.w, mode.size.h);
                 wlr_mode.refresh(mode.refresh);
                 wlr_mode.preferred();
-                
+
                 head.current_mode(&wlr_mode);
             }
-            
+
             head.enabled(1);
             if let Some(pos) = loc {
                 head.position(pos.x, pos.y);
@@ -86,10 +89,10 @@ where
             }
             head.transform(wl_output::Transform::Normal);
             head.scale(output.current_scale().fractional_scale());
-            
+
             serial += 1;
         }
-        
+
         manager.done(serial);
     }
 }
@@ -97,8 +100,8 @@ where
 impl<D> Dispatch<ZwlrOutputManagerV1, (), D> for OutputManagerState
 where
     D: Dispatch<ZwlrOutputManagerV1, ()>
-     + Dispatch<ZwlrOutputConfigurationV1, ()>
-     + AsMut<OutputManagerState>,
+        + Dispatch<ZwlrOutputConfigurationV1, ()>
+        + AsMut<OutputManagerState>,
 {
     fn request(
         _state: &mut D,
@@ -135,7 +138,8 @@ where
         _data: &(),
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
-    ) {}
+    ) {
+    }
 }
 
 impl<D> Dispatch<ZwlrOutputModeV1, (), D> for OutputManagerState
@@ -150,7 +154,8 @@ where
         _data: &(),
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
-    ) {}
+    ) {
+    }
 }
 
 // ---------------------------------------------------------
@@ -159,9 +164,9 @@ where
 
 impl<D> Dispatch<ZwlrOutputConfigurationV1, (), D> for OutputManagerState
 where
-    D: Dispatch<ZwlrOutputConfigurationV1, ()> 
-     + Dispatch<ZwlrOutputConfigurationHeadV1, ()>
-     + AsMut<OutputManagerState>,
+    D: Dispatch<ZwlrOutputConfigurationV1, ()>
+        + Dispatch<ZwlrOutputConfigurationHeadV1, ()>
+        + AsMut<OutputManagerState>,
 {
     fn request(
         _state: &mut D,
@@ -202,7 +207,8 @@ where
         _data: &(),
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
-    ) {}
+    ) {
+    }
 }
 
 // ---------------------------------------------------------
@@ -215,23 +221,23 @@ macro_rules! delegate_output_manager {
         wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             wayland_protocols_wlr::output_management::v1::server::zwlr_output_manager_v1::ZwlrOutputManagerV1: ()
         ] => $crate::output_manager::OutputManagerState);
-        
+
         wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             wayland_protocols_wlr::output_management::v1::server::zwlr_output_manager_v1::ZwlrOutputManagerV1: ()
         ] => $crate::output_manager::OutputManagerState);
-        
+
         wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             wayland_protocols_wlr::output_management::v1::server::zwlr_output_head_v1::ZwlrOutputHeadV1: ()
         ] => $crate::output_manager::OutputManagerState);
-        
+
         wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             wayland_protocols_wlr::output_management::v1::server::zwlr_output_mode_v1::ZwlrOutputModeV1: ()
         ] => $crate::output_manager::OutputManagerState);
-        
+
         wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             wayland_protocols_wlr::output_management::v1::server::zwlr_output_configuration_v1::ZwlrOutputConfigurationV1: ()
         ] => $crate::output_manager::OutputManagerState);
-        
+
         wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             wayland_protocols_wlr::output_management::v1::server::zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1: ()
         ] => $crate::output_manager::OutputManagerState);

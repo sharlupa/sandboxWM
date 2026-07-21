@@ -6,20 +6,18 @@
 //!
 //! Specialised to `GlesRenderer`, the only renderer used by both backends.
 
+use cgmath::{Matrix3, Vector2, prelude::*};
 use smithay::backend::renderer::{
     element::{
-        render_elements,
-        solid::SolidColorRenderElement,
-        surface::WaylandSurfaceRenderElement,
-        Element, Id, Kind, RenderElement, UnderlyingStorage,
+        Element, Id, Kind, RenderElement, UnderlyingStorage, render_elements,
+        solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
     },
     gles::GlesRenderer,
     utils::{CommitCounter, DamageSet, OpaqueRegions},
 };
-use smithay::desktop::{space::SpaceRenderElements, Window};
+use smithay::desktop::{Window, space::SpaceRenderElements};
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::seat::WaylandFocus;
-use cgmath::{prelude::*, Matrix3, Vector2};
 
 use crate::state::AppState;
 
@@ -43,39 +41,70 @@ pub struct PhysicsElement {
 }
 
 impl PhysicsElement {
-    fn bounding_geometry(center: Point<f64, Physical>, inner_geo: Rectangle<i32, Physical>, zoom: f64) -> Rectangle<i32, Physical> {
+    fn bounding_geometry(
+        center: Point<f64, Physical>,
+        inner_geo: Rectangle<i32, Physical>,
+        zoom: f64,
+    ) -> Rectangle<i32, Physical> {
         let corners: [Point<f64, Physical>; 4] = [
             Point::from((inner_geo.loc.x as f64, inner_geo.loc.y as f64)),
-            Point::from(((inner_geo.loc.x + inner_geo.size.w) as f64, inner_geo.loc.y as f64)),
-            Point::from((inner_geo.loc.x as f64, (inner_geo.loc.y + inner_geo.size.h) as f64)),
-            Point::from(((inner_geo.loc.x + inner_geo.size.w) as f64, (inner_geo.loc.y + inner_geo.size.h) as f64)),
+            Point::from((
+                (inner_geo.loc.x + inner_geo.size.w) as f64,
+                inner_geo.loc.y as f64,
+            )),
+            Point::from((
+                inner_geo.loc.x as f64,
+                (inner_geo.loc.y + inner_geo.size.h) as f64,
+            )),
+            Point::from((
+                (inner_geo.loc.x + inner_geo.size.w) as f64,
+                (inner_geo.loc.y + inner_geo.size.h) as f64,
+            )),
         ];
 
-        let max_sq_dist = corners.iter().map(|p| {
-            let dx = p.x - center.x;
-            let dy = p.y - center.y;
-            dx * dx + dy * dy
-        }).fold(0.0f64, f64::max);
+        let max_sq_dist = corners
+            .iter()
+            .map(|p| {
+                let dx = p.x - center.x;
+                let dy = p.y - center.y;
+                dx * dx + dy * dy
+            })
+            .fold(0.0f64, f64::max);
 
         let bounding_radius = (max_sq_dist.sqrt() * zoom).ceil() as i32;
         let bounding_diameter = bounding_radius * 2;
-        let loc = Point::from((center.x as i32 - bounding_radius, center.y as i32 - bounding_radius));
+        let loc = Point::from((
+            center.x as i32 - bounding_radius,
+            center.y as i32 - bounding_radius,
+        ));
         Rectangle::new(loc, (bounding_diameter, bounding_diameter).into())
     }
 }
 
 impl Element for PhysicsElement {
-    fn id(&self) -> &Id { self.inner.id() }
-    fn current_commit(&self) -> CommitCounter { self.visual_commit }
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+    fn current_commit(&self) -> CommitCounter {
+        self.visual_commit
+    }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
         Self::bounding_geometry(self.center, self.inner.geometry(scale), self.zoom)
     }
 
-    fn src(&self) -> Rectangle<f64, Buffer> { self.inner.src() }
-    fn transform(&self) -> Transform { self.inner.transform() }
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.inner.src()
+    }
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
 
-    fn damage_since(&self, scale: Scale<f64>, _commit: Option<CommitCounter>) -> DamageSet<i32, Physical> {
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        _commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
         // ВАЖНО: damage_since — в координатах относительно geometry().loc
         // (трекер сам делает `d.loc += element_loc`). Абсолютные rect'ы
         // сдвигались второй раз → при вращении на месте зачищалась чужая
@@ -98,8 +127,12 @@ impl Element for PhysicsElement {
         OpaqueRegions::default()
     }
 
-    fn alpha(&self) -> f32 { self.inner.alpha() }
-    fn kind(&self) -> Kind { self.inner.kind() }
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
 }
 
 impl RenderElement<GlesRenderer> for PhysicsElement {
@@ -118,8 +151,8 @@ impl RenderElement<GlesRenderer> for PhysicsElement {
         _damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), <GlesRenderer as smithay::backend::renderer::RendererSuper>::Error> {
-        use smithay::backend::renderer::element::surface::WaylandSurfaceTexture;
         use smithay::backend::renderer::Texture;
+        use smithay::backend::renderer::element::surface::WaylandSurfaceTexture;
 
         let tex = match self.inner.texture() {
             WaylandSurfaceTexture::Texture(t) => t,
@@ -129,7 +162,8 @@ impl RenderElement<GlesRenderer> for PhysicsElement {
         };
 
         let mut mat = Matrix3::<f32>::identity();
-        mat = mat * Matrix3::from_translation(Vector2::new(self.center.x as f32, self.center.y as f32));
+        mat = mat
+            * Matrix3::from_translation(Vector2::new(self.center.x as f32, self.center.y as f32));
         mat = mat * Matrix3::from_angle_z(cgmath::Rad(self.angle as f32));
         mat = mat * Matrix3::from_scale(self.zoom as f32);
         let orig = self.inner.geometry(Scale::from(1.0));
@@ -147,15 +181,12 @@ impl RenderElement<GlesRenderer> for PhysicsElement {
         let scale_y = src.size.h / orig.size.h as f64;
         let mut tex_mat = Matrix3::<f32>::identity();
         tex_mat = Matrix3::from_nonuniform_scale(scale_x as f32, scale_y as f32) * tex_mat;
-        tex_mat = Matrix3::from_translation(Vector2::new(src.loc.x as f32, src.loc.y as f32)) * tex_mat;
-        tex_mat = Matrix3::from_nonuniform_scale(1.0 / tex_size.w as f32, 1.0 / tex_size.h as f32) * tex_mat;
+        tex_mat =
+            Matrix3::from_translation(Vector2::new(src.loc.x as f32, src.loc.y as f32)) * tex_mat;
+        tex_mat = Matrix3::from_nonuniform_scale(1.0 / tex_size.w as f32, 1.0 / tex_size.h as f32)
+            * tex_mat;
 
-        let instances = [
-            0.0f32,
-            0.0f32,
-            orig.size.w as f32,
-            orig.size.h as f32,
-        ];
+        let instances = [0.0f32, 0.0f32, orig.size.w as f32, orig.size.h as f32];
 
         frame.render_texture(
             tex,
@@ -194,20 +225,40 @@ pub fn collect_physics_elements(
             .space
             .elements()
             .filter_map(|win| {
-                let &handle = state.window_bodies.get(win)?;
-                let (cx, cy, angle) = phys.body_transform(handle)?;
                 let win_geom = state.space.element_geometry(win).unwrap_or_default();
-                let screen_cx = (cx as f64 - cam.0) * zoom;
-                let screen_cy = (cy as f64 - cam.1) * zoom;
-                Some((
-                    win.clone(),
-                    screen_cx,
-                    screen_cy,
-                    angle as f64,
-                    zoom,
-                    win_geom.size.w,
-                    win_geom.size.h,
-                ))
+                if let Some(&handle) = state.window_bodies.get(win) {
+                    let (cx, cy, angle) = phys.body_transform(handle)?;
+                    let screen_cx = (cx as f64 - cam.0) * zoom;
+                    let screen_cy = (cy as f64 - cam.1) * zoom;
+                    Some((
+                        win.clone(),
+                        screen_cx,
+                        screen_cy,
+                        angle as f64,
+                        zoom,
+                        win_geom.size.w,
+                        win_geom.size.h,
+                    ))
+                } else if win
+                    .x11_surface()
+                    .map_or(false, |x| x.is_override_redirect())
+                {
+                    // Меню/тултипы без тела: клиент ставит их в ЭКРАННЫХ
+                    // координатах (X-геометрия теперь экранная) — рисуем как есть.
+                    let screen_cx = win_geom.loc.x as f64 + win_geom.size.w as f64 * 0.5;
+                    let screen_cy = win_geom.loc.y as f64 + win_geom.size.h as f64 * 0.5;
+                    Some((
+                        win.clone(),
+                        screen_cx,
+                        screen_cy,
+                        0.0,
+                        1.0,
+                        win_geom.size.w,
+                        win_geom.size.h,
+                    ))
+                } else {
+                    None
+                }
             })
             .collect()
     };
@@ -224,7 +275,9 @@ pub fn collect_physics_elements(
             .unwrap_or_default();
         let center: Point<f64, Physical> = (screen_cx, screen_cy).into();
 
-        let Some(surface) = win.wl_surface() else { continue };
+        let Some(surface) = win.wl_surface() else {
+            continue;
+        };
         let render_elements =
             smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
                 renderer,

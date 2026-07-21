@@ -17,6 +17,7 @@ smithay = { version = "0.7", features = [
     "backend_libinput",
     "backend_udev",
     "backend_session_libseat",
+    "xwayland",
     "use_system_lib",
     "renderer_gl",
 ] }

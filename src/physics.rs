@@ -34,14 +34,15 @@ impl WindowPhysics {
         world.integration_parameters.length_unit = 100.0;
         world.integration_parameters.num_solver_iterations = 12;
         world.integration_parameters.num_internal_pgs_iterations = 2;
-        world.integration_parameters.num_internal_stabilization_iterations = 4;
+        world
+            .integration_parameters
+            .num_internal_stabilization_iterations = 4;
         world.integration_parameters.max_ccd_substeps = 8;
 
         // Статический пол. fixed-тело не двигается под гравитацией и служит
         // бесконечной горизонтальной плоскостью, на которую падают окна.
         world.insert(
-            RigidBodyBuilder::fixed()
-                .translation(Vector::new(0.0, cfg.floor_y + cfg.floor_half_h)),
+            RigidBodyBuilder::fixed().translation(Vector::new(0.0, cfg.floor_y + cfg.floor_half_h)),
             ColliderBuilder::cuboid(cfg.floor_half_w, cfg.floor_half_h),
         );
 
@@ -82,6 +83,14 @@ impl WindowPhysics {
         }
     }
 
+    /// Блокирует вращение тела. Для X11-окон: XWayland не умеет повёрнутую
+    /// геометрию, глобальные координаты кликов (Steam/CEF) съезжают.
+    pub fn lock_rotations(&mut self, handle: RigidBodyHandle) {
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            body.lock_rotations(true, true);
+        }
+    }
+
     /// Удаляет тело окна (и его коллайдер). Вызывается при закрытии окна
     /// или при выходе из физического режима.
     pub fn remove_window(&mut self, handle: RigidBodyHandle) {
@@ -93,7 +102,9 @@ impl WindowPhysics {
     /// на cuboid с новыми half-extents.
     pub fn update_collider_size(&mut self, handle: RigidBodyHandle, w: Real, h: Real) {
         let collider_handles: Vec<ColliderHandle> = {
-            let Some(body) = self.world.bodies.get(handle) else { return };
+            let Some(body) = self.world.bodies.get(handle) else {
+                return;
+            };
             body.colliders().to_vec()
         };
         if let Some(&col_handle) = collider_handles.first() {
@@ -112,17 +123,34 @@ impl WindowPhysics {
         // Аварийная координата под полом. Если CCD/solver всё же пропустили
         // тело, возвращаем его над полом и гасим накопленную скорость.
         let rescue_y = self.cfg.floor_y + self.cfg.floor_half_h / 0.25;
-        let escaped: Vec<RigidBodyHandle> = self.world.bodies.iter()
+        let escaped: Vec<RigidBodyHandle> = self
+            .world
+            .bodies
+            .iter()
             .filter(|(_, body)| body.is_dynamic() && body.translation().y > rescue_y)
             .map(|(handle, _)| handle)
             .collect();
         for handle in escaped {
-            let vertical_extent = self.world.bodies.get(handle)
-                .and_then(|body| body.colliders().first().copied().map(|collider| (body.rotation().angle(), collider)))
-                .and_then(|(angle, collider)| self.world.colliders.get(collider).and_then(|c| c.shape().as_cuboid()).map(|cuboid| {
-                    let half = cuboid.half_extents;
-                    angle.sin().abs() / half.x.recip() + angle.cos().abs() / half.y.recip()
-                }))
+            let vertical_extent = self
+                .world
+                .bodies
+                .get(handle)
+                .and_then(|body| {
+                    body.colliders()
+                        .first()
+                        .copied()
+                        .map(|collider| (body.rotation().angle(), collider))
+                })
+                .and_then(|(angle, collider)| {
+                    self.world
+                        .colliders
+                        .get(collider)
+                        .and_then(|c| c.shape().as_cuboid())
+                        .map(|cuboid| {
+                            let half = cuboid.half_extents;
+                            angle.sin().abs() / half.x.recip() + angle.cos().abs() / half.y.recip()
+                        })
+                })
                 .unwrap_or(50.0);
             if let Some(body) = self.world.bodies.get_mut(handle) {
                 let safe_y = self.cfg.floor_y - vertical_extent - 4.0;
@@ -145,10 +173,18 @@ impl WindowPhysics {
         max_x: Real,
         max_y: Real,
     ) -> bool {
-        let Some(body) = self.world.bodies.get(handle) else { return false };
-        let Some(&collider_handle) = body.colliders().first() else { return false };
-        let Some(collider) = self.world.colliders.get(collider_handle) else { return false };
-        let Some(cuboid) = collider.shape().as_cuboid() else { return false };
+        let Some(body) = self.world.bodies.get(handle) else {
+            return false;
+        };
+        let Some(&collider_handle) = body.colliders().first() else {
+            return false;
+        };
+        let Some(collider) = self.world.colliders.get(collider_handle) else {
+            return false;
+        };
+        let Some(cuboid) = collider.shape().as_cuboid() else {
+            return false;
+        };
         let angle = body.rotation().angle();
         let half = cuboid.half_extents;
         let extent_x = angle.cos().abs() / half.x.recip() + angle.sin().abs() / half.y.recip();
@@ -160,16 +196,34 @@ impl WindowPhysics {
         let high_x = max_x - extent_x;
         let low_y = min_y + extent_y;
         let high_y = max_y - extent_y;
-        let mut x = if low_x <= high_x { pos.x.clamp(low_x, high_x) } else { (min_x + max_x) / 2.0 };
-        let mut y = if low_y <= high_y { pos.y.clamp(low_y, high_y) } else { (min_y + max_y) / 2.0 };
-        if !x.is_finite() { x = pos.x; }
-        if !y.is_finite() { y = pos.y; }
-        if x == pos.x && y == pos.y { return false; }
+        let mut x = if low_x <= high_x {
+            pos.x.clamp(low_x, high_x)
+        } else {
+            (min_x + max_x) / 2.0
+        };
+        let mut y = if low_y <= high_y {
+            pos.y.clamp(low_y, high_y)
+        } else {
+            (min_y + max_y) / 2.0
+        };
+        if !x.is_finite() {
+            x = pos.x;
+        }
+        if !y.is_finite() {
+            y = pos.y;
+        }
+        if x == pos.x && y == pos.y {
+            return false;
+        }
 
         let mut vx = old_vel.x;
         let mut vy = old_vel.y;
-        if x != pos.x && ((x <= low_x && vx < 0.0) || (x >= high_x && vx > 0.0)) { vx = 0.0; }
-        if y != pos.y && ((y <= low_y && vy < 0.0) || (y >= high_y && vy > 0.0)) { vy = 0.0; }
+        if x != pos.x && ((x <= low_x && vx < 0.0) || (x >= high_x && vx > 0.0)) {
+            vx = 0.0;
+        }
+        if y != pos.y && ((y <= low_y && vy < 0.0) || (y >= high_y && vy > 0.0)) {
+            vy = 0.0;
+        }
         if let Some(body) = self.world.bodies.get_mut(handle) {
             body.set_translation(Vector::new(x, y), true);
             body.set_linvel(Vector::new(vx, vy), true);

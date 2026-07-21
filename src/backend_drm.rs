@@ -1,44 +1,43 @@
 /// DRM/KMS + libinput backend — запуск sandboxWM прямо из TTY.
-
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::input::process_libinput_event;
+use crate::render::CustomRenderElements;
+use crate::state::AppState;
+use smithay::reexports::rustix;
 use smithay::{
     backend::{
         allocator::{
-            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
             Fourcc,
+            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
         },
         drm::{
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode,
             compositor::{DrmCompositor, FrameFlags},
             exporter::gbm::GbmFramebufferExporter,
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode,
         },
         egl::{EGLContext, EGLDisplay},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             element::{
-                solid::{SolidColorBuffer, SolidColorRenderElement},
                 Kind,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
             },
             gles::GlesRenderer,
         },
-        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
-        udev::{primary_gpu, UdevBackend, UdevEvent},
+        session::{Event as SessionEvent, Session, libseat::LibSeatSession},
+        udev::{UdevBackend, UdevEvent, primary_gpu},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
-        calloop::{timer::Timer, EventLoop},
-        drm::control::{connector, Device as ControlDevice, ModeTypeFlags},
+        calloop::{EventLoop, timer::Timer},
+        drm::control::{Device as ControlDevice, ModeTypeFlags, connector},
         wayland_server::Display,
     },
     utils::{DeviceFd, Transform},
 };
-use smithay::reexports::rustix;
-use crate::input::process_libinput_event;
-use crate::render::CustomRenderElements;
-use crate::state::AppState;
 
 pub fn run_tty(
     mut event_loop: EventLoop<AppState>,
@@ -49,17 +48,13 @@ pub fn run_tty(
     let display_handle = state.display_handle.clone();
 
     // 1. libseat сессия
-    let (session, notifier) = LibSeatSession::new()
-        .map_err(|e| format!("libseat: {e}"))?;
+    let (session, notifier) = LibSeatSession::new().map_err(|e| format!("libseat: {e}"))?;
     let seat_name = session.seat();
     println!("=====> Сессия: {seat_name}");
     state.session = Some(session.clone());
 
-
-
     // 2. GPU
-    let gpu_path = primary_gpu(&seat_name)?
-        .ok_or_else(|| "Видеокарта не найдена".to_string())?;
+    let gpu_path = primary_gpu(&seat_name)?.ok_or_else(|| "Видеокарта не найдена".to_string())?;
     println!("=====> GPU: {gpu_path:?}");
 
     // 3. DRM fd
@@ -94,21 +89,31 @@ pub fn run_tty(
         .modes()
         .iter()
         .max_by_key(|m| {
-            let pref = if m.mode_type().contains(ModeTypeFlags::PREFERRED) { 1_000_000u32 } else { 0 };
+            let pref = if m.mode_type().contains(ModeTypeFlags::PREFERRED) {
+                1_000_000u32
+            } else {
+                0
+            };
             pref + m.size().0 as u32 * m.size().1 as u32
         })
         .copied()
         .ok_or_else(|| "Нет режимов монитора".to_string())?;
 
-    println!("=====> Режим: {}x{}@{}Hz",
-        drm_mode.size().0, drm_mode.size().1, drm_mode.vrefresh());
+    println!(
+        "=====> Режим: {}x{}@{}Hz",
+        drm_mode.size().0,
+        drm_mode.size().1,
+        drm_mode.vrefresh()
+    );
 
     // Энкодер + CRTC
     let encoder = connector
         .current_encoder()
         .and_then(|h| drm.get_encoder(h).ok())
         .or_else(|| {
-            connector.encoders().iter()
+            connector
+                .encoders()
+                .iter()
                 .find_map(|&h| drm.get_encoder(h).ok())
         })
         .ok_or_else(|| "Нет энкодера".to_string())?;
@@ -136,7 +141,10 @@ pub fn run_tty(
     );
     let _global = output.create_global::<AppState>(&display_handle);
     output.change_current_state(
-        Some(smithay_mode), Some(Transform::Normal), None, Some((0, 0).into()),
+        Some(smithay_mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
     );
     output.set_preferred(smithay_mode);
     state.space.map_output(&output, (0, 0));
@@ -144,8 +152,11 @@ pub fn run_tty(
     // 7. DRM поверхность + DrmCompositor
     let drm_surface = drm.create_surface(crtc, drm_mode, &[connector.handle()])?;
     let drm_node = DrmNode::from_path(&gpu_path).ok();
-    let exporter   = GbmFramebufferExporter::new(gbm.clone(), drm_node);
-    let allocator  = GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let exporter = GbmFramebufferExporter::new(gbm.clone(), drm_node);
+    let allocator = GbmAllocator::new(
+        gbm.clone(),
+        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+    );
     let color_fmts = [Fourcc::Abgr8888, Fourcc::Argb8888];
     let render_fmts = renderer.egl_context().dmabuf_render_formats().clone();
 
@@ -171,7 +182,7 @@ pub fn run_tty(
     // Also bind the renderer's EGL buffer reader to our Wayland display. On
     // Mesa this gives clients the EGL wl_drm interface and lets the GLES
     // renderer import their dmabufs as textures — the actual zero-copy path.
-    use smithay::backend::renderer::{ImportEgl, ImportDma};
+    use smithay::backend::renderer::{ImportDma, ImportEgl};
     match renderer.bind_wl_display(&display_handle) {
         Ok(()) => println!("=====> EGL hardware-acceleration enabled"),
         Err(e) => eprintln!("[DRM] EGL bind_wl_display failed: {e:?}"),
@@ -187,7 +198,8 @@ pub fn run_tty(
         smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(main_device, dmabuf_formats)
             .build()
             .expect("failed to build dmabuf feedback");
-    let dmabuf_global = state.dmabuf_state
+    let dmabuf_global = state
+        .dmabuf_state
         .create_global_with_default_feedback::<AppState>(&display_handle, &default_feedback);
     state.dmabuf_global = Some(dmabuf_global);
     println!("=====> DMA-BUF (zero-copy) global создан");
@@ -213,7 +225,10 @@ pub fn run_tty(
                 eprintln!("[libinput] Ошибка при resume: {:?}", e);
             }
             if let Err(e) = compositor_session.borrow_mut().reset_state() {
-                eprintln!("[DRM] Ошибка при сбросе состояния после активации сессии: {:?}", e);
+                eprintln!(
+                    "[DRM] Ошибка при сбросе состояния после активации сессии: {:?}",
+                    e
+                );
             }
             println!("[session] активна");
         }
@@ -232,12 +247,11 @@ pub fn run_tty(
         }
     })?;
 
-
     // 10. udev hotplug
     let udev_backend = UdevBackend::new(&seat_name)?;
     loop_handle.insert_source(udev_backend, |event, _, _| match event {
-        UdevEvent::Added { path, .. }    => println!("[udev] GPU добавлена: {path:?}"),
-        UdevEvent::Changed { .. }        => {}
+        UdevEvent::Added { path, .. } => println!("[udev] GPU добавлена: {path:?}"),
+        UdevEvent::Changed { .. } => {}
         UdevEvent::Removed { device_id } => println!("[udev] GPU удалена: {device_id}"),
     })?;
 
@@ -248,12 +262,10 @@ pub fn run_tty(
     let floor_buf = SolidColorBuffer::new((10000, 4), [0.8f32, 0.8, 0.8, 1.0]);
     // Буферы для псевдо-круглых точек 6x6 (состоят из 3-х прямоугольников)
 
-
-
     // 11. Рендер-таймер ~60 fps. Renders only when something changed
     //     (`state.needs_render`); an idle desktop costs ~0 GPU/CPU instead of a
     //     forced 60fps redraw loop.
-    let output_t     = output.clone();
+    let output_t = output.clone();
     let compositor_t = compositor.clone();
     loop_handle.insert_source(
         Timer::from_duration(Duration::from_millis(16)),
@@ -263,6 +275,7 @@ pub fn run_tty(
             // `step_physics` сам выставит `needs_render = true`, разбудив рендер.
             if state.layout_mode == crate::state::LayoutMode::Physics {
                 state.step_physics();
+                state.sync_x11_with_physics();
             }
 
             // Screencopy-клиент (OBS через portal-wlr) ждёт кадр — будим рендер,
@@ -314,7 +327,7 @@ pub fn run_tty(
                 // Пол: мировая Y из config.physics.floor_y
                 let screen_w = output_t.current_mode().map(|m| m.size.w).unwrap_or(1920);
                 let floor_y = ((state.config.physics.floor_y as f64 - state.camera_offset.1) * state.camera_zoom) as i32;
-                
+
                 // Если пол попадает в экран, рисуем его
                 if floor_y > -100 && floor_y < 4000 {
                     // Сама полоса (белая) — центрируем по X

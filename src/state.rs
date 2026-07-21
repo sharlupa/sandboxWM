@@ -1,3 +1,12 @@
+use smithay::reexports::wayland_server::Resource;
+use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::data_device::{
+    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    set_data_device_focus,
+};
+use smithay::wayland::selection::primary_selection::{
+    PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+};
 use smithay::{
     backend::session::libseat::LibSeatSession,
     desktop::{PopupKind, PopupManager, Space, Window},
@@ -5,34 +14,23 @@ use smithay::{
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            backend::{ClientData, ClientId, DisconnectReason},
-            protocol::{wl_surface::WlSurface, wl_seat::WlSeat},
             Client, DisplayHandle,
+            backend::{ClientData, ClientId, DisconnectReason},
+            protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
         },
     },
-    utils::{Clock, Monotonic, Serial, Rectangle, Size, Logical, Point},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Size},
     wayland::{
         buffer::BufferHandler,
-        compositor::{
-            CompositorClientState, CompositorHandler, CompositorState,
-        },
+        compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        output::{OutputHandler, OutputManagerState},
         seat::WaylandFocus,
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            decoration::{XdgDecorationState, XdgDecorationHandler},
+            decoration::{XdgDecorationHandler, XdgDecorationState},
         },
-        output::{OutputHandler, OutputManagerState},
         shm::{ShmHandler, ShmState},
     },
-};
-use smithay::reexports::wayland_server::Resource;
-use smithay::wayland::selection::SelectionHandler;
-use smithay::wayland::selection::data_device::{
-    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
-    ServerDndGrabHandler,
-};
-use smithay::wayland::selection::primary_selection::{
-    set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
 };
 
 #[derive(Default)]
@@ -81,6 +79,11 @@ pub struct AppState {
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_output_manager_state: crate::output_manager::OutputManagerState,
 
+    // XWayland: shell-state, оконный менеджер X11 и номер X-дисплея
+    pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
+    pub xwm: Option<smithay::xwayland::X11Wm>,
+    pub xdisplay: Option<u32>,
+
     // WM states
     pub space: Space<Window>,
     pub seat: Seat<Self>,
@@ -127,7 +130,7 @@ pub struct AppState {
         Window,
         std::collections::VecDeque<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
     >,
-    
+
     // Tracks windows that have received a configure event but haven't committed
     // a new buffer yet. This prevents us from spamming configure events faster
     // than the client can process them (backpressure).
@@ -176,7 +179,10 @@ impl AppState {
         let screencopy_state = crate::screencopy::ScreencopyState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
-        let wlr_output_manager_state = crate::output_manager::OutputManagerState::new::<Self>(&display_handle);
+        let wlr_output_manager_state =
+            crate::output_manager::OutputManagerState::new::<Self>(&display_handle);
+        let xwayland_shell_state =
+            smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(&display_handle);
 
         Self {
             display_handle,
@@ -188,6 +194,9 @@ impl AppState {
             popup_manager: PopupManager::default(),
             output_manager_state,
             wlr_output_manager_state,
+            xwayland_shell_state,
+            xwm: None,
+            xdisplay: None,
             seat_state,
             xdg_decoration_state,
             screencopy_state,
@@ -267,11 +276,24 @@ impl AppState {
             .collect();
 
         for (win, geo) in geoms {
+            // Override-redirect окна (меню/тултипы Steam и т.п.) — без тел:
+            // клиент позиционирует их сам, WM не должен их двигать.
+            if win
+                .x11_surface()
+                .map_or(false, |x| x.is_override_redirect())
+            {
+                continue;
+            }
             // Центр окна в мировых координатах. Камера сейчас (0,0), поэтому
             // мировые координаты = экранные на момент переключения.
             let cx = geo.loc.x as f32 + geo.size.w as f32 * 0.5;
             let cy = geo.loc.y as f32 + geo.size.h as f32 * 0.5;
             let handle = phys.spawn_window(cx, cy, geo.size.w as f32, geo.size.h as f32);
+            // X11 не умеет повёрнутые окна: при угле != 0 глобальные
+            // координаты кликов (Steam/CEF) съезжают. Блокируем вращение.
+            if win.x11_surface().is_some() {
+                phys.lock_rotations(handle);
+            }
             self.window_bodies.insert(win, handle);
         }
 
@@ -344,12 +366,13 @@ impl AppState {
                 phys.set_angular_velocity(handle, spin_dir * spin_rate);
             }
         }
-        
+
         // Держим needs_render поднятым, пока хоть одно тело двигается — иначе
         // рендер-цикл уснёт и симуляция застынет. Когда всё улеглось, рендер
         // засыпает (это и нужно для энергосбережения на idle столе).
-        let mut moving = phys.any_moving() || self.drag_body.is_some() || self.physics_spin_dir != 0.0;
-        
+        let mut moving =
+            phys.any_moving() || self.drag_body.is_some() || self.physics_spin_dir != 0.0;
+
         // Плавная камера (Lerp)
         let cam_dx = self.target_camera_offset.0 - self.camera_offset.0;
         let cam_dy = self.target_camera_offset.1 - self.camera_offset.1;
@@ -395,7 +418,8 @@ impl AppState {
             let loc = (
                 (cx - size.w as f32 * 0.5).round() as i32,
                 (cy - size.h as f32 * 0.5).round() as i32,
-            ).into();
+            )
+                .into();
             let rect = Rectangle::new(loc, size);
             self.apply_window_geometry(&win, rect);
         }
@@ -404,18 +428,25 @@ impl AppState {
     /// Смещает камеру на `(dx, dy)` в мировых координатах. Фактическое
     /// смещение вида применяется в рендер-цикле через map_output.
     pub fn screen_to_world(&self, x: f64, y: f64) -> (f64, f64) {
-        (x / self.camera_zoom + self.camera_offset.0, y / self.camera_zoom + self.camera_offset.1)
+        (
+            x / self.camera_zoom + self.camera_offset.0,
+            y / self.camera_zoom + self.camera_offset.1,
+        )
     }
 
     pub fn zoom_camera(&mut self, factor: f64) {
-        if self.layout_mode != LayoutMode::Physics { return; }
+        if self.layout_mode != LayoutMode::Physics {
+            return;
+        }
         self.camera_zoom = (self.camera_zoom * factor).clamp(0.25, 3.0);
         self.physics_visual_gen = self.physics_visual_gen.wrapping_add(1);
         self.needs_render = true;
     }
 
     pub fn reset_camera(&mut self) {
-        if self.layout_mode != LayoutMode::Physics { return; }
+        if self.layout_mode != LayoutMode::Physics {
+            return;
+        }
         self.camera_offset = (0.0, 0.0);
         self.target_camera_offset = (0.0, 0.0);
         self.camera_zoom = 1.0;
@@ -478,6 +509,11 @@ impl AppState {
             return;
         };
         let handle = phys.spawn_window(spawn_x, spawn_y, w, h);
+        // X11-окна не вращаем: XWayland не умеет сообщать повёрнутую
+        // геометрию, глобальные координаты кликов (Steam/CEF) съезжают.
+        if win.x11_surface().is_some() {
+            phys.lock_rotations(handle);
+        }
         self.window_bodies.insert(win.clone(), handle);
     }
 
@@ -525,12 +561,18 @@ impl AppState {
 
     /// Находит тело окна под курсором (мировые координаты) для drag.
     /// Обходит окна сверху вниз (как в Space), чтобы верхнее перекрывало нижнее.
-    pub fn physics_pick(&self, world_x: f64, world_y: f64) -> Option<(Window, rapier2d::prelude::RigidBodyHandle)> {
+    pub fn physics_pick(
+        &self,
+        world_x: f64,
+        world_y: f64,
+    ) -> Option<(Window, rapier2d::prelude::RigidBodyHandle)> {
         if self.physics.is_none() {
             return None;
         }
         for win in self.space.elements().rev() {
-            let Some(&handle) = self.window_bodies.get(win) else { continue };
+            let Some(&handle) = self.window_bodies.get(win) else {
+                continue;
+            };
             if let Some((local_x, local_y, hw, hh)) =
                 self.physics_world_to_local(win, handle, world_x, world_y)
             {
@@ -544,12 +586,112 @@ impl AppState {
 
     /// Hit-test с учётом поворота: возвращает окно и «виртуальный» top-left,
     /// такой что `world - loc` даёт локальные координаты поверхности (0..w, 0..h).
-    pub fn physics_element_under(&self, world_x: f64, world_y: f64) -> Option<(Window, Point<i32, Logical>)> {
+    /// Сообщаем X-серверу реальные экранные позиции X11-окон в физическом
+    /// режиме. XWayland пересчитывает координаты кликов в глобальные через
+    /// X11-геометрию окна; если она устарела (окно двигает физика, а не
+    /// тайлинг), клики в X11-приложениях (Steam) «съезжают».
+    pub fn sync_x11_with_physics(&self) {
+        if self.layout_mode != LayoutMode::Physics {
+            return;
+        }
+        let Some(phys) = self.physics.as_ref() else {
+            return;
+        };
+        for win in self.space.elements() {
+            let Some(x11) = win.x11_surface() else {
+                continue;
+            };
+            // Override-redirect окна клиент позиционирует сам — не трогаем.
+            if x11.is_override_redirect() {
+                continue;
+            }
+            let Some(&handle) = self.window_bodies.get(win) else {
+                continue;
+            };
+            let Some((cx, cy, _angle)) = phys.body_transform(handle) else {
+                continue;
+            };
+            let size = win.geometry().size;
+            // Экранные координаты — как в apply_window_geometry.
+            let loc = Point::<i32, Logical>::from((
+                ((cx as f64 - size.w as f64 * 0.5 - self.camera_offset.0) * self.camera_zoom)
+                    .round() as i32,
+                ((cy as f64 - size.h as f64 * 0.5 - self.camera_offset.1) * self.camera_zoom)
+                    .round() as i32,
+            ));
+            // ОТКЛЮЧЕНО: apply_window_geometry уже конфигурирует экранные
+            // координаты каждый кадр; второй configure с другим округлением
+            // устраивал войну 658<->657 и заваливал CEF потоком ConfigureNotify.
+            if false && x11.geometry().loc != loc {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/wm_sync.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "sync class={:?} x_geo={:?} -> loc={:?} size={:?}",
+                        x11.class(),
+                        x11.geometry().loc,
+                        loc,
+                        size
+                    );
+                }
+                let _ = x11.configure(Rectangle::new(loc, size));
+            }
+        }
+    }
+
+    pub fn physics_element_under(
+        &self,
+        world_x: f64,
+        world_y: f64,
+    ) -> Option<(Window, Point<i32, Logical>)> {
         if self.physics.is_none() {
             return None;
         }
         for win in self.space.elements().rev() {
-            let Some(&handle) = self.window_bodies.get(win) else { continue };
+            let Some(&handle) = self.window_bodies.get(win) else {
+                // Без тела (override-redirect меню/тултипы Steam): хит-тест
+                // по статичной позиции, куда окно поставил сам клиент.
+                if win
+                    .x11_surface()
+                    .map_or(false, |x| x.is_override_redirect())
+                {
+                    if let Some(geo) = self.space.element_geometry(win) {
+                        // OR-окна клиент ставит в ЭКРАННЫХ координатах (X-геометрия
+                        // теперь экранная) — переводим мировой клик в экран.
+                        let sx = (world_x - self.camera_offset.0) * self.camera_zoom;
+                        let sy = (world_y - self.camera_offset.1) * self.camera_zoom;
+                        let local = Point::<f64, Logical>::from((
+                            sx - geo.loc.x as f64,
+                            sy - geo.loc.y as f64,
+                        ));
+                        // Только реальная зона ввода поверхности: невидимые
+                        // служебные OR-слои CEF не должны съедать клики.
+                        if local.x >= 0.0
+                            && local.y >= 0.0
+                            && local.x <= geo.size.w as f64
+                            && local.y <= geo.size.h as f64
+                            && win
+                                .surface_under(local, smithay::desktop::WindowSurfaceType::ALL)
+                                .is_some()
+                        {
+                            return Some((
+                                win.clone(),
+                                Point::from((
+                                    (geo.loc.x as f64 / self.camera_zoom + self.camera_offset.0)
+                                        .round() as i32,
+                                    (geo.loc.y as f64 / self.camera_zoom + self.camera_offset.1)
+                                        .round() as i32,
+                                )),
+                            ));
+                        }
+                    }
+                }
+                continue;
+            };
             if let Some((local_x, local_y, hw, hh)) =
                 self.physics_world_to_local(win, handle, world_x, world_y)
             {
@@ -567,11 +709,10 @@ impl AppState {
 
     fn focused_physics_body(&self) -> Option<rapier2d::prelude::RigidBodyHandle> {
         let surf = self.seat.get_keyboard()?.current_focus()?;
-        let win = self.space.elements().find(|w| {
-            w.toplevel()
-                .map(|t| t.wl_surface() == &surf)
-                .unwrap_or(false)
-        })?;
+        let win = self
+            .space
+            .elements()
+            .find(|w| w.wl_surface().map(|s| s.as_ref() == &surf).unwrap_or(false))?;
         self.window_bodies.get(win).copied()
     }
 
@@ -642,6 +783,32 @@ impl AppState {
         self.drag_last_ptr = None;
     }
 
+    /// Общая уборка окна (Wayland toplevel или X11): Space, тайлы, физика, фокус.
+    pub fn remove_window_common(&mut self, window: &Window) {
+        self.space.unmap_elem(window);
+
+        if self.layout_mode == LayoutMode::Physics {
+            self.physics_remove_window(window);
+            if self
+                .drag_body
+                .as_ref()
+                .map(|(w, _)| w == window)
+                .unwrap_or(false)
+            {
+                self.physics_drag_end();
+            }
+        } else if let Some(tree) = self.tile_tree.take() {
+            self.tile_tree = tree.remove(window);
+            self.recalculate_layout();
+        }
+
+        let next_win = self.space.elements().next_back().cloned();
+        if let Some(win) = next_win {
+            self.focus_window(&win);
+        }
+        self.needs_render = true;
+    }
+
     /// Get the screen size from the first mapped output.
     pub fn output_size(&self) -> Size<i32, Logical> {
         self.space
@@ -663,10 +830,10 @@ impl AppState {
         let screen = self.output_size();
         let gaps_in = 4i32; // between windows
         let gaps_out = 8i32; // from screen edges
-        
+
         let screen_rect = Rectangle::new(
             (gaps_out, gaps_out).into(),
-            (screen.w - gaps_out * 2, screen.h - gaps_out * 2).into()
+            (screen.w - gaps_out * 2, screen.h - gaps_out * 2).into(),
         );
 
         if let Some(tree) = &self.tile_tree {
@@ -686,16 +853,16 @@ impl AppState {
             let old_left = old_geo.loc.x;
             let old_right = old_geo.loc.x + old_geo.size.w;
             let target_right = rect.loc.x + rect.size.w;
-            
+
             let old_top = old_geo.loc.y;
             let old_bottom = old_geo.loc.y + old_geo.size.h;
             let target_bottom = rect.loc.y + rect.size.h;
-            
+
             // If the right edge is conceptually fixed, anchor visual location to the right
             if (target_right - old_right).abs() < 5 && (rect.loc.x - old_left).abs() > 0 {
                 loc.x = target_right - current_buffer_geo.size.w;
             }
-            
+
             // If the bottom edge is conceptually fixed, anchor visual location to the bottom
             if (target_bottom - old_bottom).abs() < 5 && (rect.loc.y - old_top).abs() > 0 {
                 loc.y = target_bottom - current_buffer_geo.size.h;
@@ -729,16 +896,71 @@ impl AppState {
                 }
             }
         }
+
+        // X11-окна (XWayland): размер/позиция задаются напрямую через configure.
+        if let Some(x11) = window.x11_surface() {
+            // В физике X-геометрия — в ЭКРАННЫХ координатах: X-экран размером
+            // с output, и X-сервер клампит указатель к его границам. Мировые
+            // координаты уводят окно за экран → root-координаты кликов у
+            // CEF/Steam рвутся (смещение нажатий).
+            let x_loc = if self.layout_mode == LayoutMode::Physics {
+                Point::<i32, Logical>::from((
+                    ((loc.x as f64 - self.camera_offset.0) * self.camera_zoom).round() as i32,
+                    ((loc.y as f64 - self.camera_offset.1) * self.camera_zoom).round() as i32,
+                ))
+            } else {
+                loc
+            };
+            let target = Rectangle::new(x_loc, rect.size);
+            if x11.geometry() != target {
+                let _ = x11.configure(target);
+            }
+        }
     }
 
-    /// Set keyboard focus to a specific window.
-    pub fn focus_window(&mut self, window: &Window) {
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+    /// Synchronize Smithay's visual Space order with XWayland's internal
+    /// X11 stacking order. Steam/CEF uses many override-redirect popup windows;
+    /// if the two stacks diverge, a popup may be visible on top while X11 sends
+    /// the click to the main window underneath it.
+    pub fn sync_x11_stacking(&mut self) {
+        let order: Vec<smithay::xwayland::X11Surface> = self
+            .space
+            .elements()
+            .filter_map(|w| w.x11_surface().cloned())
+            .collect();
+        if let Some(xwm) = self.xwm.as_mut() {
+            let _ = xwm.update_stacking_order_downwards(order.iter());
+        }
+    }
 
-        // Deactivate all windows first, then activate the target.
-        // Dirty-check: only send a configure to windows whose activated state
-        // actually changed. Previously every focus switch sent a configure to
-        // ALL N windows, triggering an O(N) burst of client re-commits.
+    /// Set keyboard focus to a specific normal toplevel window.
+    pub fn focus_window(&mut self, window: &Window) {
+        // X11 override-redirect windows (Steam/CEF menus, tooltips and
+        // notifications) manage their own focus/grabs. Treating them as normal
+        // toplevels generates FocusOut before ButtonPress and makes clicks pass
+        // through the popup.
+        if window
+            .x11_surface()
+            .map_or(false, |x| x.is_override_redirect())
+        {
+            return;
+        }
+
+        let already_focused = self
+            .get_focused_window()
+            .as_ref()
+            .map_or(false, |focused| focused == window);
+
+        // Raise visually first, then mirror the complete order to X11. Raising
+        // just the target with X11Wm::raise_window loses CEF popup ordering.
+        self.space.raise_element(window, true);
+        if already_focused {
+            self.sync_x11_stacking();
+            self.needs_render = true;
+            return;
+        }
+
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         let windows: Vec<Window> = self.space.elements().cloned().collect();
         for w in &windows {
             let is_target = w == window;
@@ -758,18 +980,26 @@ impl AppState {
                 if changed {
                     toplevel.send_configure();
                 }
+            } else if let Some(x11) = w.x11_surface() {
+                // Never deactivate OR popups. Steam's locally-active focus
+                // model closes or defocuses them before the pending click.
+                if x11.is_override_redirect() {
+                    continue;
+                }
+                let _ = x11.set_activated(is_target);
+                w.set_activated(is_target);
             }
         }
 
-        // Set keyboard focus to target window's surface
-        if let Some(toplevel) = window.toplevel() {
-            let wl_surface = toplevel.wl_surface().clone();
+        // Wayland keyboard focus on the XWayland wl_surface lets XWayland apply
+        // the client's ICCCM input model (including WM_TAKE_FOCUS).
+        if let Some(wl_surface) = window.wl_surface().map(|s| s.into_owned()) {
             if let Some(kbd) = self.seat.get_keyboard() {
                 kbd.set_focus(self, Some(wl_surface), serial);
             }
         }
 
-        self.space.raise_element(window, true);
+        self.sync_x11_stacking();
         self.needs_render = true;
     }
 
@@ -786,11 +1016,9 @@ impl AppState {
         };
         let current_surface = kbd.current_focus();
         let current_idx = current_surface.and_then(|surf| {
-            windows.iter().position(|w| {
-                w.toplevel()
-                    .map(|t| t.wl_surface() == &surf)
-                    .unwrap_or(false)
-            })
+            windows
+                .iter()
+                .position(|w| w.wl_surface().map(|s| s.as_ref() == &surf).unwrap_or(false))
         });
 
         let next_idx = match current_idx {
@@ -812,8 +1040,9 @@ impl AppState {
     pub fn get_focused_window(&self) -> Option<Window> {
         let kbd = self.seat.get_keyboard()?;
         let surf = kbd.current_focus()?;
-        self.space.elements()
-            .find(|w| w.toplevel().map(|t| t.wl_surface() == &surf).unwrap_or(false))
+        self.space
+            .elements()
+            .find(|w| w.wl_surface().map(|s| s.as_ref() == &surf).unwrap_or(false))
             .cloned()
     }
 }
@@ -824,6 +1053,13 @@ impl CompositorHandler for AppState {
         &mut self.compositor_state
     }
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        // Обычные Wayland-клиенты несут ClientState, а клиент XWayland —
+        // XWaylandClientData (его создаёт smithay при XWayland::spawn).
+        // Раньше unwrap() здесь ронял композитор (SIGABRT в global_bind),
+        // как только Xwayland подключался к композитору.
+        if let Some(data) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            return &data.compositor_state;
+        }
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
     fn commit(&mut self, surface: &WlSurface) {
@@ -849,11 +1085,16 @@ impl CompositorHandler for AppState {
             // Client has committed a buffer, meaning it has processed the last
             // configure event. We can send new configure events to it now.
             self.pending_configures.remove(&window);
-            
+
             // Если мы в физическом режиме, но тело ещё не создано — самое время это сделать!
             // Но только когда клиент уже закоммитил реальный буфер (размер > placeholder 1x1).
             // Первый commit часто приходит с нулевой/заглушечной геометрией.
-            if self.layout_mode == LayoutMode::Physics && !self.window_bodies.contains_key(&window) {
+            if self.layout_mode == LayoutMode::Physics
+                && !self.window_bodies.contains_key(&window)
+                && !window
+                    .x11_surface()
+                    .map_or(false, |x| x.is_override_redirect())
+            {
                 let geo = window.geometry();
                 if geo.size.w > 1 && geo.size.h > 1 {
                     self.physics_spawn_window(&window);
@@ -884,14 +1125,17 @@ impl CompositorHandler for AppState {
         // Новый буфер — экран нужно перерисовать.
         self.needs_render = true;
     }
-
 }
 
 smithay::delegate_compositor!(AppState);
 
 // 2. Buffer & SHM
 impl BufferHandler for AppState {
-    fn buffer_destroyed(&mut self, _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer) {}
+    fn buffer_destroyed(
+        &mut self,
+        _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    ) {
+    }
 }
 
 impl smithay::wayland::dmabuf::DmabufHandler for AppState {
@@ -975,7 +1219,12 @@ impl XdgShellHandler for AppState {
             if self.layout_mode == LayoutMode::Physics {
                 self.physics_remove_window(&window);
                 // Если таскали именно это окно — сбрасываем drag.
-                if self.drag_body.as_ref().map(|(w, _)| w == &window).unwrap_or(false) {
+                if self
+                    .drag_body
+                    .as_ref()
+                    .map(|(w, _)| w == &window)
+                    .unwrap_or(false)
+                {
                     self.physics_drag_end();
                 }
             } else if let Some(tree) = self.tile_tree.take() {
@@ -995,12 +1244,19 @@ impl XdgShellHandler for AppState {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        let _ = self.popup_manager.track_popup(PopupKind::Xdg(surface.clone()));
+        let _ = self
+            .popup_manager
+            .track_popup(PopupKind::Xdg(surface.clone()));
         let _ = surface.send_configure();
         self.needs_render = true;
     }
     fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
-    fn reposition_request(&mut self, surface: PopupSurface, _positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        _positioner: PositionerState,
+        token: u32,
+    ) {
         surface.send_repositioned(token);
         let _ = surface.send_configure();
         self.needs_render = true;
@@ -1047,8 +1303,26 @@ impl AsMut<crate::output_manager::OutputManagerState> for AppState {
 }
 
 impl crate::output_manager::OutputManagerHandler for AppState {
-    fn outputs(&self) -> Vec<(smithay::output::Output, Option<smithay::utils::Point<i32, smithay::utils::Logical>>)> {
-        self.space.outputs().map(|o| (o.clone(), Some(self.space.output_geometry(o).unwrap_or(smithay::utils::Rectangle::from_size((0, 0).into())).loc))).collect()
+    fn outputs(
+        &self,
+    ) -> Vec<(
+        smithay::output::Output,
+        Option<smithay::utils::Point<i32, smithay::utils::Logical>>,
+    )> {
+        self.space
+            .outputs()
+            .map(|o| {
+                (
+                    o.clone(),
+                    Some(
+                        self.space
+                            .output_geometry(o)
+                            .unwrap_or(smithay::utils::Rectangle::from_size((0, 0).into()))
+                            .loc,
+                    ),
+                )
+            })
+            .collect()
     }
 }
 
