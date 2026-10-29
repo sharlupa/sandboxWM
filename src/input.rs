@@ -370,7 +370,10 @@ fn physics_pointer_focus(
     state: &mut AppState,
     x: f64,
     y: f64,
-) -> (Option<(WlSurface, Point<f64, Logical>)>, Point<f64, Logical>) {
+) -> (
+    Option<(WlSurface, Point<f64, Logical>)>,
+    Point<f64, Logical>,
+) {
     if pointer_grabbed(state) {
         if let Some(target) = state.pointer_grab_target.clone() {
             if let Some(local) = state.physics_target_point(&target, x, y) {
@@ -409,13 +412,13 @@ fn handle_pointer_motion(state: &mut AppState, mut x: f64, mut y: f64, serial: S
         }
         state.tool_motion(x, y);
         state.soft_grab_update(x, y);
-        let (focus, location) =
-            if state.dragging || state.tool_active() || state.soft_grab_active() {
-                // Пока тащим окно или работаем инструментом, ховер клиентам не нужен.
-                (None, pos)
-            } else {
-                physics_pointer_focus(state, x, y)
-            };
+        let (focus, location) = if state.dragging || state.tool_active() || state.soft_grab_active()
+        {
+            // Пока тащим окно или работаем инструментом, ховер клиентам не нужен.
+            (None, pos)
+        } else {
+            physics_pointer_focus(state, x, y)
+        };
         if state.dragging {
             state.needs_render = true;
         }
@@ -504,7 +507,12 @@ fn tiling_focus(
 }
 
 /// Shared click-to-focus + Super+LMB tile resize (Tiling) / drag body (Physics)
-fn handle_pointer_button(state: &mut AppState, button: u32, btn_state: ButtonState, time_msec: u32) {
+fn handle_pointer_button(
+    state: &mut AppState,
+    button: u32,
+    btn_state: ButtonState,
+    time_msec: u32,
+) {
     let serial = SERIAL_COUNTER.next_serial();
     let pos = state.pointer_location;
     let super_down = super_held(state);
@@ -654,7 +662,13 @@ fn click_focus(state: &mut AppState, window: Option<smithay::desktop::Window>) {
     }
 }
 
-fn send_button(state: &mut AppState, button: u32, btn_state: ButtonState, serial: Serial, time: u32) {
+fn send_button(
+    state: &mut AppState,
+    button: u32,
+    btn_state: ButtonState,
+    serial: Serial,
+    time: u32,
+) {
     if let Some(ptr) = state.seat.get_pointer() {
         ptr.button(
             state,

@@ -117,7 +117,9 @@ enum Tag {
     Line(u32),
     /// Звено верёвки. `excluded` — куски, с которыми звено не сталкивается
     /// (окна, которые эта верёвка связывает/держит).
-    Rope { excluded: [u32; 2] },
+    Rope {
+        excluded: [u32; 2],
+    },
 }
 
 const KIND_SHIFT: u32 = 120;
@@ -1048,10 +1050,7 @@ impl WindowPhysics {
             chain.segments[chain.segments.len() - 1]
         };
         let half = self.segment_half_len(seg).unwrap_or(chain.half_len);
-        (
-            seg,
-            Vector::new(if end == 0 { -half } else { half }, 0.0),
-        )
+        (seg, Vector::new(if end == 0 { -half } else { half }, 0.0))
     }
 
     fn segment_half_len(&self, seg: RigidBodyHandle) -> Option<f32> {
@@ -1129,7 +1128,8 @@ impl WindowPhysics {
                 let world = seg_pose.transform_point(local);
                 let l = pose.inverse_transform_point(world);
                 if l.x.abs() <= half.x + reach && l.y.abs() <= half.y + reach {
-                    let clamped = Vector::new(l.x.clamp(-half.x, half.x), l.y.clamp(-half.y, half.y));
+                    let clamped =
+                        Vector::new(l.x.clamp(-half.x, half.x), l.y.clamp(-half.y, half.y));
                     attach = Some((id, end, clamped));
                     break;
                 }
@@ -1163,22 +1163,26 @@ impl WindowPhysics {
             };
             (seg, seg_local, pin_anchor, length)
         };
-        let mut joints = vec![self.world.insert_impulse_joint(
-            piece_body,
-            seg,
-            RevoluteJointBuilder::new()
-                .local_anchor1(local_on_piece)
-                .local_anchor2(seg_local)
-                .contacts_enabled(false),
-        )];
-        if let Some(anchor) = pin_anchor {
-            joints.push(self.world.insert_impulse_joint(
-                anchor,
+        let mut joints = vec![
+            self.world.insert_impulse_joint(
                 piece_body,
-                RopeJointBuilder::new(length.max(1.0))
-                    .local_anchor1(Vector::ZERO)
-                    .local_anchor2(local_on_piece),
-            ));
+                seg,
+                RevoluteJointBuilder::new()
+                    .local_anchor1(local_on_piece)
+                    .local_anchor2(seg_local)
+                    .contacts_enabled(false),
+            ),
+        ];
+        if let Some(anchor) = pin_anchor {
+            joints.push(
+                self.world.insert_impulse_joint(
+                    anchor,
+                    piece_body,
+                    RopeJointBuilder::new(length.max(1.0))
+                        .local_anchor1(Vector::ZERO)
+                        .local_anchor2(local_on_piece),
+                ),
+            );
         }
         // Звенья больше не толкаются с подвешенным окном.
         if let Some(Line {
@@ -1301,7 +1305,9 @@ impl WindowPhysics {
             for &jh in &link.joints {
                 if let Some(j) = self.world.impulse_joints.get(jh) {
                     let imp = j.impulses;
-                    let mass = self.piece_mass(link.a.piece).min(self.piece_mass(link.b.piece));
+                    let mass = self
+                        .piece_mass(link.a.piece)
+                        .min(self.piece_mass(link.b.piece));
                     if Vector::new(imp.x, imp.y).length() / mass > link.break_dv {
                         broken_links.push(id);
                         break;
@@ -1334,14 +1340,16 @@ impl WindowPhysics {
             LinkKind::Weld => {
                 // Монолит в текущей взаимной позе: frame2 = поза b в системе a.
                 let rel = pose_a.inverse() * pose_b;
-                joints.push(self.world.insert_impulse_joint(
-                    body_a,
-                    body_b,
-                    FixedJointBuilder::new()
-                        .local_frame1(rel)
-                        .local_frame2(Pose::IDENTITY)
-                        .contacts_enabled(false),
-                ));
+                joints.push(
+                    self.world.insert_impulse_joint(
+                        body_a,
+                        body_b,
+                        FixedJointBuilder::new()
+                            .local_frame1(rel)
+                            .local_frame2(Pose::IDENTITY)
+                            .contacts_enabled(false),
+                    ),
+                );
                 break_dv = self.joints_cfg.weld.break_force.max(0.0);
             }
             LinkKind::Spring => {
@@ -1376,32 +1384,38 @@ impl WindowPhysics {
                 let mut chain = self.build_chain(&pts, thickness, excluded, [false, false])?;
                 let (seg0, l0) = self.chain_end(&chain, 0);
                 let (seg1, l1) = self.chain_end(&chain, 1);
-                chain.joints.push(self.world.insert_impulse_joint(
-                    body_a,
-                    seg0,
-                    RevoluteJointBuilder::new()
-                        .local_anchor1(a.local)
-                        .local_anchor2(l0)
-                        .contacts_enabled(false),
-                ));
-                chain.joints.push(self.world.insert_impulse_joint(
-                    body_b,
-                    seg1,
-                    RevoluteJointBuilder::new()
-                        .local_anchor1(b.local)
-                        .local_anchor2(l1)
-                        .contacts_enabled(false),
-                ));
+                chain.joints.push(
+                    self.world.insert_impulse_joint(
+                        body_a,
+                        seg0,
+                        RevoluteJointBuilder::new()
+                            .local_anchor1(a.local)
+                            .local_anchor2(l0)
+                            .contacts_enabled(false),
+                    ),
+                );
+                chain.joints.push(
+                    self.world.insert_impulse_joint(
+                        body_b,
+                        seg1,
+                        RevoluteJointBuilder::new()
+                            .local_anchor1(b.local)
+                            .local_anchor2(l1)
+                            .contacts_enabled(false),
+                    ),
+                );
                 // Лёгкая цепь под тяжёлым окном (перепад масс ~40:1) заметно
                 // тянется в PGS-солвере. Страховочный rope joint между точками
                 // крепления не даёт окнам разойтись дальше длины верёвки.
-                chain.joints.push(self.world.insert_impulse_joint(
-                    body_a,
-                    body_b,
-                    RopeJointBuilder::new(length)
-                        .local_anchor1(a.local)
-                        .local_anchor2(b.local),
-                ));
+                chain.joints.push(
+                    self.world.insert_impulse_joint(
+                        body_a,
+                        body_b,
+                        RopeJointBuilder::new(length)
+                            .local_anchor1(a.local)
+                            .local_anchor2(b.local),
+                    ),
+                );
                 rope = Some(chain);
             }
         }
@@ -1549,7 +1563,11 @@ pub fn resample(points: &[Vector], step: f32, max_segments: usize) -> Vec<Vector
             let left = edge - t_in_edge;
             if remaining <= left || i + 2 >= points.len() {
                 t_in_edge += remaining;
-                let t = if edge > 0.0 { (t_in_edge / edge).min(1.0) } else { 0.0 };
+                let t = if edge > 0.0 {
+                    (t_in_edge / edge).min(1.0)
+                } else {
+                    0.0
+                };
                 out.push(a + (b - a) * t);
                 break;
             }
@@ -1633,9 +1651,7 @@ mod tests {
             Tag::Floor,
             Tag::Piece(7),
             Tag::Line(u32::MAX),
-            Tag::Rope {
-                excluded: [3, 900],
-            },
+            Tag::Rope { excluded: [3, 900] },
         ] {
             assert_eq!(Tag::decode(t.encode()), t);
         }
@@ -1765,7 +1781,10 @@ mod tests {
         run(&mut p, 2.0);
         let (ca, _) = p.piece_transform(a).unwrap();
         let (cb, _) = p.piece_transform(b).unwrap();
-        assert!(((cb - ca).length() - 400.0).abs() < 10.0, "weld keeps distance");
+        assert!(
+            ((cb - ca).length() - 400.0).abs() < 10.0,
+            "weld keeps distance"
+        );
         p.remove_link(weld);
         let rope = p
             .add_link(
@@ -1783,7 +1802,11 @@ mod tests {
         run(&mut p, 3.0);
         let (cb, _) = p.piece_transform(b).unwrap();
         assert!(cb.y < 700.0, "rope must hold b: {cb:?}");
-        assert!(p.link_views().iter().any(|l| l.id == rope && l.points.len() > 3));
+        assert!(
+            p.link_views()
+                .iter()
+                .any(|l| l.id == rope && l.points.len() > 3)
+        );
         assert!(p.unlink_piece(a));
         assert!(p.link_views().is_empty());
     }
@@ -1813,7 +1836,11 @@ mod tests {
 
     #[test]
     fn resample_lengths() {
-        let pts = [Vector::new(0.0, 0.0), Vector::new(100.0, 0.0), Vector::new(100.0, 100.0)];
+        let pts = [
+            Vector::new(0.0, 0.0),
+            Vector::new(100.0, 0.0),
+            Vector::new(100.0, 100.0),
+        ];
         let r = resample(&pts, 20.0, 64);
         assert_eq!(r.len(), 11);
         for w in r.windows(2) {

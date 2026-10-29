@@ -142,9 +142,15 @@ impl Affine {
             self.apply(r.loc.x + r.size.w, r.loc.y + r.size.h),
         ];
         let min_x = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-        let max_x = corners.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        let max_x = corners
+            .iter()
+            .map(|p| p.0)
+            .fold(f64::NEG_INFINITY, f64::max);
         let min_y = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-        let max_y = corners.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+        let max_y = corners
+            .iter()
+            .map(|p| p.1)
+            .fold(f64::NEG_INFINITY, f64::max);
         let x0 = min_x.floor() as i32;
         let y0 = min_y.floor() as i32;
         Rectangle::new(
@@ -311,7 +317,12 @@ impl RenderElement<GlesRenderer> for PhysicsElement {
             1.0,
         );
         let v = self.visible;
-        let instances = [v.loc.x as f32, v.loc.y as f32, v.size.w as f32, v.size.h as f32];
+        let instances = [
+            v.loc.x as f32,
+            v.loc.y as f32,
+            v.size.w as f32,
+            v.size.h as f32,
+        ];
         let alpha = self.inner.alpha();
         crate::overlay::scissored(frame, dst, damage, |frame| {
             frame.render_texture(tex, tex_matrix, matrix, Some(instances), alpha, None, &[])
@@ -382,7 +393,9 @@ impl RenderCache {
                 commit: CommitCounter::default(),
                 seen: frame,
             });
-        if entry.inner_commit != inner_commit || !entry.xf.approx_eq(&xf) || entry.visible != visible
+        if entry.inner_commit != inner_commit
+            || !entry.xf.approx_eq(&xf)
+            || entry.visible != visible
         {
             entry.inner_commit = inner_commit;
             entry.xf = xf;
@@ -393,7 +406,12 @@ impl RenderCache {
         (entry.id.clone(), entry.commit)
     }
 
-    fn track_mesh(&mut self, key: u32, fingerprint: u64, snapshot: CommitCounter) -> (Id, CommitCounter) {
+    fn track_mesh(
+        &mut self,
+        key: u32,
+        fingerprint: u64,
+        snapshot: CommitCounter,
+    ) -> (Id, CommitCounter) {
         let frame = self.frame;
         let entry = self.meshes.entry(key).or_insert_with(|| CachedMesh {
             id: Id::new(),
@@ -467,7 +485,11 @@ fn push_surface_elements(
             continue;
         }
         let visible = Rectangle::new(
-            (visible_abs.loc.x - local.loc.x, visible_abs.loc.y - local.loc.y).into(),
+            (
+                visible_abs.loc.x - local.loc.x,
+                visible_abs.loc.y - local.loc.y,
+            )
+                .into(),
             visible_abs.size,
         );
         let geometry = xf.bounds(visible_abs);
@@ -505,7 +527,11 @@ pub fn collect_physics_elements(
         let geo_loc = draw.window.geometry().loc;
         let mesh_element = draw.mesh.as_ref().and_then(|mesh| {
             let snap = snapshots.snapshot(renderer, &draw.window)?;
-            let texcoords = mesh.geometry_uv.iter().map(|uv| snap.texcoord(*uv)).collect();
+            let texcoords = mesh
+                .geometry_uv
+                .iter()
+                .map(|uv| snap.texcoord(*uv))
+                .collect();
             let (id, commit) = cache.track_mesh(draw.key, mesh.fingerprint, snap.commit);
             Some(crate::mesh_render::MeshElement::new(
                 id,

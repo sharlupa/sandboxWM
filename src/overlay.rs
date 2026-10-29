@@ -65,10 +65,26 @@ where
         let x1 = x0 + d.size.w as f32;
         let y1 = y0 + d.size.h as f32;
         let pts = [to_fb(x0, y0), to_fb(x1, y0), to_fb(x0, y1), to_fb(x1, y1)];
-        let min_x = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min).floor() as i32;
-        let max_x = pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max).ceil() as i32;
-        let min_y = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min).floor() as i32;
-        let max_y = pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max).ceil() as i32;
+        let min_x = pts
+            .iter()
+            .map(|p| p.0)
+            .fold(f32::INFINITY, f32::min)
+            .floor() as i32;
+        let max_x = pts
+            .iter()
+            .map(|p| p.0)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil() as i32;
+        let min_y = pts
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::INFINITY, f32::min)
+            .floor() as i32;
+        let max_y = pts
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil() as i32;
         // Не выходим за scissor, который выставил сам smithay.
         let sx0 = min_x.max(old_scissor[0]);
         let sy0 = min_y.max(old_scissor[1]);
@@ -84,7 +100,12 @@ where
         }
     }
     frame.with_context(|gl| unsafe {
-        gl.Scissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3])
+        gl.Scissor(
+            old_scissor[0],
+            old_scissor[1],
+            old_scissor[2],
+            old_scissor[3],
+        )
     })?;
     result
 }
@@ -125,7 +146,10 @@ impl OverlayGeometry {
     }
 
     fn triangle(&mut self, a: [f32; 2], b: [f32; 2], c: [f32; 2], color: [f32; 4]) {
-        if [a, b, c].iter().any(|p| !(p[0].is_finite() && p[1].is_finite())) {
+        if [a, b, c]
+            .iter()
+            .any(|p| !(p[0].is_finite() && p[1].is_finite()))
+        {
             return;
         }
         self.vertex(a, color);

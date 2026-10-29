@@ -791,8 +791,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sandboxwm-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.conf"), "[physics]\ngravity_y = 10.0\n[gravity_modes]\nweightless_gravity_y = 1.0\n").unwrap();
-        std::fs::write(dir.join("b.conf"), "[gravity_modes]\nfreeze_transition_secs = 2.0\n[controls]\nterminal = \"foot\"\n").unwrap();
+        std::fs::write(
+            dir.join("a.conf"),
+            "[physics]\ngravity_y = 10.0\n[gravity_modes]\nweightless_gravity_y = 1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.conf"),
+            "[gravity_modes]\nfreeze_transition_secs = 2.0\n[controls]\nterminal = \"foot\"\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("c.conf"), "this is not toml [[[").unwrap();
         let cfg = Config::load_from_dir(&dir).unwrap();
         assert_eq!(cfg.physics.gravity_y, 10.0);

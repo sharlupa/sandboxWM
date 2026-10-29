@@ -161,11 +161,7 @@ fn v2(x: f64, y: f64) -> Vector {
 
 /// Пересечение отрезка `p0→p1` с прямоугольником (Liang–Barsky):
 /// параметры входа/выхода `t ∈ [0,1]`.
-fn clip_segment(
-    p0: (f64, f64),
-    p1: (f64, f64),
-    r: Rectangle<f64, Logical>,
-) -> Option<(f64, f64)> {
+fn clip_segment(p0: (f64, f64), p1: (f64, f64), r: Rectangle<f64, Logical>) -> Option<(f64, f64)> {
     let dx = p1.0 - p0.0;
     let dy = p1.1 - p0.1;
     let mut t0 = 0.0f64;
@@ -516,7 +512,10 @@ impl AppState {
         let phys = self.ensure_physics();
         let zero = !phys.zero_gravity();
         phys.set_zero_gravity(zero);
-        println!("[physics] невесомость: {}", if zero { "вкл" } else { "выкл" });
+        println!(
+            "[physics] невесомость: {}",
+            if zero { "вкл" } else { "выкл" }
+        );
         self.needs_render = true;
     }
 
@@ -589,10 +588,16 @@ impl AppState {
                 }
                 continue;
             }
-            let (ww, wh) = (window.geometry().size.w.max(1) as f64, window.geometry().size.h.max(1) as f64);
+            let (ww, wh) = (
+                window.geometry().size.w.max(1) as f64,
+                window.geometry().size.h.max(1) as f64,
+            );
             let main = self.main_piece(&window).map(|p| p.id);
             for piece in existing {
-                let Some((c, angle)) = self.physics.as_ref().and_then(|p| p.piece_transform(piece.id))
+                let Some((c, angle)) = self
+                    .physics
+                    .as_ref()
+                    .and_then(|p| p.piece_transform(piece.id))
                 else {
                     continue;
                 };
@@ -645,7 +650,10 @@ impl AppState {
         }
         self.sync_space_positions();
         self.needs_render = true;
-        println!("[physics] режим включён, {} окон", self.space.elements().count());
+        println!(
+            "[physics] режим включён, {} окон",
+            self.space.elements().count()
+        );
     }
 
     /// Physics → Tiling: окна плавно выстраиваются по сетке.
@@ -997,12 +1005,21 @@ impl AppState {
             let y = ((phys.floor_y() as f64 - cam.1) * zoom) as f32;
             if y > -10.0 && y < screen.h as f32 + 10.0 {
                 let color = crate::config::parse_color(&self.config.physics.floor_color);
-                g.segment([-10.0, y + 1.5], [screen.w as f32 + 10.0, y + 1.5], 3.0, color);
+                g.segment(
+                    [-10.0, y + 1.5],
+                    [screen.w as f32 + 10.0, y + 1.5],
+                    3.0,
+                    color,
+                );
             }
         }
 
         for line in phys.line_views() {
-            let pts: Vec<[f32; 2]> = line.points.iter().map(|p| to_screen(*p, cam, zoom)).collect();
+            let pts: Vec<[f32; 2]> = line
+                .points
+                .iter()
+                .map(|p| to_screen(*p, cam, zoom))
+                .collect();
             let width = (line.material.thickness(materials) as f64 * zoom) as f32;
             let color = line.material.color(materials);
             g.polyline(&pts, width.max(1.5), color);
@@ -1028,7 +1045,11 @@ impl AppState {
             phys.link_views()
         };
         for link in links {
-            let pts: Vec<[f32; 2]> = link.points.iter().map(|p| to_screen(*p, cam, zoom)).collect();
+            let pts: Vec<[f32; 2]> = link
+                .points
+                .iter()
+                .map(|p| to_screen(*p, cam, zoom))
+                .collect();
             match link.kind {
                 LinkKind::Weld => {
                     let color = [1.0, 0.55, 0.2, 1.0];
@@ -1042,7 +1063,13 @@ impl AppState {
                 LinkKind::Spring => {
                     let color = crate::config::parse_color(&self.config.joints.spring.color);
                     if pts.len() == 2 {
-                        g.zigzag(pts[0], pts[1], (3.0 * zoom as f32).max(1.5), (10.0 * zoom as f32).max(4.0), color);
+                        g.zigzag(
+                            pts[0],
+                            pts[1],
+                            (3.0 * zoom as f32).max(1.5),
+                            (10.0 * zoom as f32).max(4.0),
+                            color,
+                        );
                     }
                     for p in &pts {
                         g.disc(*p, (5.0 * zoom as f32).max(2.5), color);
@@ -1055,13 +1082,17 @@ impl AppState {
         }
 
         // Превью инструментов.
-        let ptr = [self.pointer_location.x as f32, self.pointer_location.y as f32];
+        let ptr = [
+            self.pointer_location.x as f32,
+            self.pointer_location.y as f32,
+        ];
         match &self.tool {
             Tool::Draw {
                 material, stroke, ..
             } => {
                 if stroke.len() >= 2 {
-                    let pts: Vec<[f32; 2]> = stroke.iter().map(|p| to_screen(*p, cam, zoom)).collect();
+                    let pts: Vec<[f32; 2]> =
+                        stroke.iter().map(|p| to_screen(*p, cam, zoom)).collect();
                     let width = ((material.thickness(materials) as f64 * zoom) as f32).max(1.5);
                     let mut color = material.color(materials);
                     color[3] *= 0.8;
@@ -1084,7 +1115,9 @@ impl AppState {
             Tool::Link { kind, first } => {
                 let color = match kind {
                     LinkKind::Weld => [1.0, 0.55, 0.2, 1.0],
-                    LinkKind::Spring => crate::config::parse_color(&self.config.joints.spring.color),
+                    LinkKind::Spring => {
+                        crate::config::parse_color(&self.config.joints.spring.color)
+                    }
                     LinkKind::Rope => Material::Rope.color(materials),
                 };
                 if let Some(a) = first {
@@ -1107,7 +1140,12 @@ impl AppState {
         g.disc(c, 8.0, [0.0, 0.0, 0.0, 0.6]);
         g.disc(c, 6.0, color);
         if kind == 1 {
-            g.segment([c[0] - 4.0, c[1] - 4.0], [c[0] + 4.0, c[1] + 4.0], 1.5, [1.0; 4]);
+            g.segment(
+                [c[0] - 4.0, c[1] - 4.0],
+                [c[0] + 4.0, c[1] + 4.0],
+                1.5,
+                [1.0; 4],
+            );
         } else if kind == 2 {
             g.disc(c, 2.0, [1.0; 4]);
         }
@@ -1154,7 +1192,8 @@ impl AppState {
                 }
             }
         }
-        let inside = x >= r.loc.x && y >= r.loc.y && x < r.loc.x + r.size.w && y < r.loc.y + r.size.h;
+        let inside =
+            x >= r.loc.x && y >= r.loc.y && x < r.loc.x + r.size.w && y < r.loc.y + r.size.h;
         Some(((x, y).into(), inside))
     }
 
@@ -1170,14 +1209,17 @@ impl AppState {
         for window in self.space.elements().rev() {
             if Self::is_override_redirect(window) {
                 let geo = self.space.element_geometry(window)?;
-                let local = Point::<f64, Logical>::from((sx - geo.loc.x as f64, sy - geo.loc.y as f64));
+                let local =
+                    Point::<f64, Logical>::from((sx - geo.loc.x as f64, sy - geo.loc.y as f64));
                 // Только реальная зона ввода: невидимые служебные OR-слои
                 // CEF не должны съедать клики.
                 if local.x >= 0.0
                     && local.y >= 0.0
                     && local.x <= geo.size.w as f64
                     && local.y <= geo.size.h as f64
-                    && window.surface_under(local, WindowSurfaceType::ALL).is_some()
+                    && window
+                        .surface_under(local, WindowSurfaceType::ALL)
+                        .is_some()
                 {
                     return Some((
                         PointerTarget {
@@ -1226,7 +1268,12 @@ impl AppState {
     /// Координаты окна для заданной цели даже за её пределами — для
     /// неявного захвата указателя (выделение текста мышью уходит за край
     /// повёрнутого окна, а приложение должно получать согласованные точки).
-    pub fn physics_target_point(&self, target: &PointerTarget, sx: f64, sy: f64) -> Option<Point<f64, Logical>> {
+    pub fn physics_target_point(
+        &self,
+        target: &PointerTarget,
+        sx: f64,
+        sy: f64,
+    ) -> Option<Point<f64, Logical>> {
         match target.piece {
             Some(id) => {
                 let piece = self.piece_by_id(id)?;
@@ -1332,7 +1379,8 @@ impl AppState {
                 self.enter_physics_mode();
             }
             let material = self.last_material.unwrap_or_else(|| {
-                Material::from_name(&self.config.drawing.default_material).unwrap_or(Material::Steel)
+                Material::from_name(&self.config.drawing.default_material)
+                    .unwrap_or(Material::Steel)
             });
             self.tool = Tool::Draw {
                 material,
@@ -1353,7 +1401,10 @@ impl AppState {
                 self.enter_physics_mode();
             }
             let p = (self.pointer_location.x, self.pointer_location.y);
-            self.tool = Tool::Knife { start: None, end: p };
+            self.tool = Tool::Knife {
+                start: None,
+                end: p,
+            };
         }
         self.needs_render = true;
     }
@@ -1395,7 +1446,10 @@ impl AppState {
             xkb::KEY_3 => Some(Material::Trampoline),
             xkb::KEY_4 => Some(Material::Rope),
             xkb::KEY_Tab => {
-                let i = Material::ALL.iter().position(|m| m == material).unwrap_or(0);
+                let i = Material::ALL
+                    .iter()
+                    .position(|m| m == material)
+                    .unwrap_or(0);
                 Some(Material::ALL[(i + 1) % Material::ALL.len()])
             }
             _ => None,
@@ -1421,7 +1475,10 @@ impl AppState {
     pub fn tool_button(&mut self, button: u32, pressed: bool, sx: f64, sy: f64) -> bool {
         const BTN_LEFT: u32 = 0x110;
         const BTN_RIGHT: u32 = 0x111;
-        if !self.tool_active() || self.layout_mode != LayoutMode::Physics || self.transition.is_some() {
+        if !self.tool_active()
+            || self.layout_mode != LayoutMode::Physics
+            || self.transition.is_some()
+        {
             return false;
         }
         let (wx, wy) = self.screen_to_world(sx, sy);
@@ -1513,7 +1570,8 @@ impl AppState {
             return false;
         }
         let (wx, wy) = self.screen_to_world(sx, sy);
-        let spacing = (self.config.drawing.min_point_spacing.max(1.0) as f64 / self.camera_zoom) as f32;
+        let spacing =
+            (self.config.drawing.min_point_spacing.max(1.0) as f64 / self.camera_zoom) as f32;
         let max_points = self.config.drawing.max_points.max(2) as usize;
         let zoom = self.camera_zoom;
         let mut erase = false;
@@ -1607,7 +1665,10 @@ impl AppState {
                     }
                     (
                         Rectangle::new(r.loc, (r.size.w, y - r.loc.y).into()),
-                        Rectangle::new((r.loc.x, y).into(), (r.size.w, r.loc.y + r.size.h - y).into()),
+                        Rectangle::new(
+                            (r.loc.x, y).into(),
+                            (r.size.w, r.loc.y + r.size.h - y).into(),
+                        ),
                     )
                 } else {
                     let x = ((p0.0 + p1.0) * 0.5).round();
@@ -1616,14 +1677,20 @@ impl AppState {
                     }
                     (
                         Rectangle::new(r.loc, (x - r.loc.x, r.size.h).into()),
-                        Rectangle::new((x, r.loc.y).into(), (r.loc.x + r.size.w - x, r.size.h).into()),
+                        Rectangle::new(
+                            (x, r.loc.y).into(),
+                            (r.loc.x + r.size.w - x, r.size.h).into(),
+                        ),
                     )
                 };
                 self.split_piece(&piece, r1, r2, horizontal, gap);
                 cut_any = true;
             }
             if cut_any {
-                println!("[knife] окно разрезано, кусков: {}", self.pieces_of(&window).count());
+                println!(
+                    "[knife] окно разрезано, кусков: {}",
+                    self.pieces_of(&window).count()
+                );
                 self.sync_space_positions();
                 self.needs_render = true;
                 return;
@@ -1767,11 +1834,18 @@ impl AppState {
         let Some(main) = self.main_piece(&window).cloned() else {
             return;
         };
-        let Some((c, angle)) = self.physics.as_ref().and_then(|p| p.piece_transform(main.id)) else {
+        let Some((c, angle)) = self
+            .physics
+            .as_ref()
+            .and_then(|p| p.piece_transform(main.id))
+        else {
             return;
         };
         let floating = self.window_floating(&window);
-        let weight = self.physics.as_ref().map_or(1.0, |p| p.piece_weight(main.id));
+        let weight = self
+            .physics
+            .as_ref()
+            .map_or(1.0, |p| p.piece_weight(main.id));
         let size = window.geometry().size;
         let full = Rectangle::new((0.0, 0.0).into(), (size.w as f64, size.h as f64).into());
         // Целое окно ставим так, чтобы основной кусок остался на месте.
@@ -1820,7 +1894,9 @@ impl AppState {
 
     /// Снимок рабочего пространства для сохранения.
     pub fn session_snapshot(&self) -> crate::session::SessionData {
-        use crate::session::{SavedAnchor, SavedJoint, SavedLine, SavedPiece, SavedWindow, SessionData};
+        use crate::session::{
+            SavedAnchor, SavedJoint, SavedLine, SavedPiece, SavedWindow, SessionData,
+        };
         let mut data = SessionData {
             layout_mode: match self.layout_mode {
                 LayoutMode::Tiling => "tiling".into(),
@@ -1829,7 +1905,11 @@ impl AppState {
             camera: if self.layout_mode == LayoutMode::Physics && self.transition.is_none() {
                 [self.camera_offset.0, self.camera_offset.1, self.camera_zoom]
             } else {
-                [self.saved_camera.0, self.saved_camera.1, self.saved_camera.2]
+                [
+                    self.saved_camera.0,
+                    self.saved_camera.1,
+                    self.saved_camera.2,
+                ]
             },
             ..Default::default()
         };
@@ -1837,7 +1917,12 @@ impl AppState {
             data.layout_mode = "tiling".into();
             return data;
         };
-        data.gravity_mode = if phys.zero_gravity() { "zero" } else { "normal" }.into();
+        data.gravity_mode = if phys.zero_gravity() {
+            "zero"
+        } else {
+            "normal"
+        }
+        .into();
         data.floor_y = Some(phys.floor_y());
 
         // Окна в порядке стека; запоминаем индекс каждого куска для связей.
@@ -1853,7 +1938,9 @@ impl AppState {
                 app_id: window_app_id(window),
                 title: window_title(window),
                 x11: window.x11_surface().is_some(),
-                command: pid.and_then(crate::session::process_command).unwrap_or_default(),
+                command: pid
+                    .and_then(crate::session::process_command)
+                    .unwrap_or_default(),
                 cwd: pid.and_then(crate::session::process_cwd),
                 pid: pid.unwrap_or(0),
                 size: [size.w, size.h],
@@ -1902,7 +1989,10 @@ impl AppState {
             });
         }
         for link in phys.link_views() {
-            let (Some(a), Some(b)) = (piece_index.get(&link.a.piece), piece_index.get(&link.b.piece)) else {
+            let (Some(a), Some(b)) = (
+                piece_index.get(&link.a.piece),
+                piece_index.get(&link.b.piece),
+            ) else {
                 continue;
             };
             data.joints.push(SavedJoint {
@@ -2005,7 +2095,11 @@ impl AppState {
                 let Some(material) = Material::from_name(&line.material) else {
                     continue;
                 };
-                let pts: Vec<Vector> = line.points.iter().map(|p| Vector::new(p[0], p[1])).collect();
+                let pts: Vec<Vector> = line
+                    .points
+                    .iter()
+                    .map(|p| Vector::new(p[0], p[1]))
+                    .collect();
                 let pinned = (line.pinned.len() == 2).then(|| [line.pinned[0], line.pinned[1]]);
                 phys.add_line(material, &pts, pinned);
             }
@@ -2050,8 +2144,16 @@ impl AppState {
         };
         let size = window.geometry().size;
         let (sx, sy) = (
-            if saved.size[0] > 0 { size.w as f64 / saved.size[0] as f64 } else { 1.0 },
-            if saved.size[1] > 0 { size.h as f64 / saved.size[1] as f64 } else { 1.0 },
+            if saved.size[0] > 0 {
+                size.w as f64 / saved.size[0] as f64
+            } else {
+                1.0
+            },
+            if saved.size[1] > 0 {
+                size.h as f64 / saved.size[1] as f64
+            } else {
+                1.0
+            },
         );
         let mut ids = Vec::new();
         for p in &saved.pieces {
@@ -2063,7 +2165,13 @@ impl AppState {
                 (p.rect[0] * sx, p.rect[1] * sy).into(),
                 ((p.rect[2] * sx).max(1.0), (p.rect[3] * sy).max(1.0)).into(),
             );
-            let id = self.spawn_piece(window, rect, Vector::new(p.center[0], p.center[1]), p.angle, saved.weight);
+            let id = self.spawn_piece(
+                window,
+                rect,
+                Vector::new(p.center[0], p.center[1]),
+                p.angle,
+                saved.weight,
+            );
             if p.floating {
                 if let Some(phys) = self.physics.as_mut() {
                     phys.set_floating(id, true);
@@ -2208,7 +2316,11 @@ impl AppState {
         println!(
             "[soft] окно {:?}: {}",
             window_app_id(&window),
-            if soft { "жёсткое" } else { "мягкое" }
+            if soft {
+                "жёсткое"
+            } else {
+                "мягкое"
+            }
         );
         self.needs_render = true;
     }
@@ -2244,7 +2356,9 @@ impl AppState {
         let Some(target) = self.rigid_local(&piece, sx, sy) else {
             return;
         };
-        if let (Some((_, grab)), Some(soft)) = (self.soft_grab.as_ref(), self.soft.get_mut(&piece_id)) {
+        if let (Some((_, grab)), Some(soft)) =
+            (self.soft_grab.as_ref(), self.soft.get_mut(&piece_id))
+        {
             let params = soft.params;
             soft.mesh.drag(grab, target, &params);
         }
