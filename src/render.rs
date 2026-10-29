@@ -25,6 +25,8 @@ render_elements! {
     pub CustomRenderElements<=GlesRenderer>;
     Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     Cursor=SolidColorRenderElement,
+    CursorSurface=WaylandSurfaceRenderElement<GlesRenderer>,
+    CursorImage=smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
     Physics=PhysicsElement,
 }
 

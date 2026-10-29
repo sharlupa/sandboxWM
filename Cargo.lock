@@ -1642,6 +1642,7 @@ dependencies = [
  "toml",
  "wayland-protocols-wlr",
  "wayland-server",
+ "xcursor",
 ]
 
 [[package]]

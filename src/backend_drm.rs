@@ -3,8 +3,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::cursor::CursorRenderer;
 use crate::input::process_libinput_event;
 use crate::render::CustomRenderElements;
+use crate::screencopy::ScreencopyRenderer;
 use crate::state::AppState;
 use smithay::reexports::rustix;
 use smithay::{
@@ -28,7 +30,7 @@ use smithay::{
             gles::GlesRenderer,
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
-        udev::{UdevBackend, UdevEvent, primary_gpu},
+        udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
@@ -54,7 +56,14 @@ pub fn run_tty(
     state.session = Some(session.clone());
 
     // 2. GPU
-    let gpu_path = primary_gpu(&seat_name)?.ok_or_else(|| "Видеокарта не найдена".to_string())?;
+    // primary_gpu ищет boot_vga; на машинах без него (ARM, virtio) берём первую GPU.
+    let gpu_path = match primary_gpu(&seat_name)? {
+        Some(path) => path,
+        None => all_gpus(&seat_name)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Видеокарта не найдена".to_string())?,
+    };
     println!("=====> GPU: {gpu_path:?}");
 
     // 3. DRM fd
@@ -125,11 +134,9 @@ pub fn run_tty(
         .ok_or_else(|| "Нет CRTC".to_string())?;
 
     // 6. smithay Output
-    let (w, h) = drm_mode.size();
-    let smithay_mode = Mode {
-        size: (w as i32, h as i32).into(),
-        refresh: drm_mode.vrefresh() as i32 * 1000,
-    };
+    // From<drm Mode> считает частоту точно (59.94 Гц → 59940 мГц), а не vrefresh * 1000.
+    let smithay_mode = Mode::from(drm_mode);
+    let frame_interval = frame_interval(smithay_mode.refresh);
     let output = Output::new(
         format!("{:?}", connector.interface()),
         PhysicalProperties {
@@ -194,13 +201,24 @@ pub fn run_tty(
     let main_device = DrmNode::from_path(&gpu_path)
         .map(|n| n.dev_id())
         .unwrap_or_else(|_| drm_fd.dev_id().unwrap_or(0));
-    let default_feedback =
-        smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(main_device, dmabuf_formats)
+    let dmabuf_global =
+        match smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(main_device, dmabuf_formats)
             .build()
-            .expect("failed to build dmabuf feedback");
-    let dmabuf_global = state
-        .dmabuf_state
-        .create_global_with_default_feedback::<AppState>(&display_handle, &default_feedback);
+        {
+            Ok(default_feedback) => state
+                .dmabuf_state
+                .create_global_with_default_feedback::<AppState>(
+                    &display_handle,
+                    &default_feedback,
+                ),
+            Err(e) => {
+                // Без feedback (v4) остаётся v3-глобал с одним списком форматов.
+                eprintln!("[DRM] dmabuf feedback не собран ({e:?}), fallback на v3");
+                state
+                    .dmabuf_state
+                    .create_global::<AppState>(&display_handle, renderer.dmabuf_formats())
+            }
+        };
     state.dmabuf_global = Some(dmabuf_global);
     println!("=====> DMA-BUF (zero-copy) global создан");
 
@@ -208,21 +226,31 @@ pub fn run_tty(
     use smithay::reexports::input as libinput_raw;
     let mut libinput_ctx =
         libinput_raw::Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
-    libinput_ctx.udev_assign_seat(&seat_name).unwrap();
+    libinput_ctx
+        .udev_assign_seat(&seat_name)
+        .map_err(|()| format!("libinput: не удалось назначить seat {seat_name}"))?;
     let libinput_backend = LibinputInputBackend::new(libinput_ctx.clone());
     loop_handle.insert_source(libinput_backend, |event, _, state| {
         process_libinput_event(state, event);
     })?;
 
     // 7.5. Обработка событий сессии (VT-переключения)
+    // DrmDevice переезжает сюда: на паузе он отдаёт DRM master и помечает
+    // поверхности неактивными, при возврате — забирает master обратно. Его
+    // DrmDeviceInternal делят с ним поверхности компоновщика, так что порядок
+    // освобождения при выходе не меняется (см. комментарий в конце функции).
     let compositor_session = compositor.clone();
     let mut libinput_session = libinput_ctx;
+    let mut drm_session = drm;
     loop_handle.insert_source(notifier, move |event, _, state| match event {
         SessionEvent::ActivateSession => {
             state.session_paused = false;
             state.needs_render = true;
             if let Err(e) = libinput_session.resume() {
                 eprintln!("[libinput] Ошибка при resume: {:?}", e);
+            }
+            if let Err(e) = drm_session.activate(false) {
+                eprintln!("[DRM] Ошибка при активации устройства: {e:?}");
             }
             if let Err(e) = compositor_session.borrow_mut().reset_state() {
                 eprintln!(
@@ -235,6 +263,7 @@ pub fn run_tty(
         SessionEvent::PauseSession => {
             state.session_paused = true;
             libinput_session.suspend();
+            drm_session.pause();
             println!("[session] пауза");
         }
     })?;
@@ -255,20 +284,23 @@ pub fn run_tty(
         UdevEvent::Removed { device_id } => println!("[udev] GPU удалена: {device_id}"),
     })?;
 
-    // Курсор — простой белый квадрат 12x12 (рисуется программно как render-element,
-    // т.к. в Smithay 0.7 у DrmCompositor нет API для hardware cursor plane).
-    let cursor_buf = SolidColorBuffer::new((12, 12), [1.0f32, 1.0, 1.0, 1.0]);
+    // Курсор: клиентская поверхность / xcursor-тема / встроенная стрелка.
+    // Элементы с Kind::Cursor DrmCompositor сам кладёт на аппаратную
+    // cursor-плоскость (DrmCompositor создан с cursor_size и gbm).
+    let mut cursor_renderer = CursorRenderer::new();
+    // Screencopy: кэш offscreen-текстуры и damage для copy_with_damage.
+    let mut screencopy = ScreencopyRenderer::new();
     // Визуальный пол
     let floor_buf = SolidColorBuffer::new((10000, 4), [0.8f32, 0.8, 0.8, 1.0]);
     // Буферы для псевдо-круглых точек 6x6 (состоят из 3-х прямоугольников)
 
-    // 11. Рендер-таймер ~60 fps. Renders only when something changed
-    //     (`state.needs_render`); an idle desktop costs ~0 GPU/CPU instead of a
-    //     forced 60fps redraw loop.
+    // 11. Рендер-таймер с периодом обновления монитора. Renders only when
+    //     something changed (`state.needs_render`); an idle desktop costs ~0
+    //     GPU/CPU instead of a forced redraw loop.
     let output_t = output.clone();
     let compositor_t = compositor.clone();
     loop_handle.insert_source(
-        Timer::from_duration(Duration::from_millis(16)),
+        Timer::from_duration(frame_interval),
         move |_, _, state| {
             // ── Физический режим: шаг симуляции ─────────────
             // Выполняем шаг ДО проверки `needs_render`. Если тела движутся,
@@ -280,20 +312,19 @@ pub fn run_tty(
 
             // Screencopy-клиент (OBS через portal-wlr) ждёт кадр — будим рендер,
             // даже если сцена статична: иначе захват замирает/чернеет.
-            if !state.needs_render
-                && state
-                    .screencopy_state
-                    .pending_frames
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|f| f.buffer.is_some())
-            {
+            // copy_with_damage будит рендер, только когда в его регионе что-то
+            // изменилось.
+            if screencopy.wants_render(&state.screencopy_state, &output_t) {
+                state.needs_render = true;
+            }
+            // Указатель сдвинулся, клиент сменил курсор или анимированный
+            // курсор перешёл на следующий кадр.
+            if cursor_renderer.needs_redraw(&state.cursor_status, state.pointer_location) {
                 state.needs_render = true;
             }
             if state.session_paused || !state.needs_render {
                 return smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
-                    Duration::from_millis(16),
+                    frame_interval,
                 );
             }
 
@@ -344,180 +375,43 @@ pub fn run_tty(
                                     }
             }
 
-            // Программный курсор поверх окон. `render_frame` принимает элементы
-            // в порядке front-to-back: первый элемент в слайсе рисуется поверх
-            // всех остальных. Поэтому вставляем курсор в начало вектора.
-            let cursor_loc = state.pointer_location.to_physical(1.0).to_i32_round();
-            elements.insert(0, CustomRenderElements::Cursor(
-                SolidColorRenderElement::from_buffer(
-                    &cursor_buf,
-                    cursor_loc,
-                    1.0,
-                    1.0,
-                    Kind::Cursor,
-                ),
-            ));
-            // --- Screencopy: capture BEFORE the DRM render so the renderer
-            //     is in a clean state and we get a reliable offscreen render. ---
-            {
-                let pending_screencopies = {
-                    let mut frames = state.screencopy_state.pending_frames.lock().unwrap();
-                    let mut ready = Vec::new();
-                    let mut i = 0;
-                    while i < frames.len() {
-                        if frames[i].buffer.is_some() {
-                            ready.push(frames.remove(i));
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    ready
-                };
+            // Курсор поверх окон. `render_frame` принимает элементы в порядке
+            // front-to-back: первый элемент в слайсе рисуется поверх всех
+            // остальных. Поэтому вставляем курсор в начало вектора.
+            let cursor_elements = cursor_renderer.elements(
+                &mut renderer,
+                &mut state.cursor_status,
+                state.pointer_location,
+                1.0,
+            );
+            let cursor_count = cursor_elements.len();
+            elements.splice(0..0, cursor_elements);
 
-                if !pending_screencopies.is_empty() {
-                    use smithay::backend::renderer::{Offscreen, Bind, ExportMem, Renderer as _, Frame as _};
-                    use smithay::backend::renderer::element::{RenderElement as _, Element as _};
-                    use smithay::utils::{Size, Physical, Scale};
-                    use smithay::utils::Buffer as BufferCoords;
-
-                    let screen_size = output_t.current_mode().map(|m| m.size).unwrap_or((1920, 1080).into());
-                    let screen_size_buffer: Size<i32, BufferCoords> = Size::from((screen_size.w, screen_size.h));
-                    let screen_size_physical: Size<i32, Physical> = Size::from((screen_size.w, screen_size.h));
-                    // Use RGBA (Abgr8888 in DRM fourcc) — universally supported in GLES
-                    let format = smithay::backend::allocator::Fourcc::Abgr8888;
-
-                    let capture_result: Result<(), Box<dyn std::error::Error>> = (|| {
-                        let mut offscreen_target: smithay::backend::renderer::gles::GlesTexture =
-                            renderer.create_buffer(format, screen_size_buffer)
-                                .map_err(|e| format!("create_buffer: {e:?}"))?;
-
-                        let mut target = renderer.bind(&mut offscreen_target)
-                            .map_err(|e| format!("bind: {e:?}"))?;
-
-                        // Manual render pass (no damage tracker — always full redraw)
-                        {
-                            let mut frame = renderer.render(&mut target, screen_size_physical, Transform::Normal)
-                                .map_err(|e| format!("render: {e:?}"))?;
-
-                            let full_rect = smithay::utils::Rectangle::<i32, Physical>::from_size(screen_size_physical);
-                            frame.clear(
-                                smithay::backend::renderer::Color32F::from([0.08f32, 0.08, 0.12, 1.0]),
-                                &[full_rect],
-                            ).map_err(|e| format!("clear: {e:?}"))?;
-
-                            // Draw elements back-to-front (elements vec is front-to-back,
-                            // so iterate in reverse for correct layering)
-                            let scale = Scale::from(1.0f64);
-                            let mut draw_errors: Vec<String> = Vec::new();
-                            for element in elements.iter().rev() {
-                                let geo = element.geometry(scale);
-                                // damage должен быть в ЛОКАЛЬНЫХ координатах элемента
-                                // (относительно dst), а не в абсолютных: иначе элементы
-                                // с большим loc (правые окна, пол, курсор) обрезаются.
-                                let local_damage = [smithay::utils::Rectangle::<i32, Physical>::from_size(geo.size)];
-                                if let Err(e) = element.draw(&mut frame, element.src(), geo, &local_damage, &[]) {
-                                    draw_errors.push(format!("{e:?}"));
-                                }
-                            }
-                            if !draw_errors.is_empty() {
-                                use std::io::Write as _;
-                                if let Ok(mut lf) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sandboxwm-capture.log") {
-                                    let _ = writeln!(lf, "draw errors: {} first: {}", draw_errors.len(), draw_errors[0]);
-                                }
-                            }
-                            // GlesFrame::drop finishes the render pass
-                        }
-
-                        // Read back pixels from the offscreen FBO
-                        let mapping = renderer.copy_framebuffer(
-                            &target,
-                            smithay::utils::Rectangle::from_size(screen_size_buffer),
-                            format,
-                        ).map_err(|e| format!("copy_framebuffer: {e:?}"))?;
-
-                        let rgba_data = renderer.map_texture(&mapping)
-                            .map_err(|e| format!("map_texture: {e:?}"))?;
-
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or(Duration::ZERO);
-                        let tv_sec_hi = (now.as_secs() >> 32) as u32;
-                        let tv_sec_lo = (now.as_secs() & 0xFFFFFFFF) as u32;
-                        let tv_nsec = now.subsec_nanos();
-
-                        let height = screen_size.h as usize;
-                        let width = screen_size.w as usize;
-                        let stride = width * 4;
-
-                        {
-                            use std::io::Write as _;
-                            use std::sync::atomic::{AtomicU32, Ordering};
-                            static CAP_LOG: AtomicU32 = AtomicU32::new(0);
-                            let n = CAP_LOG.fetch_add(1, Ordering::Relaxed);
-                            if n % 60 == 0 {
-                                let mode_str = if state.layout_mode == crate::state::LayoutMode::Physics { "phys" } else { "tile" };
-                                if let Ok(mut lf) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sandboxwm-capture.log") {
-                                    let _ = writeln!(lf, "capture #{n} mode={mode_str} elements={}", elements.len());
-                                }
-                            }
-                        }
-                        for pending in pending_screencopies {
-                            if let Some(wl_buffer) = pending.buffer {
-                                let _ = smithay::wayland::shm::with_buffer_contents_mut(
-                                    &wl_buffer,
-                                    |ptr, len, _info| {
-                                        let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                                        // Convert RGBA→BGRA (channel swap).
-                                        // Без Y-флипа: offscreen-текстура уже отдаётся
-                                        // строками сверху-вниз, ручной флип переворачивал картинку.
-                                        for row in 0..height {
-                                            let src_row = row * stride;
-                                            let dst_row = row * stride;
-                                            for px in 0..width {
-                                                let si = src_row + px * 4;
-                                                let di = dst_row + px * 4;
-                                                if di + 3 < dst.len() && si + 3 < rgba_data.len() {
-                                                    dst[di]     = rgba_data[si + 2]; // B ← R
-                                                    dst[di + 1] = rgba_data[si + 1]; // G ← G
-                                                    dst[di + 2] = rgba_data[si];     // R ← B
-                                                    dst[di + 3] = rgba_data[si + 3]; // A ← A
-                                                }
-                                            }
-                                        }
-                                    },
-                                );
-                                pending.frame.flags(
-                                    wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_frame_v1::Flags::empty(),
-                                );
-                                pending.frame.ready(tv_sec_hi, tv_sec_lo, tv_nsec);
-                            }
-                        }
-                        Ok(())
-                    })();
-
-                    if let Err(e) = capture_result {
-                        eprintln!("[screencopy] capture failed: {e}");
-                        use std::io::Write as _;
-                        if let Ok(mut lf) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sandboxwm-capture.log") {
-                            let _ = writeln!(lf, "capture failed: {e}");
-                        }
-                    }
-                }
-            }
-            // --- End Screencopy ---
+            // Screencopy до DRM-рендера: offscreen-захват в своей текстуре, курсор
+            // (первые cursor_count элементов) — только для overlay_cursor.
+            // Вызывается на каждом рендере, чтобы copy_with_damage видел все изменения.
+            screencopy.fulfill_pending(
+                &mut renderer,
+                &state.screencopy_state,
+                &output_t,
+                &elements,
+                cursor_count,
+                CLEAR_COLOR,
+            );
 
             let mut comp = compositor_t.borrow_mut();
             let frame_flags = if state.layout_mode == crate::state::LayoutMode::Physics {
-                // Без plane-scanout: иначе DRM кладёт неповёрнутый буфер на
-                // плоскость рядом с GLES-поворотом → «копия» окна на кадр.
-                FrameFlags::empty()
+                // Без primary/overlay scanout: иначе DRM кладёт неповёрнутый буфер
+                // на плоскость рядом с GLES-поворотом → «копия» окна на кадр.
+                // Cursor-плоскость безопасна: на неё попадают только Kind::Cursor.
+                FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT
             } else {
                 FrameFlags::DEFAULT
             };
             match comp.render_frame::<_, _>(
                 &mut renderer,
                 &elements,
-                [0.08, 0.08, 0.12, 1.0],
+                CLEAR_COLOR,
                 frame_flags,
             ) {
                 Ok(_result) => {
@@ -532,7 +426,7 @@ pub fn run_tty(
                             |_, _| Some(output_t.clone()),
                         );
                     }
-
+                    crate::cursor::send_frames(&state.cursor_status, &output_t, now);
 
                     // Frame submitted successfully — clear the damage flag so we
                     // don't render again until the next real change.
@@ -541,9 +435,7 @@ pub fn run_tty(
                 Err(e) => eprintln!("[DRM] ошибка рендера: {e:?}"),
             }
 
-            smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
-                Duration::from_millis(16),
-            )
+            smithay::reexports::calloop::timer::TimeoutAction::ToDuration(frame_interval)
         },
     )?;
 
@@ -592,9 +484,40 @@ pub fn run_tty(
     drop(event_loop);
     drop(display);
 
-    // Locals (compositor, egl_display, gbm, drm, session clone) drop here
+    // Locals (compositor, egl_display, gbm, session clone) drop here
     // in reverse declaration order — all safe because the DRM fd is still
     // valid (state.session is the last Arc ref, dropped later in main()).
+    // The DrmDevice itself was moved into the session closure and dropped
+    // with event_loop; its DrmDeviceInternal is shared with the compositor's
+    // surface, so the device teardown still happens with the compositor.
 
     Ok(())
+}
+
+/// Цвет фона (как у winit-бэкенда).
+const CLEAR_COLOR: [f32; 4] = [0.08, 0.08, 0.12, 1.0];
+
+/// Период рендер-таймера по частоте режима (в мГц): 1/refresh, но не чаще
+/// 4 мс; без данных о частоте — ~60 Гц.
+fn frame_interval(refresh_mhz: i32) -> Duration {
+    if refresh_mhz <= 0 {
+        return Duration::from_millis(16);
+    }
+    Duration::from_micros(1_000_000_000 / refresh_mhz as u64).max(Duration::from_millis(4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_interval;
+    use std::time::Duration;
+
+    #[test]
+    fn frame_interval_follows_refresh() {
+        assert_eq!(frame_interval(60_000), Duration::from_micros(16_666));
+        assert_eq!(frame_interval(59_940), Duration::from_micros(16_683));
+        assert_eq!(frame_interval(144_000), Duration::from_micros(6_944));
+        assert_eq!(frame_interval(500_000), Duration::from_millis(4));
+        assert_eq!(frame_interval(0), Duration::from_millis(16));
+        assert_eq!(frame_interval(-1), Duration::from_millis(16));
+    }
 }
