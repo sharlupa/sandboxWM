@@ -5,6 +5,7 @@ pub mod output_manager;
 pub mod physics;
 pub mod render;
 pub mod screencopy;
+pub mod session;
 pub mod state;
 pub mod tiling;
 pub mod xwm;
