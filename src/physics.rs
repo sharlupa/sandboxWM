@@ -670,6 +670,21 @@ impl WindowPhysics {
         }
     }
 
+    /// Ускорение свободного падения, действующее на кусок (ноль для
+    /// парящих и в невесомости) — для «собственного» ускорения мягкого тела.
+    pub fn piece_gravity(&self, piece: u32) -> Vector {
+        let dynamic = self
+            .pieces
+            .get(&piece)
+            .and_then(|p| self.world.bodies.get(p.body))
+            .map_or(false, |b| b.is_dynamic() && b.is_enabled());
+        if dynamic {
+            self.world.gravity
+        } else {
+            Vector::ZERO
+        }
+    }
+
     pub fn piece_mass(&self, piece: u32) -> f32 {
         self.pieces
             .get(&piece)

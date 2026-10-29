@@ -42,6 +42,15 @@ impl Piece {
     }
 }
 
+/// Мягкое тело куска (концепт §5): сетка + параметры + прошлая скорость
+/// тела для инерционных псевдосил (удар об пол сплющивает окно).
+pub struct SoftPiece {
+    pub mesh: crate::softbody::SoftMesh,
+    pub params: crate::softbody::SoftParams,
+    prev_vel: Option<Vector>,
+    rest_generation: u64,
+}
+
 /// Активный инструмент физического режима.
 #[derive(Debug, Clone)]
 pub enum Tool {
@@ -353,9 +362,13 @@ impl AppState {
         let y = self.camera_offset.1 - size.h as f64 * 0.5 - 40.0 / self.camera_zoom;
         let rect = Rectangle::new((0.0, 0.0).into(), (size.w as f64, size.h as f64).into());
         let props = self.window_override(window);
-        self.spawn_piece(window, rect, v2(x, y), 0.0, props.weight.unwrap_or(1.0));
+        let id = self.spawn_piece(window, rect, v2(x, y), 0.0, props.weight.unwrap_or(1.0));
         if props.floating.unwrap_or(false) {
             self.set_window_floating(window, true);
+        }
+        if props.softness.unwrap_or(0.0) > 0.0 {
+            let params = self.soft_params(window);
+            self.make_soft(id, params);
         }
         self.sync_space_positions();
     }
@@ -391,6 +404,10 @@ impl AppState {
     pub fn physics_remove_window(&mut self, window: &Window) {
         let ids: Vec<u32> = self.pieces_of(window).map(|p| p.id).collect();
         for id in &ids {
+            self.soft.remove(id);
+            if self.soft_grab.as_ref().map_or(false, |(p, _)| p == id) {
+                self.soft_grab = None;
+            }
             if let Some(phys) = self.physics.as_mut() {
                 phys.remove_piece(*id);
             }
@@ -400,6 +417,7 @@ impl AppState {
             }
         }
         self.pieces.retain(|p| &p.window != window);
+        self.snapshots.remove(window);
         if self
             .pointer_grab_target
             .as_ref()
@@ -454,6 +472,9 @@ impl AppState {
             }
             if let Some(phys) = self.physics.as_mut() {
                 phys.set_piece_size(id, rect.size.w as f32, rect.size.h as f32);
+            }
+            if let Some(soft) = self.soft.get_mut(&id) {
+                soft.mesh.resize(rect.size.w as f32, rect.size.h as f32);
             }
         }
     }
@@ -810,6 +831,7 @@ impl AppState {
         }
         let steps = phys.advance(elapsed as f32);
         let mut moving = phys.any_moving() || spin.is_some();
+        moving |= self.step_soft(elapsed as f32);
 
         // Плавная камера (Lerp).
         let lerp = self.config.physics.camera_lerp.clamp(0.01, 1.0);
@@ -842,6 +864,8 @@ impl AppState {
         self.transition.is_some()
             || self.physics.as_ref().map_or(false, |p| p.any_moving())
             || self.spin_dir != 0.0
+            || self.soft_grab.is_some()
+            || self.soft.values().any(|s| s.mesh.is_active())
             || self.target_camera_offset != self.camera_offset
     }
 
@@ -917,6 +941,7 @@ impl AppState {
                         clip: Some(item.clip),
                         xf: Affine::piece((pose.cx, pose.cy), pose.angle, pose.scale, c),
                         popups: item.popups,
+                        mesh: None,
                     });
                 }
             }
@@ -932,6 +957,7 @@ impl AppState {
                         clip: None,
                         xf: Affine::translation(geo.loc.x as f64, geo.loc.y as f64),
                         popups: false,
+                        mesh: None,
                     });
                 }
                 continue;
@@ -945,6 +971,7 @@ impl AppState {
                         clip: Some(piece.rect),
                         xf,
                         popups: Some(piece.id) == main,
+                        mesh: self.mesh_draw(piece, &xf),
                     });
                 }
             }
@@ -1094,11 +1121,39 @@ impl AppState {
     // ── Указатель и обратное проецирование ─────────────────────────
 
     /// Экранная точка → координаты окна для куска. Повёрнутые/масштабированные
-    /// куски инвертируются аффинно. `inside` — попала ли точка в кусок.
-    fn piece_local_point(&self, piece: &Piece, sx: f64, sy: f64) -> Option<(Point<f64, Logical>, bool)> {
+    /// куски инвертируются аффинно, деформированные мягкие — через сетку
+    /// (концепт §6: приложение получает координаты в своём плоском буфере).
+    /// `inside` — попала ли точка в кусок; `extrapolate` — продолжать
+    /// отображение за краем (захват указателя при выделении текста).
+    fn piece_local_point(
+        &self,
+        piece: &Piece,
+        sx: f64,
+        sy: f64,
+        extrapolate: bool,
+    ) -> Option<(Point<f64, Logical>, bool)> {
         let inv = self.piece_xf(piece)?.inverse()?;
         let (x, y) = inv.apply(sx, sy);
         let r = piece.rect;
+        if self.config.soft_body.text_reprojection {
+            if let Some(soft) = self.soft.get(&piece.id) {
+                if soft.mesh.is_deformed() {
+                    let (cx, cy) = piece.center();
+                    let local = [(x - cx) as f32, (y - cy) as f32];
+                    let inside = soft.mesh.local_to_uv(local, false);
+                    let uv = match inside {
+                        Some(uv) => uv,
+                        None if extrapolate => soft.mesh.local_to_uv(local, true)?,
+                        None => return Some(((x, y).into(), false)),
+                    };
+                    let p = (
+                        r.loc.x + uv[0] as f64 * r.size.w,
+                        r.loc.y + uv[1] as f64 * r.size.h,
+                    );
+                    return Some((p.into(), inside.is_some()));
+                }
+            }
+        }
         let inside = x >= r.loc.x && y >= r.loc.y && x < r.loc.x + r.size.w && y < r.loc.y + r.size.h;
         Some(((x, y).into(), inside))
     }
@@ -1137,7 +1192,7 @@ impl AppState {
             // Попапы окна живут в той же плоскости, что и основной кусок,
             // но выходят за его прямоугольник.
             if let Some(main) = self.main_piece(window) {
-                if let Some((local, _)) = self.piece_local_point(main, sx, sy) {
+                if let Some((local, _)) = self.piece_local_point(main, sx, sy, false) {
                     let geo_loc = window.geometry().loc.to_f64();
                     if window
                         .surface_under(local + geo_loc, WindowSurfaceType::POPUP)
@@ -1154,7 +1209,7 @@ impl AppState {
                 }
             }
             for piece in self.pieces_of(window) {
-                if let Some((local, true)) = self.piece_local_point(piece, sx, sy) {
+                if let Some((local, true)) = self.piece_local_point(piece, sx, sy, false) {
                     return Some((
                         PointerTarget {
                             window: window.clone(),
@@ -1175,7 +1230,7 @@ impl AppState {
         match target.piece {
             Some(id) => {
                 let piece = self.piece_by_id(id)?;
-                self.piece_local_point(piece, sx, sy).map(|(p, _)| p)
+                self.piece_local_point(piece, sx, sy, true).map(|(p, _)| p)
             }
             None => {
                 let geo = self.space.element_geometry(&target.window)?;
@@ -1609,6 +1664,8 @@ impl AppState {
         let c2 = world_of(&r2, 1.0);
         let window = piece.window.clone();
         let links = self.take_links(&[piece.id]);
+        // Разрезанная сетка теряет смысл — части снова жёсткие.
+        self.drop_soft(piece.id);
         if let Some(phys) = self.physics.as_mut() {
             phys.remove_piece(piece.id);
         }
@@ -1691,8 +1748,21 @@ impl AppState {
             return;
         };
         let pieces: Vec<Piece> = self.pieces_of(&window).cloned().collect();
+        // Форма: деформацию сбрасываем, мягкость окна сохраняется.
+        for p in &pieces {
+            if let Some(soft) = self.soft.get_mut(&p.id) {
+                soft.mesh.reset();
+            }
+            if let Some(phys) = self.physics.as_mut() {
+                phys.set_piece_hull(p.id, None);
+            }
+        }
+        self.needs_render = true;
         if pieces.len() <= 1 {
             return;
+        }
+        for p in &pieces {
+            self.drop_soft(p.id);
         }
         let Some(main) = self.main_piece(&window).cloned() else {
             return;
@@ -1788,6 +1858,10 @@ impl AppState {
                 pid: pid.unwrap_or(0),
                 size: [size.w, size.h],
                 weight: pieces.first().map_or(1.0, |p| phys.piece_weight(p.id)),
+                softness: pieces
+                    .iter()
+                    .find_map(|p| self.soft.get(&p.id))
+                    .map_or(0.0, |s| s.params.softness.max(0.01)),
                 ..Default::default()
             };
             for (i, p) in pieces.iter().enumerate() {
@@ -2005,6 +2079,13 @@ impl AppState {
         if ids.is_empty() {
             return false;
         }
+        if saved.softness > 0.0 {
+            let mut params = self.soft_params(window);
+            params.softness = saved.softness;
+            for &id in &ids {
+                self.make_soft(id, params);
+            }
+        }
         println!("[session] восстановлено окно {:?}", saved.app_id);
         self.restored_windows.insert(index, ids);
         self.restore_pending_joints();
@@ -2054,20 +2135,228 @@ impl AppState {
     }
 
     // ── Мягкие тела (концепт §5) ───────────────────────────────────
-    // Интеграция с softbody.rs.
 
-    pub fn toggle_soft_focused(&mut self) {}
-
-    pub fn soft_grab_begin(&mut self, _sx: f64, _sy: f64) -> Option<Window> {
-        None
+    /// Параметры мягкости для окна: конфиг + override по app_id.
+    fn soft_params(&self, window: &Window) -> crate::softbody::SoftParams {
+        let cfg = &self.config.soft_body;
+        let softness = self
+            .window_override(window)
+            .softness
+            .filter(|s| *s > 0.0)
+            .unwrap_or(cfg.softness);
+        crate::softbody::SoftParams {
+            softness: softness.clamp(0.0, 1.0),
+            impact_squash: cfg.impact_squash.clamp(0.0, 1.0),
+            plasticity: cfg.plasticity.clamp(0.0, 1.0),
+        }
     }
 
-    pub fn soft_grab_update(&mut self, _sx: f64, _sy: f64) {}
+    /// Делает кусок мягким (если ещё не).
+    fn make_soft(&mut self, piece: u32, params: crate::softbody::SoftParams) {
+        if self.soft.contains_key(&piece) {
+            return;
+        }
+        let Some(rect) = self.piece_by_id(piece).map(|p| p.rect) else {
+            return;
+        };
+        let mesh = crate::softbody::SoftMesh::new(
+            rect.size.w as f32,
+            rect.size.h as f32,
+            self.config.soft_body.mesh_resolution.clamp(1, 32),
+        );
+        let rest_generation = mesh.rest_generation();
+        self.soft.insert(
+            piece,
+            SoftPiece {
+                mesh,
+                params,
+                prev_vel: None,
+                rest_generation,
+            },
+        );
+    }
 
-    pub fn soft_grab_end(&mut self) {}
+    fn drop_soft(&mut self, piece: u32) {
+        if self.soft.remove(&piece).is_some() {
+            if self.soft_grab.as_ref().map_or(false, |(p, _)| *p == piece) {
+                self.soft_grab = None;
+            }
+            if let Some(phys) = self.physics.as_mut() {
+                phys.set_piece_hull(piece, None);
+            }
+        }
+    }
+
+    /// Super+J: мягкое ↔ жёсткое окно.
+    pub fn toggle_soft_focused(&mut self) {
+        if self.layout_mode == LayoutMode::Tiling {
+            self.enter_physics_mode();
+        }
+        let Some(window) = self.get_focused_window() else {
+            return;
+        };
+        let ids: Vec<u32> = self.pieces_of(&window).map(|p| p.id).collect();
+        let soft = ids.iter().any(|id| self.soft.contains_key(id));
+        let params = self.soft_params(&window);
+        for id in ids {
+            if soft {
+                self.drop_soft(id);
+            } else {
+                self.make_soft(id, params);
+            }
+        }
+        println!(
+            "[soft] окно {:?}: {}",
+            window_app_id(&window),
+            if soft { "жёсткое" } else { "мягкое" }
+        );
+        self.needs_render = true;
+    }
+
+    /// Super+Shift+ЛКМ: схватить окно за точку и тянуть (деформация).
+    pub fn soft_grab_begin(&mut self, sx: f64, sy: f64) -> Option<Window> {
+        if self.layout_mode != LayoutMode::Physics || self.transition.is_some() {
+            return None;
+        }
+        let (piece_id, _) = self.piece_at(sx, sy)?;
+        let piece = self.piece_by_id(piece_id)?.clone();
+        let params = self.soft_params(&piece.window);
+        self.make_soft(piece_id, params);
+        let local = self.rigid_local(&piece, sx, sy)?;
+        let radius = (piece.rect.size.w.max(piece.rect.size.h)) as f32;
+        let soft = self.soft.get_mut(&piece_id)?;
+        let grab = soft.mesh.grab(local, radius)?;
+        self.soft_grab = Some((piece_id, grab));
+        self.last_physics_tick.get_or_insert_with(Instant::now);
+        self.needs_render = true;
+        Some(piece.window)
+    }
+
+    pub fn soft_grab_update(&mut self, sx: f64, sy: f64) {
+        let Some((piece_id, _)) = self.soft_grab.as_ref() else {
+            return;
+        };
+        let piece_id = *piece_id;
+        let Some(piece) = self.piece_by_id(piece_id).cloned() else {
+            self.soft_grab = None;
+            return;
+        };
+        let Some(target) = self.rigid_local(&piece, sx, sy) else {
+            return;
+        };
+        if let (Some((_, grab)), Some(soft)) = (self.soft_grab.as_ref(), self.soft.get_mut(&piece_id)) {
+            let params = soft.params;
+            soft.mesh.drag(grab, target, &params);
+        }
+        self.needs_render = true;
+    }
+
+    pub fn soft_grab_end(&mut self) {
+        if let Some((piece, grab)) = self.soft_grab.take() {
+            if let Some(soft) = self.soft.get_mut(&piece) {
+                soft.mesh.release(grab);
+            }
+            self.needs_render = true;
+        }
+    }
 
     pub fn soft_grab_active(&self) -> bool {
-        false
+        self.soft_grab.is_some()
+    }
+
+    /// Экран → локальные координаты куска (от центра) без учёта сетки.
+    fn rigid_local(&self, piece: &Piece, sx: f64, sy: f64) -> Option<[f32; 2]> {
+        let inv = self.piece_xf(piece)?.inverse()?;
+        let (x, y) = inv.apply(sx, sy);
+        let (cx, cy) = piece.center();
+        Some([(x - cx) as f32, (y - cy) as f32])
+    }
+
+    /// Шаг мягких тел за кадр: инерционные псевдосилы из ускорения тела.
+    /// Возвращает true, пока сетки ещё колеблются.
+    fn step_soft(&mut self, dt: f32) -> bool {
+        if self.soft.is_empty() || dt <= 0.0 {
+            return false;
+        }
+        let Some(phys) = self.physics.as_mut() else {
+            return false;
+        };
+        let mut active = false;
+        let mut hulls = Vec::new();
+        for (&id, soft) in self.soft.iter_mut() {
+            let (Some((vel, angvel)), Some((_, angle))) =
+                (phys.piece_velocity(id), phys.piece_transform(id))
+            else {
+                continue;
+            };
+            // Собственное ускорение (a − g): в свободном падении сетка не
+            // деформируется, при ударе об пол — сплющивается, в покое — оседает.
+            let accel = soft.prev_vel.map_or(Vector::ZERO, |prev| (vel - prev) / dt);
+            soft.prev_vel = Some(vel);
+            let proper = accel - phys.piece_gravity(id);
+            let local = crate::physics::rotate(proper, -angle);
+            soft.mesh.step(dt, [local.x, local.y], angvel, &soft.params);
+            active |= soft.mesh.is_active();
+            let generation = soft.mesh.rest_generation();
+            if generation != soft.rest_generation {
+                soft.rest_generation = generation;
+                let hull: Vec<Vector> = soft
+                    .mesh
+                    .rest_hull()
+                    .into_iter()
+                    .map(|p| Vector::new(p[0], p[1]))
+                    .collect();
+                hulls.push((id, hull));
+            }
+        }
+        for (id, hull) in hulls {
+            // Вытянутое в треугольник окно и сталкивается как треугольник.
+            phys.set_piece_hull(id, Some(&hull));
+        }
+        active || self.soft_grab.is_some()
+    }
+
+    /// Сетка для отрисовки, если кусок деформирован.
+    fn mesh_draw(&self, piece: &Piece, xf: &Affine) -> Option<crate::render::MeshDraw> {
+        let soft = self.soft.get(&piece.id)?;
+        if !(soft.mesh.is_deformed() || soft.mesh.is_active()) {
+            return None;
+        }
+        let (cx, cy) = piece.center();
+        let size = piece.window.geometry().size;
+        let (gw, gh) = (size.w.max(1) as f64, size.h.max(1) as f64);
+        let r = piece.rect;
+        let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+        let positions: Vec<[f32; 2]> = soft
+            .mesh
+            .positions()
+            .iter()
+            .map(|p| {
+                let (x, y) = xf.apply(cx + p[0] as f64, cy + p[1] as f64);
+                for v in [x as f32, y as f32] {
+                    fingerprint ^= v.to_bits() as u64;
+                    fingerprint = fingerprint.wrapping_mul(0x0100_0000_01b3);
+                }
+                [x as f32, y as f32]
+            })
+            .collect();
+        let geometry_uv = soft
+            .mesh
+            .uvs()
+            .iter()
+            .map(|uv| {
+                [
+                    ((r.loc.x + uv[0] as f64 * r.size.w) / gw) as f32,
+                    ((r.loc.y + uv[1] as f64 * r.size.h) / gh) as f32,
+                ]
+            })
+            .collect();
+        Some(crate::render::MeshDraw {
+            positions,
+            geometry_uv,
+            indices: soft.mesh.indices().to_vec(),
+            fingerprint,
+        })
     }
 
     /// Все id кусков (для проверки целостности в тестах/отладке).

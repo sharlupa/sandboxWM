@@ -133,6 +133,12 @@ pub struct AppState {
     /// Размеры окон в физике на время тайлинга.
     pub physics_sizes: std::collections::HashMap<Window, Size<i32, Logical>>,
     pub last_physics_tick: Option<std::time::Instant>,
+    /// Мягкие тела кусков (концепт §5): id куска → сетка.
+    pub soft: std::collections::HashMap<u32, crate::sandbox::SoftPiece>,
+    /// Захват края мягкого окна (Super+Shift+ЛКМ).
+    pub soft_grab: Option<(u32, crate::softbody::SoftGrab)>,
+    /// Снимки окон для отрисовки деформированной сеткой.
+    pub snapshots: crate::mesh_render::SnapshotCache,
     /// Окно под указателем в момент нажатия кнопки: пока кнопка зажата,
     /// координаты считаются относительно него (выделение текста за краем).
     pub pointer_grab_target: Option<crate::sandbox::PointerTarget>,
@@ -244,6 +250,9 @@ impl AppState {
             physics_sizes: Default::default(),
             last_physics_tick: None,
             pointer_grab_target: None,
+            soft: Default::default(),
+            soft_grab: None,
+            snapshots: Default::default(),
             render_cache: Default::default(),
             session_loaded: false,
             restored_floor_y: None,

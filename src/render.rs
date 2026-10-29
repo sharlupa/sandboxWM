@@ -179,6 +179,20 @@ pub struct PieceDraw {
     pub xf: Affine,
     /// Рисовать xdg-попапы окна с этой трансформой (основной кусок).
     pub popups: bool,
+    /// Деформированный кусок (мягкое тело) — рисуется сеткой по снимку окна.
+    pub mesh: Option<MeshDraw>,
+}
+
+/// Деформированная сетка куска для [`crate::mesh_render::MeshElement`].
+#[derive(Debug, Clone)]
+pub struct MeshDraw {
+    /// Вершины на экране (физические px).
+    pub positions: Vec<[f32; 2]>,
+    /// uv вершин по геометрии окна (0..1).
+    pub geometry_uv: Vec<[f32; 2]>,
+    pub indices: Vec<u16>,
+    /// Отпечаток вершин: меняется — меняется commit элемента.
+    pub fingerprint: u64,
 }
 
 /// Повёрнутая/обрезанная поверхность окна в физическом режиме.
@@ -306,10 +320,19 @@ impl RenderElement<GlesRenderer> for PhysicsElement {
 /// Кэш id/commit физических элементов между кадрами.
 pub struct RenderCache {
     elements: HashMap<(Id, u32), CachedElement>,
+    meshes: HashMap<u32, CachedMesh>,
     frame: u64,
     overlay_id: Id,
     overlay_print: u64,
     overlay_commit: CommitCounter,
+}
+
+struct CachedMesh {
+    id: Id,
+    fingerprint: u64,
+    snapshot: CommitCounter,
+    commit: CommitCounter,
+    seen: u64,
 }
 
 struct CachedElement {
@@ -325,6 +348,7 @@ impl Default for RenderCache {
     fn default() -> Self {
         Self {
             elements: HashMap::new(),
+            meshes: HashMap::new(),
             frame: 0,
             overlay_id: Id::new(),
             overlay_print: 0,
@@ -367,6 +391,24 @@ impl RenderCache {
         (entry.id.clone(), entry.commit)
     }
 
+    fn track_mesh(&mut self, key: u32, fingerprint: u64, snapshot: CommitCounter) -> (Id, CommitCounter) {
+        let frame = self.frame;
+        let entry = self.meshes.entry(key).or_insert_with(|| CachedMesh {
+            id: Id::new(),
+            fingerprint,
+            snapshot,
+            commit: CommitCounter::default(),
+            seen: frame,
+        });
+        if entry.fingerprint != fingerprint || entry.snapshot != snapshot {
+            entry.fingerprint = fingerprint;
+            entry.snapshot = snapshot;
+            entry.commit.increment();
+        }
+        entry.seen = frame;
+        (entry.id.clone(), entry.commit)
+    }
+
     fn begin_frame(&mut self) {
         self.frame += 1;
     }
@@ -374,6 +416,7 @@ impl RenderCache {
     fn end_frame(&mut self) {
         let frame = self.frame;
         self.elements.retain(|_, e| e.seen + 120 > frame);
+        self.meshes.retain(|_, e| e.seen + 120 > frame);
     }
 
     fn overlay_commit(&mut self, print: u64) -> (Id, CommitCounter) {
@@ -446,6 +489,11 @@ pub fn collect_physics_elements(
 ) -> Vec<CustomRenderElements> {
     let draws = state.piece_draws();
     let mut cache = std::mem::take(&mut state.render_cache);
+    let mut snapshots = std::mem::take(&mut state.snapshots);
+    {
+        let alive: Vec<Window> = state.space.elements().cloned().collect();
+        snapshots.retain(|w| alive.contains(w));
+    }
     cache.begin_frame();
     let mut out = Vec::new();
     for draw in draws {
@@ -453,6 +501,21 @@ pub fn collect_physics_elements(
             continue;
         };
         let geo_loc = draw.window.geometry().loc;
+        let mesh_element = draw.mesh.as_ref().and_then(|mesh| {
+            let snap = snapshots.snapshot(renderer, &draw.window)?;
+            let texcoords = mesh.geometry_uv.iter().map(|uv| snap.texcoord(*uv)).collect();
+            let (id, commit) = cache.track_mesh(draw.key, mesh.fingerprint, snap.commit);
+            Some(crate::mesh_render::MeshElement::new(
+                id,
+                commit,
+                snap.texture.clone(),
+                mesh.positions.clone(),
+                texcoords,
+                mesh.indices.clone(),
+                1.0,
+                Vec::new(),
+            ))
+        });
         if draw.popups {
             // xdg-попапы: поверх окна, с его трансформой и без обрезки.
             for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
@@ -469,6 +532,10 @@ pub fn collect_physics_elements(
                 );
             }
         }
+        if let Some(mesh) = mesh_element {
+            out.push(CustomRenderElements::Mesh(mesh));
+            continue;
+        }
         // Начало дерева поверхностей — так, чтобы геометрия окна была в (0,0).
         push_surface_elements(
             &mut out,
@@ -483,6 +550,7 @@ pub fn collect_physics_elements(
     }
     cache.end_frame();
     state.render_cache = cache;
+    state.snapshots = snapshots;
     out
 }
 
