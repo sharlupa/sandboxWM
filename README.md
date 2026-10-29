@@ -116,6 +116,10 @@ OBS захватывает экран через `xdg-desktop-portal-wlr` и Pip
 default=wlr;gtk
 ```
 
+Если OBS показывает один кадр и замирает, а `pacman -Q xdg-desktop-portal-wlr` даёт 0.8.3 или 0.8.4, — это ошибка самого портала: его поток в PipeWire ведёт граф, но после первого кадра не запрашивает следующий (исправлено в git-версии, где портал сам запускает цикл PipeWire после каждого кадра). Варианты:
+- поставить git-версию портала (`xdg-desktop-portal-wlr-git` в AUR) или собрать её и запустить через `SANDBOXWM_PORTAL_BIN=/путь/к/xdg-desktop-portal-wlr`;
+- захватывать без портала плагином OBS [wlrobs](https://hg.sr.ht/~scoopta/wlrobs) — он читает экран напрямую через wlr-screencopy.
+
 Если картинка замирает или курсора не видно:
 - `SANDBOXWM_DEBUG_SCREENCOPY=1` — sandboxWM печатает каждый кадр захвата (`capture`, `copy…`, `ready`);
 - `SANDBOXWM_SCREENCOPY_DMABUF=0` — отключить захват через DMA-BUF (останется только shm);

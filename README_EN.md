@@ -116,6 +116,10 @@ OBS captures the screen through `xdg-desktop-portal-wlr` and PipeWire (the "Scre
 default=wlr;gtk
 ```
 
+If OBS shows one frame and freezes and `pacman -Q xdg-desktop-portal-wlr` says 0.8.3 or 0.8.4, it is a bug in the portal itself: its PipeWire stream drives the graph but never asks for the next frame after the first one (fixed in the git version, where the portal starts the next PipeWire cycle after each frame). Options:
+- install the git version of the portal (`xdg-desktop-portal-wlr-git` in the AUR), or build it and run it with `SANDBOXWM_PORTAL_BIN=/path/to/xdg-desktop-portal-wlr`;
+- capture without the portal using the [wlrobs](https://hg.sr.ht/~scoopta/wlrobs) OBS plugin, which reads the screen directly over wlr-screencopy.
+
 If the picture freezes or the cursor is missing:
 - `SANDBOXWM_DEBUG_SCREENCOPY=1` makes sandboxWM print every capture frame (`capture`, `copy…`, `ready`);
 - `SANDBOXWM_SCREENCOPY_DMABUF=0` turns off DMA-BUF capture (shm only);

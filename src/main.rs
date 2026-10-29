@@ -98,11 +98,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         //
         // SANDBOXWM_PORTAL_LOG=<файл>: вместо сервиса запускаем wlr-бэкенд сами
         // с `-l DEBUG` и пишем его лог в этот файл (диагностика захвата в OBS).
-        let restart_wlr = if std::env::var_os("SANDBOXWM_PORTAL_LOG").is_some() {
+        // SANDBOXWM_PORTAL_BIN=<путь>: запустить этот бинарник wlr-бэкенда
+        // (например, собранный из git) вместо системного.
+        let manual = ["SANDBOXWM_PORTAL_LOG", "SANDBOXWM_PORTAL_BIN"]
+            .iter()
+            .any(|v| std::env::var_os(v).is_some());
+        let restart_wlr = if manual {
             "systemctl --user stop xdg-desktop-portal-wlr.service; \
-             for p in /usr/lib/xdg-desktop-portal-wlr /usr/libexec/xdg-desktop-portal-wlr \
+             log=\"${SANDBOXWM_PORTAL_LOG:-/dev/null}\"; \
+             for p in \"$SANDBOXWM_PORTAL_BIN\" /usr/lib/xdg-desktop-portal-wlr /usr/libexec/xdg-desktop-portal-wlr \
              /usr/lib/xdg-desktop-portal/xdg-desktop-portal-wlr \"$(command -v xdg-desktop-portal-wlr)\"; do \
-             if [ -x \"$p\" ]; then \"$p\" -r -l DEBUG > \"$SANDBOXWM_PORTAL_LOG\" 2>&1 & break; fi; done"
+             if [ -x \"$p\" ]; then \"$p\" -r -l DEBUG > \"$log\" 2>&1 & break; fi; done"
         } else {
             "systemctl --user restart --no-block xdg-desktop-portal-wlr.service"
         };
