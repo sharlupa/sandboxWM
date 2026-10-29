@@ -239,6 +239,8 @@ pub struct PhysicsConfig {
     /// Рисовать линию пола.
     pub floor_visible: bool,
     pub floor_color: String,
+    /// Два ряда точек в шахматном порядке под линией пола.
+    pub floor_dots: bool,
     /// Плотность коллайдера окна (масса ∝ площади).
     pub density: f32,
     pub linear_damping: f32,
@@ -268,6 +270,7 @@ impl Default for PhysicsConfig {
             floor_half_h: 100.0,
             floor_visible: true,
             floor_color: "#cccccc".into(),
+            floor_dots: true,
             density: 0.002,
             linear_damping: 1.5,
             angular_damping: 3.5,
@@ -809,12 +812,22 @@ pub struct WindowOverride {
 pub struct RenderingConfig {
     /// Цвет фона рабочего стола.
     pub background: String,
+    /// Толщина обводки окон (px, 0 — без обводки). В тайлинге не больше
+    /// отступа между окнами.
+    pub border_width: f32,
+    /// Цвет обводки неактивных окон.
+    pub border_color: String,
+    /// Цвет обводки активного окна.
+    pub border_active_color: String,
 }
 
 impl Default for RenderingConfig {
     fn default() -> Self {
         Self {
             background: "#14141f".into(),
+            border_width: 2.0,
+            border_color: "#4a4e5e".into(),
+            border_active_color: "#7aa2f7".into(),
         }
     }
 }

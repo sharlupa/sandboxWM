@@ -1039,15 +1039,38 @@ impl AppState {
         let materials = &self.config.materials;
 
         if self.config.physics.floor_visible {
+            let color = crate::config::parse_color(&self.config.physics.floor_color);
             let y = ((phys.floor_y() as f64 - cam.1) * zoom) as f32;
-            if y > -10.0 && y < screen.h as f32 + 10.0 {
-                let color = crate::config::parse_color(&self.config.physics.floor_color);
+            let thickness = (4.0 * zoom as f32).max(1.5);
+            if y > -thickness && y < screen.h as f32 {
                 floor.segment(
-                    [-10.0, y + 1.5],
-                    [screen.w as f32 + 10.0, y + 1.5],
-                    3.0,
+                    [-10.0, y + thickness * 0.5],
+                    [screen.w as f32 + 10.0, y + thickness * 0.5],
+                    thickness,
                     color,
                 );
+            }
+            if self.config.physics.floor_dots {
+                // Два ряда точек 6×6 с шагом 40 px под полом, второй ряд
+                // сдвинут на полшага — шахматный порядок. Точки привязаны к
+                // миру и едут вместе с камерой; всё это один draw call.
+                const STEP: f64 = 40.0;
+                let radius = (3.0 * zoom as f32).max(1.0);
+                let first = (cam.0 / STEP).floor() as i64 - 1;
+                let count = (screen.w as f64 / zoom / STEP).ceil() as i64 + 3;
+                for row in 0..2 {
+                    let wy = phys.floor_y() as f64 + 23.0 + row as f64 * 20.0;
+                    let sy = ((wy - cam.1) * zoom) as f32;
+                    if sy < -radius || sy > screen.h as f32 + radius {
+                        continue;
+                    }
+                    let shift = if row == 1 { STEP * 0.5 } else { 0.0 };
+                    for k in first..first + count {
+                        let wx = k as f64 * STEP + shift;
+                        let sx = ((wx - cam.0) * zoom) as f32;
+                        floor.disc([sx, sy], radius, color);
+                    }
+                }
             }
         }
 

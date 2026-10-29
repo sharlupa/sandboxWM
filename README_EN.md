@@ -102,7 +102,7 @@ The first directory found is used: `$SANDBOXWM_CONFIG`, `$XDG_CONFIG_HOME/sandbo
 | `slicing.conf` | `[slicing]` |
 | `session.conf` | `[session]`: autosave, path, TOML/JSON format, relaunching apps |
 | `window.conf` | `[window_props]` and per-app overrides: `[window_props.apps."org.gnome.Nautilus"] weight = 2.0, softness = 0.3, floating = true` |
-| `rendering.conf` | `[rendering]`: background colour |
+| `rendering.conf` | `[rendering]`: background colour, window borders (width, normal and active colour) |
 
 The session is stored in `$XDG_STATE_HOME/sandboxWM/session.toml` by default (with a `.bak` next to it); panics are logged to `$XDG_STATE_HOME/sandboxWM/panic.log`.
 

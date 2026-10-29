@@ -229,6 +229,28 @@ impl OverlayGeometry {
         self.polyline(&pts, width, color);
     }
 
+    /// Замкнутый контур (обводка окна). Каждая сторона продлена на
+    /// полтолщины, чтобы углы не «щербились» при тонкой линии.
+    pub fn outline(&mut self, pts: &[[f32; 2]], width: f32, color: [f32; 4]) {
+        let n = pts.len();
+        if n < 2 {
+            return;
+        }
+        let h = width * 0.5;
+        for i in 0..n {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            let dx = b[0] - a[0];
+            let dy = b[1] - a[1];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1e-3 {
+                continue;
+            }
+            let (ux, uy) = (dx / len * h, dy / len * h);
+            self.segment([a[0] - ux, a[1] - uy], [b[0] + ux, b[1] + uy], width, color);
+        }
+    }
+
     /// Пунктир (превью ножа и т.п.).
     pub fn dashed(&mut self, a: [f32; 2], b: [f32; 2], width: f32, dash: f32, color: [f32; 4]) {
         let dx = b[0] - a[0];

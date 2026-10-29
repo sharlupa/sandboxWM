@@ -28,6 +28,7 @@ use smithay::output::Output;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::seat::WaylandFocus;
 
+use crate::overlay::OverlayGeometry;
 use crate::state::AppState;
 
 render_elements! {
@@ -368,6 +369,14 @@ pub struct RenderCache {
     frame: u64,
     /// Слои оверлея: (id, отпечаток, commit).
     overlays: [(Id, u64, CommitCounter); 3],
+    /// Обводки окон/кусков: (id, отпечаток, commit, кадр последнего показа).
+    borders: HashMap<BorderKey, (Id, u64, CommitCounter, u64)>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum BorderKey {
+    Piece(u32),
+    Window(Window),
 }
 
 struct CachedMesh {
@@ -394,6 +403,7 @@ impl Default for RenderCache {
             meshes: HashMap::new(),
             frame: 0,
             overlays: std::array::from_fn(|_| (Id::new(), 0, CommitCounter::default())),
+            borders: HashMap::new(),
         }
     }
 }
@@ -465,6 +475,31 @@ impl RenderCache {
         let frame = self.frame;
         self.elements.retain(|_, e| e.seen + 120 > frame);
         self.meshes.retain(|_, e| e.seen + 120 > frame);
+        self.borders.retain(|_, e| e.3 + 120 > frame);
+    }
+
+    /// Render-элемент обводки со стабильным id; commit растёт при изменении.
+    fn border(
+        &mut self,
+        key: BorderKey,
+        geometry: OverlayGeometry,
+    ) -> Option<CustomRenderElements> {
+        if geometry.is_empty() {
+            return None;
+        }
+        let frame = self.frame;
+        let print = geometry.fingerprint();
+        let entry = self
+            .borders
+            .entry(key)
+            .or_insert_with(|| (Id::new(), print, CommitCounter::default(), frame));
+        if entry.1 != print {
+            entry.1 = print;
+            entry.2.increment();
+        }
+        entry.3 = frame;
+        crate::overlay::OverlayElement::new(entry.0.clone(), entry.2, geometry)
+            .map(CustomRenderElements::Overlay)
     }
 
     fn overlay_commit(&mut self, layer: usize, print: u64) -> (Id, CommitCounter) {
@@ -535,6 +570,64 @@ fn push_surface_elements(
     }
 }
 
+/// Параметры обводки: толщина и цвет (активное окно — свой цвет).
+fn border_style(state: &AppState, window: &Window, focused: Option<&Window>) -> (f32, [f32; 4]) {
+    let cfg = &state.config.rendering;
+    let color = if focused == Some(window) {
+        &cfg.border_active_color
+    } else {
+        &cfg.border_color
+    };
+    (cfg.border_width.max(0.0), crate::config::parse_color(color))
+}
+
+/// Обводка куска: прямоугольник снаружи кадра (повёрнутый вместе с окном)
+/// или контур деформированной сетки мягкого окна.
+fn piece_border(draw: &PieceDraw, width: f32, color: [f32; 4]) -> OverlayGeometry {
+    let mut g = OverlayGeometry::new();
+    let Some(rect) = draw.clip else {
+        return g;
+    };
+    if width <= 0.0 {
+        return g;
+    }
+    // Масштаб камеры: толщина рамки растёт и уменьшается вместе с окном.
+    let scale = (draw.xf.a * draw.xf.a + draw.xf.b * draw.xf.b).sqrt() as f32;
+    let w = (width * scale).max(1.0);
+    let outline: Vec<[f32; 2]> = match &draw.mesh {
+        Some(mesh) => {
+            // Граница сетки (res+1)×(res+1), вершины построчно.
+            let n = mesh.positions.len();
+            let side = (n as f64).sqrt().round() as usize;
+            if side < 2 || side * side != n {
+                return g;
+            }
+            let idx = |x: usize, y: usize| y * side + x;
+            let mut ring = Vec::with_capacity(4 * side);
+            ring.extend((0..side).map(|x| idx(x, 0)));
+            ring.extend((1..side).map(|y| idx(side - 1, y)));
+            ring.extend((0..side - 1).rev().map(|x| idx(x, side - 1)));
+            ring.extend((1..side - 1).rev().map(|y| idx(0, y)));
+            ring.into_iter().map(|i| mesh.positions[i]).collect()
+        }
+        None => {
+            // Рамка снаружи окна: центр линии на полтолщины за краем.
+            let e = (width * 0.5) as f64;
+            let (x0, y0) = (rect.loc.x - e, rect.loc.y - e);
+            let (x1, y1) = (rect.loc.x + rect.size.w + e, rect.loc.y + rect.size.h + e);
+            [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                .into_iter()
+                .map(|(x, y)| {
+                    let (sx, sy) = draw.xf.apply(x, y);
+                    [sx as f32, sy as f32]
+                })
+                .collect()
+        }
+    };
+    g.outline(&outline, w, color);
+    g
+}
+
 /// Элементы окон физического режима, front-to-back.
 pub fn collect_physics_elements(
     renderer: &mut GlesRenderer,
@@ -548,11 +641,18 @@ pub fn collect_physics_elements(
         snapshots.retain(|w| alive.contains(w));
     }
     cache.begin_frame();
+    let focused = state.get_focused_window();
     let mut out = Vec::new();
     for draw in draws {
         let Some(surface) = draw.window.wl_surface().map(|s| s.into_owned()) else {
             continue;
         };
+        // Обводка — сразу за своим куском: позади окна, но поверх окон ниже.
+        let (border_width, border_color) = border_style(state, &draw.window, focused.as_ref());
+        let border = cache.border(
+            BorderKey::Piece(draw.key),
+            piece_border(&draw, border_width, border_color),
+        );
         let geo_loc = draw.window.geometry().loc;
         let mesh_element = draw.mesh.as_ref().and_then(|mesh| {
             let snap = snapshots.snapshot(renderer, &draw.window)?;
@@ -591,6 +691,7 @@ pub fn collect_physics_elements(
         }
         if let Some(mesh) = mesh_element {
             out.push(CustomRenderElements::Mesh(mesh));
+            out.extend(border);
             continue;
         }
         // Начало дерева поверхностей — так, чтобы геометрия окна была в (0,0).
@@ -604,10 +705,44 @@ pub fn collect_physics_elements(
             draw.xf,
             draw.clip,
         );
+        out.extend(border);
     }
     cache.end_frame();
     state.render_cache = cache;
     state.snapshots = snapshots;
+    out
+}
+
+/// Обводки окон в тайлинге: окна не пересекаются, рамки живут в зазорах
+/// между ними — рисуем их позади всех окон.
+fn tiling_borders(state: &mut AppState) -> Vec<CustomRenderElements> {
+    let focused = state.get_focused_window();
+    let windows: Vec<(Window, Rectangle<i32, Logical>)> = state
+        .space
+        .elements()
+        .filter(|w| !w.x11_surface().is_some_and(|x| x.is_override_redirect()))
+        .filter_map(|w| Some((w.clone(), state.space.element_geometry(w)?)))
+        .collect();
+    let mut cache = std::mem::take(&mut state.render_cache);
+    cache.begin_frame();
+    let mut out = Vec::new();
+    for (window, geo) in windows {
+        let (width, color) = border_style(state, &window, focused.as_ref());
+        if width <= 0.0 {
+            continue;
+        }
+        let e = width * 0.5;
+        let (x0, y0) = (geo.loc.x as f32 - e, geo.loc.y as f32 - e);
+        let (x1, y1) = (
+            (geo.loc.x + geo.size.w) as f32 + e,
+            (geo.loc.y + geo.size.h) as f32 + e,
+        );
+        let mut g = OverlayGeometry::new();
+        g.outline(&[[x0, y0], [x1, y0], [x1, y1], [x0, y1]], width, color);
+        out.extend(cache.border(BorderKey::Window(window), g));
+    }
+    cache.end_frame();
+    state.render_cache = cache;
     out
 }
 
@@ -637,13 +772,15 @@ pub fn frame_elements(
     output: &Output,
 ) -> Vec<CustomRenderElements> {
     if state.layout_mode == crate::state::LayoutMode::Tiling {
-        return state
+        let mut elements: Vec<CustomRenderElements> = state
             .space
             .render_elements_for_output(renderer, output, 1.0)
             .unwrap_or_default()
             .into_iter()
             .map(CustomRenderElements::Space)
             .collect();
+        elements.extend(tiling_borders(state));
+        return elements;
     }
     let mut elements = overlay_elements(state);
     elements.extend(collect_physics_elements(renderer, state));

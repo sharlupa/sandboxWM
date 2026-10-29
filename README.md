@@ -102,7 +102,7 @@ cargo build --release
 | `slicing.conf` | `[slicing]` |
 | `session.conf` | `[session]`: автосохранение, путь, формат TOML/JSON, перезапуск приложений |
 | `window.conf` | `[window_props]` и overrides по app_id: `[window_props.apps."org.gnome.Nautilus"] weight = 2.0, softness = 0.3, floating = true` |
-| `rendering.conf` | `[rendering]`: цвет фона |
+| `rendering.conf` | `[rendering]`: цвет фона, обводка окон (толщина, цвет обычных и активного) |
 
 Сессия по умолчанию лежит в `$XDG_STATE_HOME/sandboxWM/session.toml` (рядом — `.bak`), лог паник — в `$XDG_STATE_HOME/sandboxWM/panic.log`.
 
