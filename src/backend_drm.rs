@@ -148,6 +148,8 @@ pub fn run_tty(
     );
     output.set_preferred(smithay_mode);
     state.space.map_output(&output, (0, 0));
+    // Выход есть — можно грузить сессию (пол/камера зависят от размера экрана).
+    state.on_output_ready();
 
     // 7. DRM поверхность + DrmCompositor
     let drm_surface = drm.create_surface(crtc, drm_mode, &[connector.handle()])?;
@@ -258,9 +260,6 @@ pub fn run_tty(
     // Курсор — простой белый квадрат 12x12 (рисуется программно как render-element,
     // т.к. в Smithay 0.7 у DrmCompositor нет API для hardware cursor plane).
     let cursor_buf = SolidColorBuffer::new((12, 12), [1.0f32, 1.0, 1.0, 1.0]);
-    // Визуальный пол
-    let floor_buf = SolidColorBuffer::new((10000, 4), [0.8f32, 0.8, 0.8, 1.0]);
-    // Буферы для псевдо-круглых точек 6x6 (состоят из 3-х прямоугольников)
 
     // 11. Рендер-таймер ~60 fps. Renders only when something changed
     //     (`state.needs_render`); an idle desktop costs ~0 GPU/CPU instead of a
@@ -273,10 +272,7 @@ pub fn run_tty(
             // ── Физический режим: шаг симуляции ─────────────
             // Выполняем шаг ДО проверки `needs_render`. Если тела движутся,
             // `step_physics` сам выставит `needs_render = true`, разбудив рендер.
-            if state.layout_mode == crate::state::LayoutMode::Physics {
-                state.step_physics();
-                state.sync_x11_with_physics();
-            }
+            state.step_physics();
 
             // Screencopy-клиент (OBS через portal-wlr) ждёт кадр — будим рендер,
             // даже если сцена статична: иначе захват замирает/чернеет.
@@ -310,39 +306,10 @@ pub fn run_tty(
                 (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
             );
 
-            let mut elements: Vec<CustomRenderElements> = if state.layout_mode == crate::state::LayoutMode::Tiling {
-                state
-                    .space
-                    .render_elements_for_output(&mut renderer, &output_t, 1.0)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(CustomRenderElements::Space)
-                    .collect()
-            } else {
-                crate::render::collect_physics_elements(&mut renderer, state)
-            };
-
-            // Вставляем визуальный пол в конец вектора (рендерится позади окон)
-            if state.layout_mode == crate::state::LayoutMode::Physics {
-                // Пол: мировая Y из config.physics.floor_y
-                let screen_w = output_t.current_mode().map(|m| m.size.w).unwrap_or(1920);
-                let floor_y = ((state.config.physics.floor_y as f64 - state.camera_offset.1) * state.camera_zoom) as i32;
-
-                // Если пол попадает в экран, рисуем его
-                if floor_y > -100 && floor_y < 4000 {
-                    // Сама полоса (белая) — центрируем по X
-                    elements.push(CustomRenderElements::Cursor(
-                        SolidColorRenderElement::from_buffer(
-                            &floor_buf,
-                            (state.camera_zoom.mul_add(-5000.0, 0.0) as i32 + screen_w / 2, floor_y),
-                            1.0,
-                            1.0,
-                            Kind::Unspecified,
-                        ),
-                    ));
-
-                                    }
-            }
+            // Окна + оверлей физики (линии, верёвки, связи, пол) — общий
+            // сборщик кадра для обоих бэкендов.
+            let mut elements: Vec<CustomRenderElements> =
+                crate::render::frame_elements(&mut renderer, state, &output_t);
 
             // Программный курсор поверх окон. `render_frame` принимает элементы
             // в порядке front-to-back: первый элемент в слайсе рисуется поверх
@@ -517,7 +484,7 @@ pub fn run_tty(
             match comp.render_frame::<_, _>(
                 &mut renderer,
                 &elements,
-                [0.08, 0.08, 0.12, 1.0],
+                state.background_color(),
                 frame_flags,
             ) {
                 Ok(_result) => {
@@ -582,10 +549,12 @@ pub fn run_tty(
     // LibSeatSession Arc) drops → libseat_close_seat() → fd revoked.
     // By that point every native resource is already gone.  No SIGSEGV.
 
+    // Сессию сохраняем, пока физический мир ещё жив.
+    state.save_session();
+
     // Clear physics state while everything is alive (avoids rapier handles
     // referencing a partially-torn-down world during field-order drops).
-    state.drag_body = None;
-    state.window_bodies.clear();
+    state.pieces.clear();
     state.physics = None;
 
     drop(loop_handle);

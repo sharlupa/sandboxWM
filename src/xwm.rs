@@ -42,14 +42,13 @@ impl XwmHandler for AppState {
         let focused = self.get_focused_window();
         if let Some(tree) = self.tile_tree.take() {
             let target = focused.unwrap_or_else(|| window.clone());
-            self.tile_tree = Some(tree.insert(&target, window.clone(), self.output_rect()));
+            self.tile_tree = Some(tree.insert(&target, window.clone(), self.tiling_area()));
         } else {
             self.tile_tree = Some(crate::tiling::TileNode::Leaf(window.clone()));
         }
 
-        if self.layout_mode == LayoutMode::Physics {
-            // Тело заспавнится в commit(), когда клиент отрисует реальный буфер.
-        } else {
+        // В физике тело появится в commit(), когда клиент отрисует буфер.
+        if self.layout_mode == LayoutMode::Tiling {
             self.recalculate_layout();
         }
 
@@ -153,22 +152,6 @@ pub fn spawn_xwayland(
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, AppState>,
     display_handle: &smithay::reexports::wayland_server::DisplayHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Паник-хук: пишем панику и бектрейс в panic.log, чтобы причину
-    // краша было видно, даже если stderr не перенаправлен в файл.
-    std::panic::set_hook(Box::new(|info| {
-        let bt = std::backtrace::Backtrace::force_capture();
-        let msg = format!("PANIC: {info}\n\nbacktrace:\n{bt}\n");
-        eprintln!("{msg}");
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/home/user/sandboxWM/panic.log")
-        {
-            let _ = f.write_all(msg.as_bytes());
-        }
-    }));
-
     let (xwayland, client) = XWayland::spawn(
         display_handle,
         None,

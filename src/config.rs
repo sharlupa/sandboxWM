@@ -7,78 +7,54 @@
 //! 3. `~/.config/sandboxWM/`
 //! 4. `./config/` (рядом с cwd)
 //!
-//! Внутри найденной директории читаются все файлы `*.conf` (по алфавиту, для
-//! стабильного порядка) и склеиваются в один TOML-документ. Каждый файл отвечает за
-//! свои секции:
-//!   - `sandboxWM.conf`  — `[physics]` и `[controls]` (реализовано, работает)
-//!   - `gravity.conf`    — `[gravity_modes]`, `[planned_controls]` (заготовка)
-//!   - `drawing.conf`    — `[drawing]`, `[materials.*]` (заготовка)
-//!   - `joints.conf`     — `[joints.*]` (заготовка)
-//!   - `softbody.conf`   — `[soft_body]` (заготовка)
-//!   - `slicing.conf`    — `[slicing]` (заготовка)
-//!   - `session.conf`    — `[session]` (заготовка)
-//!   - `window.conf`     — `[window_props]` (заготовка)
-//!   - `rendering.conf`  — `[rendering]` (заготовка)
+//! Внутри найденной директории читаются все файлы `*.conf` (по алфавиту) и
+//! сливаются потаблично: одинаковые таблицы из разных файлов объединяются,
+//! повторный ключ из более позднего файла перекрывает ранний. Раньше файлы
+//! склеивались строкой, и любая повторная секция (`[gravity_modes]` была и в
+//! `gravity.conf`, и в `sandboxWM.conf`) давала `duplicate key` — весь конфиг
+//! молча откатывался к дефолтам. Файл с синтаксической ошибкой теперь
+//! пропускается с сообщением, остальные применяются.
 //!
-//! Секции-заготовки уже содержат разумные дефолты по концепту
-//! (`sandboxWM_concept.md`), но ни одна из них пока не читается кодом — это
-//! заготовки под будущую реализацию, а не рабочие настройки.
+//! Раскладка по файлам (рекомендуемая, не обязательная):
+//!   - `sandboxWM.conf`  — `[physics]`, `[controls]`
+//!   - `gravity.conf`    — `[gravity_modes]`
+//!   - `drawing.conf`    — `[drawing]`, `[materials.*]`
+//!   - `joints.conf`     — `[joints.*]`
+//!   - `softbody.conf`   — `[soft_body]`
+//!   - `slicing.conf`    — `[slicing]`
+//!   - `session.conf`    — `[session]`
+//!   - `window.conf`     — `[window_props]`
+//!   - `rendering.conf`  — `[rendering]`
 //!
 //! Отсутствующие файлы/поля → [`Default`].
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Корневой конфиг.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub physics: PhysicsConfig,
     pub controls: ControlsConfig,
-
-    // ── Заглушки (фици из концепта, ещё не реализованы) ────────────
-    /// Режимы гравитации (концепт §1, режимы 2–4). Сейчас есть только общий
-    /// тумблер тайлинг↔физика (`controls.toggle_physics`); заморозка в
-    /// тайлинг, невесомость одного окна и полная невесомость — план.
+    /// Режимы гравитации (концепт §1).
     pub gravity_modes: GravityModesConfig,
-    /// Клавиши для функций из концепта, которых пока нет в коде.
-    pub planned_controls: PlannedControlsConfig,
-    /// Рисование физических линий курсором.
+    /// Рисование физических линий курсором (концепт §2).
     pub drawing: DrawingConfig,
     /// Материалы линий: сталь / клей / батут / верёвка.
     pub materials: MaterialsConfig,
-    /// Скрепление окон (Weld / Spring / Rope).
+    /// Скрепление окон (Weld / Spring / Rope, концепт §4).
     pub joints: JointsConfig,
-    /// Мягкие тела / деформация окон.
+    /// Мягкие тела / деформация окон (концепт §5–6).
     pub soft_body: SoftBodyConfig,
-    /// Разрезание окон (слайсинг).
+    /// Разрезание окон (концепт §7).
     pub slicing: SlicingConfig,
-    /// Персистентность сессии (сохранение/восстановление).
+    /// Персистентность сессии (концепт §3).
     pub session: SessionConfig,
-    /// Свойства окон (вес, мягкость и т.п. — per-window overrides).
+    /// Свойства окон по умолчанию и per-app overrides.
     pub window_props: WindowPropsConfig,
-    /// Будущий рендер-бэкенд (сейчас GLES через Smithay; план — wgpu/glow
-    /// mesh-рендер для деформации окон).
     pub rendering: RenderingConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            physics: PhysicsConfig::default(),
-            controls: ControlsConfig::default(),
-            gravity_modes: GravityModesConfig::default(),
-            planned_controls: PlannedControlsConfig::default(),
-            drawing: DrawingConfig::default(),
-            materials: MaterialsConfig::default(),
-            joints: JointsConfig::default(),
-            soft_body: SoftBodyConfig::default(),
-            slicing: SlicingConfig::default(),
-            session: SessionConfig::default(),
-            window_props: WindowPropsConfig::default(),
-            rendering: RenderingConfig::default(),
-        }
-    }
 }
 
 impl Config {
@@ -105,11 +81,8 @@ impl Config {
         }
     }
 
-    /// Считывает и склеивает все `*.conf`-файлы директории (по алфавиту,
-    /// для стабильного порядка), затем парсит результат как единый
-    /// TOML-документ. Каждый файл отвечает за свои таблицы (`[physics]`,
-    /// `[joints.weld]`, …), поэтому конкатенация безопасна, если файлы не описывают
-    /// одну и ту же таблицу дважды.
+    /// Читает все `*.conf` директории и сливает их потаблично (см. модульную
+    /// документацию). Ошибка в одном файле не отменяет остальные.
     fn load_from_dir(dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|entry| entry.ok())
@@ -120,14 +93,16 @@ impl Config {
             .collect();
         files.sort();
 
-        let mut combined = String::new();
+        let mut merged = toml::Table::new();
         for path in &files {
-            combined.push_str(&std::fs::read_to_string(path)?);
-            combined.push('\n');
+            let text = std::fs::read_to_string(path)?;
+            match text.parse::<toml::Table>() {
+                Ok(table) => merge_tables(&mut merged, table),
+                Err(e) => eprintln!("[config] {} пропущен: {e}", path.display()),
+            }
         }
 
-        let cfg: Config = toml::from_str(&combined)?;
-        Ok(cfg)
+        Ok(toml::Value::Table(merged).try_into()?)
     }
 
     fn find_config_dir() -> Option<PathBuf> {
@@ -159,9 +134,65 @@ impl Config {
 
         None
     }
+
+    /// Свойства конкретного окна: дефолты + override по app_id/классу.
+    pub fn window_override(&self, app_id: &str) -> WindowOverride {
+        let props = &self.window_props;
+        let mut out = WindowOverride {
+            weight: Some(props.default_weight),
+            softness: Some(props.default_softness),
+            floating: Some(false),
+        };
+        if props.allow_overrides && !app_id.is_empty() {
+            let key = app_id.to_ascii_lowercase();
+            if let Some(o) = props
+                .apps
+                .iter()
+                .find(|(k, _)| k.to_ascii_lowercase() == key)
+                .map(|(_, v)| v)
+            {
+                out.weight = o.weight.or(out.weight);
+                out.softness = o.softness.or(out.softness);
+                out.floating = o.floating.or(out.floating);
+            }
+        }
+        out
+    }
 }
 
-// ── Реализованные секции ───────────────────────────────────────────
+/// Рекурсивное слияние: таблицы объединяются, прочие значения перекрываются.
+fn merge_tables(dst: &mut toml::Table, src: toml::Table) {
+    for (key, value) in src {
+        match (dst.get_mut(&key), value) {
+            (Some(toml::Value::Table(d)), toml::Value::Table(s)) => merge_tables(d, s),
+            (_, v) => {
+                dst.insert(key, v);
+            }
+        }
+    }
+}
+
+/// `#rrggbb` / `#rrggbbaa` → линейный RGBA 0..1. Некорректная строка → белый.
+pub fn parse_color(s: &str) -> [f32; 4] {
+    let hex = s.trim().trim_start_matches('#');
+    let byte = |i: usize| {
+        hex.get(i..i + 2)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+            .map(|b| b as f32 / 255.0)
+    };
+    match hex.len() {
+        6 | 8 => {
+            let a = if hex.len() == 8 { byte(6) } else { Some(1.0) };
+            match (byte(0), byte(2), byte(4), a) {
+                (Some(r), Some(g), Some(b), Some(a)) => [r, g, b, a],
+                _ => [1.0; 4],
+            }
+        }
+        _ => [1.0; 4],
+    }
+}
+
+// ── Физика ─────────────────────────────────────────────────────────
 
 /// Параметры физического мира и тел окон.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,13 +202,18 @@ pub struct PhysicsConfig {
     pub physics_dt: f32,
     /// Гравитация по Y (px/s²). Logical Y растёт вниз → положительная.
     pub gravity_y: f32,
-    /// Мировая Y-координата пола.
-    pub floor_y: f32,
+    /// Мировая Y-координата верхней грани пола. Не задано → нижний край
+    /// экрана в момент включения физики (раньше дефолт 2000 при экране
+    /// 1080 px уводил все окна за кадр).
+    pub floor_y: Option<f32>,
     /// Полуширина пола (cuboid half-extent по X).
     pub floor_half_w: f32,
     /// Полутолщина пола (cuboid half-extent по Y).
     pub floor_half_h: f32,
-    /// Плотность коллайдера окна (kg/px²); масса ∝ площади.
+    /// Рисовать линию пола.
+    pub floor_visible: bool,
+    pub floor_color: String,
+    /// Плотность коллайдера окна (масса ∝ площади).
     pub density: f32,
     pub linear_damping: f32,
     pub angular_damping: f32,
@@ -191,6 +227,9 @@ pub struct PhysicsConfig {
     pub camera_step: f64,
     /// Коэффициент lerp камеры за кадр (0..1).
     pub camera_lerp: f64,
+    /// Границы зума камеры.
+    pub zoom_min: f64,
+    pub zoom_max: f64,
 }
 
 impl Default for PhysicsConfig {
@@ -198,9 +237,11 @@ impl Default for PhysicsConfig {
         Self {
             physics_dt: 1.0 / 60.0,
             gravity_y: 1500.0,
-            floor_y: 2000.0,
+            floor_y: None,
             floor_half_w: 50_000.0,
             floor_half_h: 100.0,
+            floor_visible: true,
+            floor_color: "#cccccc".into(),
             density: 0.002,
             linear_damping: 1.5,
             angular_damping: 3.5,
@@ -210,11 +251,16 @@ impl Default for PhysicsConfig {
             spin_rate: 2.0,
             camera_step: 120.0,
             camera_lerp: 0.15,
+            zoom_min: 0.1,
+            zoom_max: 3.0,
         }
     }
 }
 
-/// Горячие клавиши и связанные команды.
+// ── Управление ─────────────────────────────────────────────────────
+
+/// Горячие клавиши. Все действия — с модификатором Super (Logo), кроме
+/// клавиш внутри активного инструмента (см. README).
 ///
 /// Имена клавиш — как в XKB без префикса `KEY_`: `Return`, `Escape`, `a`,
 /// `Left`, `F1`, … Сравнение case-insensitive для букв.
@@ -226,6 +272,7 @@ pub struct ControlsConfig {
     pub spawn_terminal: String,
     pub quit: Vec<String>,
     pub close_window: String,
+    /// Тайлинг ↔ физика (плавный переход в обе стороны).
     pub toggle_physics: String,
     pub spin_left: String,
     pub spin_right: String,
@@ -233,6 +280,36 @@ pub struct ControlsConfig {
     pub camera_right: String,
     pub camera_up: String,
     pub camera_down: String,
+
+    // Режимы гравитации (концепт §1).
+    /// Режим 1: обычная гравитация (включает физику, если был тайлинг).
+    pub gravity_normal: String,
+    /// Режим 2: гравитация выключена → окна плавно встают в тайлинг.
+    pub gravity_tiling: String,
+    /// Режим 3: невесомость только для активного окна (переключатель).
+    pub float_window: String,
+    /// Режим 4: невесомость для всех окон.
+    pub gravity_zero: String,
+
+    // Инструменты (физический режим).
+    /// Рисование линий (концепт §2).
+    pub draw_tool: String,
+    /// Нож — разрезание окна (концепт §7).
+    pub knife_tool: String,
+    /// Сварка двух окон (концепт §4).
+    pub weld_windows: String,
+    /// Пружина между окнами.
+    pub spring_windows: String,
+    /// Верёвка между окнами.
+    pub rope_windows: String,
+    /// Снять все связи/крепления активного окна.
+    pub unlink_window: String,
+    /// Сделать активное окно мягким/жёстким (концепт §5).
+    pub toggle_soft: String,
+    /// Вернуть форму окна и склеить разрезанные части.
+    pub restore_window: String,
+    /// Сохранить сессию прямо сейчас.
+    pub save_session: String,
 }
 
 impl Default for ControlsConfig {
@@ -249,6 +326,19 @@ impl Default for ControlsConfig {
             camera_right: "Right".into(),
             camera_up: "Up".into(),
             camera_down: "Down".into(),
+            gravity_normal: "1".into(),
+            gravity_tiling: "2".into(),
+            float_window: "3".into(),
+            gravity_zero: "4".into(),
+            draw_tool: "p".into(),
+            knife_tool: "x".into(),
+            weld_windows: "e".into(),
+            spring_windows: "s".into(),
+            rope_windows: "r".into(),
+            unlink_window: "u".into(),
+            toggle_soft: "j".into(),
+            restore_window: "z".into(),
+            save_session: "F5".into(),
         }
     }
 }
@@ -285,10 +375,14 @@ fn keysym_name(keysym: u32) -> Option<&'static str> {
         xkb::KEY_Escape => "Escape",
         xkb::KEY_space => "space",
         xkb::KEY_Tab => "Tab",
+        xkb::KEY_BackSpace => "BackSpace",
+        xkb::KEY_Delete => "Delete",
         xkb::KEY_Left => "Left",
         xkb::KEY_Right => "Right",
         xkb::KEY_Up => "Up",
         xkb::KEY_Down => "Down",
+        xkb::KEY_minus => "minus",
+        xkb::KEY_equal => "equal",
         xkb::KEY_F1 => "F1",
         xkb::KEY_F2 => "F2",
         xkb::KEY_F3 => "F3",
@@ -301,38 +395,36 @@ fn keysym_name(keysym: u32) -> Option<&'static str> {
         xkb::KEY_F10 => "F10",
         xkb::KEY_F11 => "F11",
         xkb::KEY_F12 => "F12",
-        xkb::KEY_0 => "0",
-        xkb::KEY_1 => "1",
-        xkb::KEY_2 => "2",
-        xkb::KEY_3 => "3",
-        xkb::KEY_4 => "4",
-        xkb::KEY_5 => "5",
-        xkb::KEY_6 => "6",
-        xkb::KEY_7 => "7",
-        xkb::KEY_8 => "8",
-        xkb::KEY_9 => "9",
+        // Цифры и их shifted-варианты на US-раскладке: Super+Shift+1 даёт
+        // keysym `exclam`, но пользователь думает о клавише «1».
+        xkb::KEY_0 | xkb::KEY_parenright => "0",
+        xkb::KEY_1 | xkb::KEY_exclam => "1",
+        xkb::KEY_2 | xkb::KEY_at => "2",
+        xkb::KEY_3 | xkb::KEY_numbersign => "3",
+        xkb::KEY_4 | xkb::KEY_dollar => "4",
+        xkb::KEY_5 | xkb::KEY_percent => "5",
+        xkb::KEY_6 | xkb::KEY_asciicircum => "6",
+        xkb::KEY_7 | xkb::KEY_ampersand => "7",
+        xkb::KEY_8 | xkb::KEY_asterisk => "8",
+        xkb::KEY_9 | xkb::KEY_parenleft => "9",
         _ => return None,
     })
 }
 
-// ── Заглушки будущих фиц ──────────────────────────────────────────
-// Поля ниже уже несут разумные дефолты по описанию из `sandboxWM_concept.md`,
-// но ни `state.rs`, ни `physics.rs`, ни `input.rs` их пока не читают. Ети
-// подготовленная поверхность конфигурации — реализация подключит логику к
-// этим полям постепенно, по одной фиче.
+// ── Режимы гравитации ──────────────────────────────────────────────
 
-/// Режимы гравитации (концепт §1). `physics.gravity_y` — режим 1 (стандарт).
-/// Здесь параметры для режимов 2–4, которых пока нет в `physics.rs`.
+/// Режимы гравитации (концепт §1). `physics.gravity_y` — режим 1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GravityModesConfig {
-    /// Режим 2: длительность плавного перехода "физика → строгий тайлинг", сек.
+    /// Режим 2: длительность плавного перехода физика ↔ тайлинг, сек.
     pub freeze_transition_secs: f32,
-    /// Порог скорости тела, ниже которого окно считается "улёгшимся" перед
-    /// заморозкой в тайлинг (px/s).
+    /// Порог скорости (px/s), ниже которого окно считается «улёгшимся».
     pub freeze_settle_speed: f32,
     /// Режим 4: гравитация во время полной невесомости (обычно 0.0).
     pub weightless_gravity_y: f32,
+    /// Затухание в невесомости: меньше → окна дольше плывут по инерции.
+    pub weightless_linear_damping: f32,
 }
 
 impl Default for GravityModesConfig {
@@ -341,62 +433,27 @@ impl Default for GravityModesConfig {
             freeze_transition_secs: 0.35,
             freeze_settle_speed: 5.0,
             weightless_gravity_y: 0.0,
+            weightless_linear_damping: 0.3,
         }
     }
 }
 
-/// Клавиши для функций из концепта, которых пока нет в `input.rs`.
-/// Раздел отдельный от [`ControlsConfig`], чтобы не путать уже рабочие
-/// биндинги с заготовками.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PlannedControlsConfig {
-    /// Режим 2: заморозить гравитацию → строгий тайлинг.
-    pub gravity_freeze: String,
-    /// Режим 3: невесомость только для сфокусированного окна.
-    pub gravity_float_window: String,
-    /// Режим 4: невесомость для всех окон.
-    pub gravity_zero: String,
-    /// Включить инструмент рисования физических линий (концепт §2).
-    pub draw_line: String,
-    /// Включить инструмент "нож" — слайсинг окна (концепт §7).
-    pub slice_window: String,
-    /// Сварить (WeldJoint) два выделенных окна (концепт §4).
-    pub weld_windows: String,
-    /// Соединить окна пружиной (SpringJoint) (концепт §4).
-    pub spring_windows: String,
-    /// Соединить окна верёвкой (концепт §4).
-    pub rope_windows: String,
-}
+// ── Рисование линий ────────────────────────────────────────────────
 
-impl Default for PlannedControlsConfig {
-    fn default() -> Self {
-        Self {
-            gravity_freeze: "2".into(),
-            gravity_float_window: "3".into(),
-            gravity_zero: "4".into(),
-            draw_line: "p".into(),
-            slice_window: "x".into(),
-            weld_windows: "e".into(),
-            spring_windows: "s".into(),
-            rope_windows: "r".into(),
-        }
-    }
-}
-
-/// Рисование линий курсором (концепт §2). Пока не используется.
+/// Рисование линий курсором (концепт §2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DrawingConfig {
-    /// Минимальное расстояние между соседними точками линии перед добавлением
-    /// нового сегмента-коллайдера (px). Сглаживает дрожание мыши.
+    /// Минимальное расстояние между соседними точками линии (px).
     pub min_point_spacing: f32,
-    /// Толщина коллайдера линии по умолчанию (px), если материал её не переопределяет.
+    /// Толщина коллайдера, если материал её не задаёт (px).
     pub default_thickness: f32,
-    /// Максимальное число точек в одной нарисованной линии.
+    /// Максимальное число точек в одной линии.
     pub max_points: u32,
-    /// Цвет превью линии во время рисования, до применения материала (hex).
+    /// Цвет превью во время рисования.
     pub preview_color: String,
+    /// Материал, выбранный при первом включении инструмента.
+    pub default_material: String,
 }
 
 impl Default for DrawingConfig {
@@ -406,11 +463,12 @@ impl Default for DrawingConfig {
             default_thickness: 12.0,
             max_points: 512,
             preview_color: "#ffffff".into(),
+            default_material: "steel".into(),
         }
     }
 }
 
-/// Материалы нарисованных линий (концепт §2): сталь / клей / батут / верёвка.
+/// Материалы нарисованных линий (концепт §2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MaterialsConfig {
@@ -441,7 +499,7 @@ impl Default for SteelMaterialConfig {
     }
 }
 
-/// Клей — высокое `friction`; `detach_force` — усилие для отрыва окна.
+/// Клей: окно приклеивается при касании и отрывается сильным рывком мышью.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GlueMaterialConfig {
@@ -449,8 +507,9 @@ pub struct GlueMaterialConfig {
     pub restitution: f32,
     pub thickness: f32,
     pub color: String,
-    /// Сила drag'а (px/s условной скорости отрыва), нужная чтобы оторвать
-    /// приклеенное окно.
+    /// Порог отрыва: изменение скорости окна за шаг (px/s), которое шов
+    /// клея должен «погасить», чтобы удержать окно. Сильнее тянешь мышью —
+    /// окно отрывается. Собственный вес окна (~25 px/s за шаг) не отрывает.
     pub detach_force: f32,
 }
 
@@ -487,30 +546,40 @@ impl Default for TrampolineMaterialConfig {
     }
 }
 
-/// Верёвка — цепочка коротких тел, соединённых `BallJoint`.
+/// Верёвка — цепочка коротких тел на шарнирах.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RopeMaterialConfig {
+    /// Длина одного звена (px); нарисованная линия разбивается на звенья.
     pub segment_length: f32,
+    /// Максимум звеньев в одной верёвке.
     pub segment_count: u32,
     pub thickness: f32,
     pub color: String,
+    /// Жёсткость шарниров 0..1 (1 — нерастяжимая цепь).
     pub joint_stiffness: f32,
+    /// Какие концы нарисованной верёвки закреплены: "start", "both", "none".
+    pub pin: String,
+    /// Свободный конец цепляется за окно, которое к нему поднесли мышью.
+    pub hook_windows: bool,
 }
 
 impl Default for RopeMaterialConfig {
     fn default() -> Self {
         Self {
             segment_length: 20.0,
-            segment_count: 16,
+            segment_count: 64,
             thickness: 6.0,
-            color: "#7a5230".into(),
+            color: "#b07a48".into(),
             joint_stiffness: 1.0,
+            pin: "start".into(),
+            hook_windows: true,
         }
     }
 }
 
-/// Joints между окнами (концепт §4).
+// ── Связи между окнами ─────────────────────────────────────────────
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JointsConfig {
@@ -519,27 +588,26 @@ pub struct JointsConfig {
     pub rope: RopeJointConfig,
 }
 
-/// Сварка (`WeldJoint`) — монолит из двух окон.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Сварка — монолит из двух окон.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WeldJointConfig {
-    /// Сила удара, при которой сварной шов разрушается. `0.0` = неразрушимый.
+    /// Порог разрушения шва в тех же единицах, что `glue.detach_force`
+    /// (px/s за шаг). `0.0` = неразрушимый.
     pub break_force: f32,
 }
 
-impl Default for WeldJointConfig {
-    fn default() -> Self {
-        Self { break_force: 0.0 }
-    }
-}
-
-/// Пружина (`SpringJoint`).
+/// Пружина.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpringJointConfig {
+    /// Жёсткость (на единицу массы окна, 1/s²).
     pub stiffness: f32,
+    /// Демпфирование (на единицу массы окна, 1/s).
     pub damping: f32,
+    /// Длина покоя (px). `0` → текущее расстояние между точками крепления.
     pub rest_length: f32,
+    pub color: String,
 }
 
 impl Default for SpringJointConfig {
@@ -547,17 +615,19 @@ impl Default for SpringJointConfig {
         Self {
             stiffness: 200.0,
             damping: 10.0,
-            rest_length: 150.0,
+            rest_length: 0.0,
+            color: "#7fd18b".into(),
         }
     }
 }
 
-/// Верёвка между окнами. По умолчанию проходит сквозь скреплённые окна
-/// (как описано в концепте).
+/// Верёвка между окнами. По умолчанию проходит сквозь скреплённые окна.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RopeJointConfig {
     pub segment_length: f32,
+    /// Максимальная длина (px). Верёвка создаётся с длиной = расстояние × 1.1,
+    /// но не длиннее этого значения.
     pub max_length: f32,
     pub collides_with_linked_windows: bool,
 }
@@ -572,39 +642,46 @@ impl Default for RopeJointConfig {
     }
 }
 
+// ── Мягкие тела ────────────────────────────────────────────────────
+
 /// Мягкие тела / деформация окон (концепт §5–6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoftBodyConfig {
-    /// Степень мягкости: `0.0` — жёсткое окно, `1.0` — желе.
+    /// Мягкость окна, которое сделали мягким (`toggle_soft` или захват
+    /// за край): `0.0` — жёсткое, `1.0` — желе.
     pub softness: f32,
-    /// Насколько сильно окно сплющивается при сильном ударе об пол.
+    /// Насколько сильно окно сплющивается при ударе.
     pub impact_squash: f32,
-    /// Число сегментов сетки (mesh) по каждой стороне окна.
+    /// Насколько вытягивание мышью остаётся навсегда (0..1).
+    pub plasticity: f32,
+    /// Число сегментов сетки по каждой стороне окна.
     pub mesh_resolution: u32,
-    /// Обратное проецирование курсора для выделения текста на искривлённой
-    /// сетке (концепт §6).
+    /// Обратное проецирование курсора через искривлённую сетку (концепт §6).
     pub text_reprojection: bool,
 }
 
 impl Default for SoftBodyConfig {
     fn default() -> Self {
         Self {
-            softness: 0.0,
-            impact_squash: 0.0,
-            mesh_resolution: 8,
-            text_reprojection: false,
+            softness: 0.5,
+            impact_squash: 0.5,
+            plasticity: 0.7,
+            mesh_resolution: 10,
+            text_reprojection: true,
         }
     }
 }
 
-/// Слайсинг окон (концепт §7, `wp_viewporter`).
+// ── Слайсинг ───────────────────────────────────────────────────────
+
+/// Слайсинг окон (концепт §7).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SlicingConfig {
-    /// Минимальный размер получившегося кусочка после разреза (px).
+    /// Минимальный размер получившегося кусочка (px).
     pub min_piece_size: f32,
-    /// Визуальный зазор между разрезанными частями (px).
+    /// Расстояние, на которое части расходятся после разреза (px).
     pub cut_gap: f32,
 }
 
@@ -617,6 +694,8 @@ impl Default for SlicingConfig {
     }
 }
 
+// ── Сессия ─────────────────────────────────────────────────────────
+
 /// Сохранение/восстановление сессии (концепт §3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -624,34 +703,43 @@ pub struct SessionConfig {
     pub enabled: bool,
     pub autosave: bool,
     pub autosave_interval_secs: u32,
-    /// Пусто = использовать XDG state dir по умолчанию, когда фича появится.
+    /// Пусто = `$XDG_STATE_HOME/sandboxWM/session.<ext>`.
     pub save_path: String,
     /// `"toml"` или `"json"`.
     pub format: String,
+    /// Перезапускать приложения, окна которых были открыты.
+    pub restore_apps: bool,
+    /// Сколько секунд ждать окна перезапущенных приложений.
+    pub restore_timeout_secs: u32,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            autosave: false,
+            enabled: true,
+            autosave: true,
             autosave_interval_secs: 60,
             save_path: String::new(),
             format: "toml".into(),
+            restore_apps: true,
+            restore_timeout_secs: 30,
         }
     }
 }
 
-/// Per-window overrides свойств (вес, мягкость и т.д.).
+// ── Свойства окон ──────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowPropsConfig {
-    /// Множитель плотности/веса по умолчанию для новых окон.
+    /// Множитель плотности (веса) для новых окон.
     pub default_weight: f32,
-    /// Степень мягкости по умолчанию (см. [`SoftBodyConfig`]).
+    /// Мягкость новых окон (0 — жёсткие).
     pub default_softness: f32,
-    /// Разрешить переопределять свойства конкретных окон индивидуально.
+    /// Разрешить overrides из `[window_props.apps."<app_id>"]`.
     pub allow_overrides: bool,
+    /// Свойства конкретных приложений по app_id / X11-классу.
+    pub apps: HashMap<String, WindowOverride>,
 }
 
 impl Default for WindowPropsConfig {
@@ -660,25 +748,85 @@ impl Default for WindowPropsConfig {
             default_weight: 1.0,
             default_softness: 0.0,
             allow_overrides: true,
+            apps: HashMap::new(),
         }
     }
 }
 
-/// Будущий рендер-бэкенд. Сейчас окна рисуются через GLES (Smithay);
-/// `wgpu`/`glow` понадобится для mesh-рендера деформируемых окон.
+/// Override свойств окна. Незаданное поле берётся из дефолтов.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowOverride {
+    pub weight: Option<f32>,
+    pub softness: Option<f32>,
+    /// Окно стартует в невесомости (режим 3).
+    pub floating: Option<bool>,
+}
+
+// ── Рендер ─────────────────────────────────────────────────────────
+
+/// Рендер. Используется GLES через Smithay (деформируемые окна рисуются
+/// собственным mesh-шейдером поверх того же GLES-контекста).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderingConfig {
-    /// `"gles"` (текущий бэкенд) или `"wgpu"` / `"glow"` (план).
-    pub backend: String,
-    pub vsync: bool,
+    /// Цвет фона рабочего стола.
+    pub background: String,
 }
 
 impl Default for RenderingConfig {
     fn default() -> Self {
         Self {
-            backend: "gles".into(),
-            vsync: true,
+            background: "#14141f".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_sections_across_files_merge() {
+        let dir = std::env::temp_dir().join(format!("sandboxwm-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.conf"), "[physics]\ngravity_y = 10.0\n[gravity_modes]\nweightless_gravity_y = 1.0\n").unwrap();
+        std::fs::write(dir.join("b.conf"), "[gravity_modes]\nfreeze_transition_secs = 2.0\n[controls]\nterminal = \"foot\"\n").unwrap();
+        std::fs::write(dir.join("c.conf"), "this is not toml [[[").unwrap();
+        let cfg = Config::load_from_dir(&dir).unwrap();
+        assert_eq!(cfg.physics.gravity_y, 10.0);
+        assert_eq!(cfg.gravity_modes.weightless_gravity_y, 1.0);
+        assert_eq!(cfg.gravity_modes.freeze_transition_secs, 2.0);
+        assert_eq!(cfg.controls.terminal, "foot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shipped_config_loads() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
+        let cfg = Config::load_from_dir(&dir).unwrap();
+        assert_eq!(cfg.controls.toggle_physics, "g");
+    }
+
+    #[test]
+    fn colors() {
+        assert_eq!(parse_color("#ff0000"), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(parse_color("00ff0080")[3], 128.0 / 255.0);
+        assert_eq!(parse_color("bogus"), [1.0; 4]);
+    }
+
+    #[test]
+    fn overrides() {
+        let mut cfg = Config::default();
+        cfg.window_props.apps.insert(
+            "Firefox".into(),
+            WindowOverride {
+                weight: Some(3.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.window_override("firefox").weight, Some(3.0));
+        assert_eq!(cfg.window_override("foot").weight, Some(1.0));
     }
 }

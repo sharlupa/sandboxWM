@@ -2,8 +2,10 @@ pub mod backend_drm;
 pub mod config;
 pub mod input;
 pub mod output_manager;
+pub mod overlay;
 pub mod physics;
 pub mod render;
+pub mod sandbox;
 pub mod screencopy;
 pub mod session;
 pub mod state;
@@ -12,7 +14,6 @@ pub mod xwm;
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::winit::{self, WinitEvent};
-use smithay::desktop::space::render_output;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
@@ -23,6 +24,8 @@ use std::sync::Arc;
 use crate::state::{AppState, ClientState};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_panic_hook();
+
     // Определяем, где запущены: в TTY или в графической сессии
     let in_tty = std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_err();
 
@@ -130,6 +133,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Паника → stderr и `$XDG_STATE_HOME/sandboxWM/panic.log` (раньше путь был
+/// захардкожен в каталог репозитория и хук ставился только при старте XWayland).
+fn install_panic_hook() {
+    let dir = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".local").join("state"))
+        })
+        .map(|d| d.join("sandboxWM"));
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("PANIC: {info}\n\nbacktrace:\n{bt}\n");
+        eprintln!("{msg}");
+        if let Some(dir) = &dir {
+            use std::io::Write as _;
+            let _ = std::fs::create_dir_all(dir);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("panic.log"))
+            {
+                let _ = f.write_all(msg.as_bytes());
+            }
+        }
+    }));
+}
+
 fn run_winit(
     mut event_loop: EventLoop<AppState>,
     mut display: Display<AppState>,
@@ -177,6 +208,8 @@ fn run_winit(
     output.set_preferred(mode);
     state.space.map_output(&output, (0, 0));
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    // Выход есть — можно грузить сессию (пол/камера зависят от размера экрана).
+    state.on_output_ready();
 
     // DMA-BUF (zero-copy) for winit/nested mode.
     //
@@ -243,19 +276,15 @@ fn run_winit(
                     return;
                 }
 
-                // ── Смещение камеры (Tiling = (0,0), Physics = Lerp) ─────────────
-                // map_output смещает вид: world = screen + camera_offset.
+                // map_output смещает вид Space: world = screen + camera_offset
+                // (output enter/leave для окон в физике).
                 state.space.map_output(
                     &output,
                     (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
                 );
-                if state.layout_mode == crate::state::LayoutMode::Physics {
-                    // Шаг физики продвигает симуляцию и применяет трансформы
-                    // тел к окнам. Держит needs_render поднятым, пока тела
-                    // двигаются; когда всё улеглось — рендер уснёт.
-                    state.step_physics();
-                    state.sync_x11_with_physics();
-                }
+                // Шаг физики (no-op в тайлинге): держит needs_render поднятым,
+                // пока тела двигаются; когда всё улеглось — рендер засыпает.
+                state.step_physics();
 
                 // Process deferred layout (resize, winit window resize).
                 // This runs at most once per frame (~60 Hz) instead of
@@ -267,35 +296,11 @@ fn run_winit(
 
                 if state.needs_render {
                     let age = backend.buffer_age().unwrap_or(0);
-                    let render_res = if let Ok((renderer, mut fb)) = backend.bind() {
-                        if state.layout_mode == crate::state::LayoutMode::Physics {
-                            let elements = crate::render::collect_physics_elements(renderer, state);
-                            // age=0 → полный redraw: иначе при buffer-age>1
-                            // на мгновение видна «копия» окна с прошлого кадра.
-                            Some(damage_tracker.render_output(
-                                renderer,
-                                &mut fb,
-                                0,
-                                &elements,
-                                [0.08, 0.08, 0.12, 1.0],
-                            ))
-                        } else {
-                            let custom: &[smithay::backend::renderer::element::solid::SolidColorRenderElement] = &[];
-                            Some(render_output(
-                                &output,
-                                renderer,
-                                &mut fb,
-                                1.0,
-                                age,
-                                [&state.space],
-                                custom,
-                                &mut damage_tracker,
-                                [0.08, 0.08, 0.12, 1.0],
-                            ))
-                        }
-                    } else {
-                        None
-                    };
+                    let clear = state.background_color();
+                    let render_res = backend.bind().ok().map(|(renderer, mut fb)| {
+                        let elements = crate::render::frame_elements(renderer, state, &output);
+                        damage_tracker.render_output(renderer, &mut fb, age, &elements, clear)
+                    });
 
                     if let Some(res) = render_res {
                         match res {
@@ -310,6 +315,7 @@ fn run_winit(
                     }
 
                     state.space.refresh();
+                    state.popup_manager.cleanup();
                     let now = state.clock.now();
                     state.space.elements().for_each(|window| {
                         window.send_frame(
@@ -323,14 +329,9 @@ fn run_winit(
                 }
 
                 // Only request the next frame when there is something to
-                // draw. Previously this was UNCONDITIONAL — it kept a
-                // Redraw event permanently in the winit event queue, so
-                // calloop's dispatch(16ms) NEVER actually blocked, turning
-                // the main loop into a busy-spin that constantly ran
-                // dispatch_clients + flush_clients even on a fully idle
-                // desktop.
-                let physics_moving = state.physics.as_ref().map_or(false, |p| p.any_moving()) || state.drag_body.is_some();
-                if state.needs_render || state.layout_dirty || physics_moving {
+                // draw — otherwise a permanent Redraw kept calloop's
+                // dispatch() from ever blocking (busy-spin on an idle desktop).
+                if state.needs_render || state.layout_dirty || state.physics_animating() {
                     backend.window().request_redraw();
                 }
             }
@@ -345,10 +346,11 @@ fn run_winit(
         event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)?;
         display.dispatch_clients(&mut state)?;
         display.flush_clients()?;
-        if state.needs_render || state.layout_dirty {
+        if state.needs_render || state.layout_dirty || state.physics_animating() {
             backend.borrow().window().request_redraw();
         }
     }
 
+    state.save_session();
     Ok(())
 }
