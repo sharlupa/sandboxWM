@@ -36,6 +36,7 @@ render_elements! {
     Cursor=SolidColorRenderElement,
     Physics=PhysicsElement,
     Overlay=crate::overlay::OverlayElement,
+    Mesh=crate::mesh_render::MeshElement,
 }
 
 /// Аффинное преобразование 2D: `x' = a·x + c·y + e`, `y' = b·x + d·y + f`.
