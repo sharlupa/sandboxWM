@@ -250,7 +250,16 @@ impl ScreencopyState {
     }
 
     fn remove_frame(&self, frame: &ZwlrScreencopyFrameV1) {
-        self.frames().retain(|f| f.frame != *frame);
+        self.frames().retain(|f| {
+            if f.frame != *frame {
+                return true;
+            }
+            // Клиент бросил кадр, не дождавшись ready: без copy — сам передумал
+            // (portal-wlr так делает, когда у PipeWire нет буфера или сменились
+            // параметры потока), с copy — не дождался изменений на экране.
+            sc_debug!("кадр уничтожен клиентом, copy был: {}", f.buffer.is_some());
+            false
+        });
     }
 }
 
