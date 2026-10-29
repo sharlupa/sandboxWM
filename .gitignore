@@ -1,2 +1,8 @@
 /target
+
+# Настройки редакторов и AI-инструментов
+.cursor/
 .zcode/
+.claude/
+.vscode/
+.idea/
