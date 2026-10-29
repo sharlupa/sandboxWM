@@ -1883,6 +1883,90 @@ impl AppState {
         }
     }
 
+    /// Super+C: собрать все окна, разбросанные по холсту, в кадр.
+    ///
+    /// Окна выстраиваются сеткой на полу (ряды снизу вверх) в текущем месте
+    /// камеры — ровно, без скорости; разрезанные — вместе со своими
+    /// кусками. Если сетка не помещается в кадр, камера отдаляется.
+    pub fn gather_windows(&mut self) {
+        if self.layout_mode != LayoutMode::Physics || self.transition.is_some() {
+            return;
+        }
+        let Some(floor_y) = self.physics.as_ref().map(|p| p.floor_y() as f64) else {
+            return;
+        };
+        // Окна в порядке стека; размер — охват всех кусков окна.
+        let windows: Vec<(Window, Rectangle<f64, Logical>)> = self
+            .space
+            .elements()
+            .filter(|w| !Self::is_override_redirect(w))
+            .filter_map(|w| {
+                let bounds = self
+                    .pieces_of(w)
+                    .map(|p| p.rect)
+                    .reduce(|a, b| a.merge(b))?;
+                Some((w.clone(), bounds))
+            })
+            .collect();
+        if windows.is_empty() {
+            return;
+        }
+        self.cancel_interactions();
+
+        const GAP: f64 = 40.0;
+        let n = windows.len();
+        let cols = (n as f64).sqrt().ceil().max(1.0) as usize;
+        let rows: Vec<&[(Window, Rectangle<f64, Logical>)]> = windows.chunks(cols).collect();
+        let row_width = |row: &[(Window, Rectangle<f64, Logical>)]| -> f64 {
+            row.iter().map(|(_, r)| r.size.w).sum::<f64>() + GAP * (row.len() as f64 - 1.0)
+        };
+        let row_height = |row: &[(Window, Rectangle<f64, Logical>)]| -> f64 {
+            row.iter().map(|(_, r)| r.size.h).fold(0.0, f64::max)
+        };
+        let total_w = rows.iter().map(|r| row_width(r)).fold(0.0, f64::max);
+        let total_h: f64 =
+            rows.iter().map(|r| row_height(r)).sum::<f64>() + GAP * (rows.len() as f64 - 1.0);
+
+        // Камера: сетка целиком в кадре, пол у нижнего края.
+        let screen = self.output_size();
+        let (sw, sh) = (screen.w as f64, screen.h as f64);
+        let fit = ((sw * 0.9) / total_w).min((sh * 0.85) / (total_h + GAP));
+        let zoom = self
+            .camera_zoom
+            .min(fit)
+            .clamp(self.config.physics.zoom_min, self.config.physics.zoom_max);
+        let center_x = self.camera_offset.0 + sw / (2.0 * self.camera_zoom);
+        let cam = (center_x - sw / (2.0 * zoom), floor_y + GAP - sh / zoom);
+        self.camera_zoom = zoom;
+        self.camera_offset = cam;
+        self.target_camera_offset = cam;
+
+        // Раскладка: ряды снизу вверх, каждый ряд по центру.
+        let mut bottom = floor_y - 1.0;
+        for row in rows {
+            let mut x = center_x - row_width(row) * 0.5;
+            for (window, bounds) in row {
+                let pieces: Vec<(u32, (f64, f64))> =
+                    self.pieces_of(window).map(|p| (p.id, p.center())).collect();
+                if let Some(phys) = self.physics.as_mut() {
+                    for (id, (pcx, pcy)) in pieces {
+                        // Куски сохраняют взаимное расположение внутри окна.
+                        let cx = x + (pcx - bounds.loc.x);
+                        let cy = bottom - bounds.size.h + (pcy - bounds.loc.y);
+                        phys.set_piece_transform(id, v2(cx, cy), 0.0);
+                        phys.set_piece_velocity(id, Vector::ZERO, 0.0);
+                    }
+                }
+                x += bounds.size.w + GAP;
+            }
+            bottom -= row_height(row) + GAP;
+        }
+        self.last_physics_tick = None;
+        self.sync_space_positions();
+        self.needs_render = true;
+        println!("[physics] окна собраны: {n}");
+    }
+
     /// Super+Z: склеивает разрезанное окно обратно в один кусок.
     pub fn restore_focused_window(&mut self) {
         let Some(window) = self.get_focused_window() else {

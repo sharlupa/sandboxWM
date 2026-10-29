@@ -303,7 +303,7 @@ fn handle_key(
     }
 
     type Action = fn(&mut AppState);
-    let actions: [(&str, Action); 15] = [
+    let actions: [(&str, Action); 16] = [
         (&ctrl.toggle_physics, AppState::toggle_physics),
         // Режимы гравитации (концепт §1).
         (&ctrl.gravity_normal, AppState::gravity_normal),
@@ -325,6 +325,7 @@ fn handle_key(
         (&ctrl.unlink_window, AppState::unlink_focused),
         (&ctrl.toggle_soft, AppState::toggle_soft_focused),
         (&ctrl.restore_window, AppState::restore_focused_window),
+        (&ctrl.gather_windows, AppState::gather_windows),
         (&ctrl.save_session, AppState::save_session),
         (&ctrl.close_window, close_focused),
     ];

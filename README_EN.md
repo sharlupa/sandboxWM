@@ -57,6 +57,7 @@ Every shortcut uses `Super`. Keys are configurable in `[controls]`.
 | `Super+A` / `Super+D` | Hold to spin the focused window |
 | `Super+wheel`, `Super+-` / `Super+=` | Zoom around the cursor |
 | `Super+0` | Reset the camera |
+| `Super+C` | Gather all scattered windows into view: a grid on the floor, the camera adjusts |
 | Middle button + drag | Pan the camera |
 
 ### Tools

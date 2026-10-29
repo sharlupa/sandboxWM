@@ -337,6 +337,8 @@ pub struct ControlsConfig {
     pub toggle_soft: String,
     /// Вернуть форму окна и склеить разрезанные части.
     pub restore_window: String,
+    /// Собрать все разбросанные окна в кадр (физика).
+    pub gather_windows: String,
     /// Сохранить сессию прямо сейчас.
     pub save_session: String,
 }
@@ -367,6 +369,7 @@ impl Default for ControlsConfig {
             unlink_window: "u".into(),
             toggle_soft: "j".into(),
             restore_window: "z".into(),
+            gather_windows: "c".into(),
             save_session: "F5".into(),
         }
     }
