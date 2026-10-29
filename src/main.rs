@@ -1,5 +1,6 @@
 pub mod backend_drm;
 pub mod config;
+pub mod cursor;
 pub mod input;
 pub mod mesh_render;
 pub mod output_manager;
