@@ -419,6 +419,7 @@ fn handle_pointer_motion(state: &mut AppState, mut x: f64, mut y: f64, serial: S
         if state.dragging {
             state.needs_render = true;
         }
+        reset_cursor_over_desktop(state, focus.is_none());
         if let Some(ptr) = state.seat.get_pointer() {
             ptr.motion(
                 state,
@@ -460,6 +461,7 @@ fn handle_pointer_motion(state: &mut AppState, mut x: f64, mut y: f64, serial: S
     }
 
     let under = tiling_focus(state, pos);
+    reset_cursor_over_desktop(state, under.is_none());
     if let Some(ptr) = state.seat.get_pointer() {
         ptr.motion(
             state,
@@ -471,6 +473,19 @@ fn handle_pointer_motion(state: &mut AppState, mut x: f64, mut y: f64, serial: S
             },
         );
         ptr.frame(state);
+    }
+}
+
+/// Над пустым столом — стандартный курсор: клиент после leave свой курсор
+/// не сбрасывает, и над фоном оставался, например, I-beam терминала.
+fn reset_cursor_over_desktop(state: &mut AppState, nothing_under: bool) {
+    use smithay::input::pointer::CursorImageStatus;
+    if nothing_under
+        && !pointer_grabbed(state)
+        && !matches!(&state.cursor_status, CursorImageStatus::Named(i) if *i == Default::default())
+    {
+        state.cursor_status = CursorImageStatus::default_named();
+        state.needs_render = true;
     }
 }
 

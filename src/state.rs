@@ -655,6 +655,13 @@ impl CompositorHandler for AppState {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
     fn commit(&mut self, surface: &WlSurface) {
+        // Поверхность курсора: wl_surface.offset сдвигает hotspot.
+        if let CursorImageStatus::Surface(cursor) = &self.cursor_status {
+            if cursor == surface {
+                crate::cursor::apply_hotspot_delta(surface);
+                self.needs_render = true;
+            }
+        }
         self.popup_manager.commit(surface);
         self.popup_manager.cleanup();
         // Обновляем буферы рендера
@@ -951,6 +958,7 @@ impl SeatHandler for AppState {
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
+        self.needs_render = true;
     }
 }
 smithay::delegate_seat!(AppState);

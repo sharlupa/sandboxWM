@@ -180,6 +180,14 @@ fn run_winit(
     let mut backend_guard = backend.borrow_mut();
     let backend_ref = &mut *backend_guard;
     let backend_loop = backend.clone();
+    // Курсор нужен только для захвата экрана с overlay_cursor (на экране
+    // указатель рисует хост); screencopy общий с основным циклом, чтобы
+    // ожидающий кадр будил рендер и на неподвижном столе.
+    let mut cursor_renderer = crate::cursor::CursorRenderer::new();
+    let screencopy = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::screencopy::ScreencopyRenderer::new(),
+    ));
+    let screencopy_loop = screencopy.clone();
 
     // Создаём Output для winit окна
     let size = backend_ref.window_size();
@@ -211,6 +219,7 @@ fn run_winit(
     output.set_preferred(mode);
     state.space.map_output(&output, (0, 0));
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    let output_main = output.clone();
     // Выход есть — можно грузить сессию (пол/камера зависят от размера экрана).
     state.on_output_ready();
 
@@ -297,12 +306,44 @@ fn run_winit(
                     state.layout_dirty = false;
                 }
 
+                if screencopy_loop
+                    .borrow()
+                    .wants_render(&state.screencopy_state, &output)
+                {
+                    state.needs_render = true;
+                }
+
                 if state.needs_render {
                     let age = backend.buffer_age().unwrap_or(0);
                     let clear = state.background_color();
+                    // Элементы собираем до bind(): снимки мягких окон и захват
+                    // экрана рендерят в свои offscreen-текстуры.
+                    let renderer = backend.renderer();
+                    let mut elements = crate::render::frame_elements(renderer, state, &output);
+                    let cursor = cursor_renderer.elements(
+                        renderer,
+                        &mut state.cursor_status,
+                        state.pointer_location,
+                        1.0,
+                    );
+                    let cursor_count = cursor.len();
+                    elements.splice(0..0, cursor);
+                    screencopy_loop.borrow_mut().fulfill_pending(
+                        renderer,
+                        &state.screencopy_state,
+                        &output,
+                        &elements,
+                        cursor_count,
+                        clear,
+                    );
                     let render_res = backend.bind().ok().map(|(renderer, mut fb)| {
-                        let elements = crate::render::frame_elements(renderer, state, &output);
-                        damage_tracker.render_output(renderer, &mut fb, age, &elements, clear)
+                        damage_tracker.render_output(
+                            renderer,
+                            &mut fb,
+                            age,
+                            &elements[cursor_count..],
+                            clear,
+                        )
                     });
 
                     if let Some(res) = render_res {
@@ -328,6 +369,7 @@ fn run_winit(
                             |_, _| Some(output.clone()),
                         );
                     });
+                    crate::cursor::send_frames(&state.cursor_status, &output, now);
                     state.needs_render = false;
                 }
 
@@ -352,7 +394,10 @@ fn run_winit(
         // Redraw в winit приходит только при изменениях — автосохранение
         // проверяем и в простое.
         state.maybe_autosave(std::time::Instant::now());
-        if state.needs_render || state.layout_dirty || state.physics_animating() {
+        let capture = screencopy
+            .borrow()
+            .wants_render(&state.screencopy_state, &output_main);
+        if state.needs_render || state.layout_dirty || state.physics_animating() || capture {
             backend.borrow().window().request_redraw();
         }
     }
