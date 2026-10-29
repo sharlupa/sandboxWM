@@ -323,17 +323,17 @@ fn handle_key(
     }
 
     let arrows = [
-        (&ctrl.camera_right, (step, 0.0), true),
-        (&ctrl.camera_left, (-step, 0.0), false),
-        (&ctrl.camera_up, (0.0, -step), false),
-        (&ctrl.camera_down, (0.0, step), true),
+        (&ctrl.camera_right, (1.0, 0.0)),
+        (&ctrl.camera_left, (-1.0, 0.0)),
+        (&ctrl.camera_up, (0.0, -1.0)),
+        (&ctrl.camera_down, (0.0, 1.0)),
     ];
-    for (name, (dx, dy), forward) in arrows {
+    for (name, (dx, dy)) in arrows {
         if mk(name) {
             if app_state.layout_mode == LayoutMode::Physics {
-                app_state.move_camera(dx, dy);
+                app_state.move_camera(dx * step, dy * step);
             } else {
-                app_state.focus_next(forward);
+                app_state.focus_direction(dx, dy);
             }
             return FilterResult::Intercept(());
         }

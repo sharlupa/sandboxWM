@@ -548,6 +548,43 @@ impl AppState {
         self.focus_window(&target);
     }
 
+    /// Фокус на ближайшее окно в направлении `(dx, dy)` (тайлинг, Super+стрелки).
+    /// Если в ту сторону окон нет — по кругу, как раньше.
+    pub fn focus_direction(&mut self, dx: f64, dy: f64) {
+        let Some(current) = self.get_focused_window() else {
+            self.focus_next(true);
+            return;
+        };
+        let Some(cur) = self.space.element_geometry(&current) else {
+            return;
+        };
+        let center = |r: Rectangle<i32, Logical>| {
+            (
+                r.loc.x as f64 + r.size.w as f64 * 0.5,
+                r.loc.y as f64 + r.size.h as f64 * 0.5,
+            )
+        };
+        let (cx, cy) = center(cur);
+        let best = self
+            .space
+            .elements()
+            .filter(|w| **w != current)
+            .filter(|w| !w.x11_surface().map_or(false, |x| x.is_override_redirect()))
+            .filter_map(|w| {
+                let (x, y) = center(self.space.element_geometry(w)?);
+                let along = (x - cx) * dx + (y - cy) * dy;
+                let across = ((x - cx) * dy - (y - cy) * dx).abs();
+                // Окна «впереди»; боковое смещение штрафуется сильнее.
+                (along > 1.0).then(|| (w.clone(), along + across * 2.0))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(w, _)| w);
+        match best {
+            Some(w) => self.focus_window(&w),
+            None => self.focus_next(dx + dy > 0.0),
+        }
+    }
+
     /// Get currently focused window
     pub fn get_focused_window(&self) -> Option<Window> {
         let kbd = self.seat.get_keyboard()?;
