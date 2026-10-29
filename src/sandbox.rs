@@ -738,6 +738,18 @@ impl AppState {
             self.set_pieces_enabled(true);
             self.last_physics_tick = None;
             self.restore_physics_sizes();
+            // Окна, открытые во время анимации: их коммит пришёлся на переход,
+            // а статичный клиент второго коммита может и не прислать.
+            let orphans: Vec<Window> = self
+                .space
+                .elements()
+                .filter(|w| !Self::is_override_redirect(w))
+                .filter(|w| self.pieces_of(w).next().is_none())
+                .cloned()
+                .collect();
+            for window in orphans {
+                self.physics_spawn_window(&window);
+            }
             self.sync_space_positions();
         }
         self.needs_render = true;

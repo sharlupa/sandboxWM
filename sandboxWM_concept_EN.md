@@ -6,6 +6,8 @@ This is a unique window manager for Wayland that combines infinite tiling with a
 
 Developed with AI: This project's concept, architecture, and current codebase are developed with the assistance of AI coding tools.
 
+> **Implementation status (0.2.0):** every item of the concept below is implemented. See the [README](./README_EN.md#concept--implementation) for how and with which keys. Differences from the technical plan: rendering uses GLES (Smithay) with custom shaders instead of a separate wgpu/glow renderer; the knife cuts along the window's axes (each part is a rectangular crop of the buffer); X11 windows do not rotate in physics mode.
+
 ## Technical Stack:
 
 - **Programming Language:** Rust
