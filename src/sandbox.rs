@@ -509,6 +509,11 @@ impl AppState {
         };
         let floating = !self.window_floating(&window);
         self.set_window_floating(&window, floating);
+        println!(
+            "[physics] невесомость окна {:?}: {}",
+            window_app_id(&window),
+            if floating { "вкл" } else { "выкл" }
+        );
         self.needs_render = true;
     }
 
@@ -755,10 +760,12 @@ impl AppState {
 
     /// Один кадр физического режима. Вызывается из рендер-цикла.
     pub fn step_physics(&mut self) {
+        let now = Instant::now();
+        // Автосохранение и ожидание восстанавливаемых окон — в любом режиме.
+        self.maybe_autosave(now);
         if self.layout_mode != LayoutMode::Physics {
             return;
         }
-        let now = Instant::now();
         if let Some(t) = self.transition.as_ref() {
             let p = t.progress(now);
             let e = ease(p);
@@ -822,7 +829,6 @@ impl AppState {
         if steps > 0 || camera_moved {
             self.sync_space_positions();
         }
-        self.maybe_autosave(now);
         if moving || camera_moved {
             self.needs_render = true;
         }
@@ -1872,7 +1878,7 @@ impl AppState {
         }
     }
 
-    fn maybe_autosave(&mut self, now: Instant) {
+    pub fn maybe_autosave(&mut self, now: Instant) {
         if self.autosave.as_mut().map_or(false, |a| a.due(now)) {
             self.save_session();
         }

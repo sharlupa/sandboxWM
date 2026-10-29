@@ -406,9 +406,18 @@ impl WindowPhysics {
         }
     }
 
-    /// Истинно, если хоть одно тело ещё движется (рендер держит кадры).
+    /// Истинно, если симуляция ещё не успокоилась (рендер держит кадры).
+    ///
+    /// Критерий — «тело не спит», а не «скорость ≠ 0»: только что созданное
+    /// тело имеет нулевую скорость, и если в этом кадре шаг не успел
+    /// выполниться, winit-рендер засыпал, а окно зависало в точке спавна до
+    /// следующего события ввода. rapier усыпляет успокоившиеся тела сам.
     pub fn any_moving(&self) -> bool {
-        self.drag.is_some() || self.world.bodies.iter().any(|(_, b)| b.is_moving())
+        self.drag.is_some()
+            || self.spin.is_some()
+            || self.world.bodies.iter().any(|(_, b)| {
+                (b.is_dynamic() && !b.is_sleeping()) || (b.is_kinematic() && b.is_moving())
+            })
     }
 
     // ── Режимы гравитации ──────────────────────────────────────────
@@ -1674,6 +1683,19 @@ mod tests {
         run(&mut p, 2.0);
         let (c, _) = p.piece_transform(id).unwrap();
         assert!(c.y.abs() < 1.0);
+    }
+
+    #[test]
+    fn floating_window_spins_in_place() {
+        let mut p = world();
+        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 200.0, 100.0, 1.0, false);
+        p.set_floating(id, true);
+        p.set_spin(Some((id, 2.0)));
+        run(&mut p, 0.5);
+        p.set_spin(None);
+        let (c, a) = p.piece_transform(id).unwrap();
+        assert!((a - 1.0).abs() < 0.1, "angle {a}");
+        assert!(c.length() < 1.0, "center moved {c:?}");
     }
 
     #[test]

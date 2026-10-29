@@ -346,6 +346,9 @@ fn run_winit(
         event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)?;
         display.dispatch_clients(&mut state)?;
         display.flush_clients()?;
+        // Redraw в winit приходит только при изменениях — автосохранение
+        // проверяем и в простое.
+        state.maybe_autosave(std::time::Instant::now());
         if state.needs_render || state.layout_dirty || state.physics_animating() {
             backend.borrow().window().request_redraw();
         }
