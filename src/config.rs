@@ -102,7 +102,33 @@ impl Config {
             }
         }
 
-        Ok(toml::Value::Table(merged).try_into()?)
+        let mut cfg: Config = toml::Value::Table(merged).try_into()?;
+        cfg.sanitize();
+        Ok(cfg)
+    }
+
+    /// Чинит значения, на которых код иначе упал бы (`clamp` с min > max
+    /// паникует и в release) или повёл бы себя бессмысленно.
+    fn sanitize(&mut self) {
+        let p = &mut self.physics;
+        if !(p.zoom_min.is_finite() && p.zoom_min > 0.0) {
+            p.zoom_min = PhysicsConfig::default().zoom_min;
+        }
+        if !(p.zoom_max.is_finite() && p.zoom_max > 0.0) {
+            p.zoom_max = PhysicsConfig::default().zoom_max;
+        }
+        if p.zoom_min > p.zoom_max {
+            std::mem::swap(&mut p.zoom_min, &mut p.zoom_max);
+        }
+        if !(p.physics_dt.is_finite() && p.physics_dt > 0.0) {
+            p.physics_dt = PhysicsConfig::default().physics_dt;
+        }
+        if !p.camera_lerp.is_finite() {
+            p.camera_lerp = PhysicsConfig::default().camera_lerp;
+        }
+        if p.floor_y.is_some_and(|y| !y.is_finite()) {
+            p.floor_y = None;
+        }
     }
 
     fn find_config_dir() -> Option<PathBuf> {
@@ -351,6 +377,19 @@ impl ControlsConfig {
             .unwrap_or(false)
     }
 
+    /// Цифровой бинд по физической клавише верхнего ряда (evdev KEY_1..KEY_0):
+    /// работает с Shift и на раскладках, где цифры на втором уровне (AZERTY).
+    pub fn matches_digit_key(name: &str, evdev: u32) -> bool {
+        // KEY_1 = 2 … KEY_9 = 10, KEY_0 = 11.
+        let digit = match evdev {
+            2..=10 => (b'1' + (evdev - 2) as u8) as char,
+            11 => '0',
+            _ => return false,
+        };
+        let name = name.trim();
+        name.len() == 1 && name.starts_with(digit)
+    }
+
     pub fn is_quit(&self, keysym: u32) -> bool {
         self.quit.iter().any(|k| Self::matches_key(k, keysym))
     }
@@ -395,18 +434,16 @@ fn keysym_name(keysym: u32) -> Option<&'static str> {
         xkb::KEY_F10 => "F10",
         xkb::KEY_F11 => "F11",
         xkb::KEY_F12 => "F12",
-        // Цифры и их shifted-варианты на US-раскладке: Super+Shift+1 даёт
-        // keysym `exclam`, но пользователь думает о клавише «1».
-        xkb::KEY_0 | xkb::KEY_parenright => "0",
-        xkb::KEY_1 | xkb::KEY_exclam => "1",
-        xkb::KEY_2 | xkb::KEY_at => "2",
-        xkb::KEY_3 | xkb::KEY_numbersign => "3",
-        xkb::KEY_4 | xkb::KEY_dollar => "4",
-        xkb::KEY_5 | xkb::KEY_percent => "5",
-        xkb::KEY_6 | xkb::KEY_asciicircum => "6",
-        xkb::KEY_7 | xkb::KEY_ampersand => "7",
-        xkb::KEY_8 | xkb::KEY_asterisk => "8",
-        xkb::KEY_9 | xkb::KEY_parenleft => "9",
+        xkb::KEY_0 => "0",
+        xkb::KEY_1 => "1",
+        xkb::KEY_2 => "2",
+        xkb::KEY_3 => "3",
+        xkb::KEY_4 => "4",
+        xkb::KEY_5 => "5",
+        xkb::KEY_6 => "6",
+        xkb::KEY_7 => "7",
+        xkb::KEY_8 => "8",
+        xkb::KEY_9 => "9",
         _ => return None,
     })
 }
@@ -815,6 +852,19 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
         let cfg = Config::load_from_dir(&dir).unwrap();
         assert_eq!(cfg.controls.toggle_physics, "g");
+    }
+
+    #[test]
+    fn sanitize_fixes_inverted_zoom_and_digits() {
+        let mut cfg = Config::default();
+        cfg.physics.zoom_min = 5.0;
+        cfg.physics.zoom_max = 0.5;
+        cfg.sanitize();
+        assert!(cfg.physics.zoom_min <= cfg.physics.zoom_max);
+        assert!(ControlsConfig::matches_digit_key("1", 2));
+        assert!(ControlsConfig::matches_digit_key("0", 11));
+        assert!(!ControlsConfig::matches_digit_key("1", 3));
+        assert!(!ControlsConfig::matches_digit_key("q", 16));
     }
 
     #[test]

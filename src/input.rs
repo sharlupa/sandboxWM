@@ -46,7 +46,8 @@ fn handle_keyboard<B: InputBackend>(state: &mut AppState, event: B::KeyboardKeyE
                 .raw_latin_sym_or_raw_current_sym()
                 .map(u32::from)
                 .unwrap_or(modified);
-            handle_key(app_state, modifiers, modified, base, key_state)
+            let evdev = keysym.raw_code().raw().saturating_sub(8);
+            handle_key(app_state, modifiers, modified, base, evdev, key_state)
         },
     );
 }
@@ -169,6 +170,7 @@ fn super_held(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
+/// Указатель захвачен (неявный захват клика, popup-grab, DnD).
 fn pointer_grabbed(state: &AppState) -> bool {
     state
         .seat
@@ -184,6 +186,7 @@ fn handle_key(
     modifiers: &smithay::input::keyboard::ModifiersState,
     keysym: u32,
     base: u32,
+    evdev: u32,
     key_state: KeyState,
 ) -> FilterResult<()> {
     // Ctrl+Alt+F1..F12 → switch virtual terminal (TTY / libseat mode).
@@ -214,16 +217,26 @@ fn handle_key(
     }
 
     // Клавиши внутри активного инструмента (материал 1–4, Delete, Esc) —
-    // без Super, чтобы рисовать было удобно.
+    // без Super, чтобы рисовать было удобно. Только в физике: в тайлинге
+    // инструментов нет, и клавиши принадлежат клиенту.
     if key_state == KeyState::Pressed
         && !modifiers.logo
+        && app_state.layout_mode == LayoutMode::Physics
         && app_state.tool_active()
-        && app_state.tool_key(keysym)
+        && app_state.tool_key(keysym, evdev)
     {
         return FilterResult::Intercept(());
     }
 
-    let mk = |name: &str| crate::config::ControlsConfig::matches_key(name, base);
+    // Бинд совпадает по символу с модификаторами, по латинскому символу
+    // без них (кириллица) или — для цифр — по физической клавише
+    // (AZERTY: «1» на первом уровне даёт `&`).
+    let mk = |name: &str| {
+        use crate::config::ControlsConfig as C;
+        C::matches_key(name, keysym)
+            || C::matches_key(name, base)
+            || C::matches_digit_key(name, evdev)
+    };
 
     if app_state.layout_mode == LayoutMode::Physics {
         if modifiers.logo && key_state == KeyState::Pressed {
@@ -374,20 +387,30 @@ fn physics_pointer_focus(
     Option<(WlSurface, Point<f64, Logical>)>,
     Point<f64, Logical>,
 ) {
-    if pointer_grabbed(state) {
+    // Что под курсором прямо сейчас: (поверхность, её начало, точка) в
+    // виртуальном пространстве окна под курсором.
+    let hover = state.physics_pointer_target(x, y).map(|(target, local)| {
+        let point = local + target.window.geometry().loc.to_f64();
+        let surface = state.physics_surface_under(&target.window, local);
+        (surface, point)
+    });
+    if !state.forwarded_buttons.is_empty() {
         if let Some(target) = state.pointer_grab_target.clone() {
             if let Some(local) = state.physics_target_point(&target, x, y) {
-                let geo = target.window.geometry().loc.to_f64();
-                return (None, local + geo);
+                let location = local + target.window.geometry().loc.to_f64();
+                // Неявный захват клика фокус игнорирует и считает от окна
+                // нажатия; popup- и DnD-захваты берут фокус отсюда — начало
+                // подбираем так, чтобы location − начало = точке в поверхности
+                // под курсором.
+                let focus = hover.and_then(|(surface, point)| {
+                    surface.map(|(s, origin)| (s, location - (point - origin)))
+                });
+                return (focus, location);
             }
         }
     }
-    match state.physics_pointer_target(x, y) {
-        Some((target, local)) => {
-            let geo = target.window.geometry().loc.to_f64();
-            let focus = state.physics_surface_under(&target.window, local);
-            (focus, local + geo)
-        }
+    match hover {
+        Some((surface, point)) => (surface, point),
         None => (None, (x, y).into()),
     }
 }
@@ -507,6 +530,11 @@ fn tiling_focus(
 }
 
 /// Shared click-to-focus + Super+LMB tile resize (Tiling) / drag body (Physics)
+///
+/// Отпускание всегда идёт туда же, куда ушло нажатие: кнопка, нажатая для
+/// клиента, отпускается у клиента (даже если в это время включили инструмент
+/// или сменили режим), а нажатие, съеденное WM, не даёт клиенту «лишнего»
+/// release без press.
 fn handle_pointer_button(
     state: &mut AppState,
     button: u32,
@@ -517,6 +545,14 @@ fn handle_pointer_button(
     let pos = state.pointer_location;
     let super_down = super_held(state);
     let pressed = btn_state == ButtonState::Pressed;
+
+    if !pressed && state.forwarded_buttons.remove(&button) {
+        forward_button(state, button, btn_state, serial, time_msec, false);
+        if state.forwarded_buttons.is_empty() {
+            state.pointer_grab_target = None;
+        }
+        return;
+    }
 
     if state.layout_mode == LayoutMode::Physics {
         // Средняя кнопка панорамирует камеру.
@@ -533,66 +569,49 @@ fn handle_pointer_button(
         if state.tool_button(button, pressed, pos.x, pos.y) {
             return;
         }
-        if button == BTN_LEFT {
-            if pressed && super_down {
-                let shift = state
-                    .seat
-                    .get_keyboard()
-                    .map(|k| k.modifier_state().shift)
-                    .unwrap_or(false);
-                // Super+Shift+ЛКМ — тянуть окно за край (мягкое тело);
-                // Super+ЛКМ — схватить и тащить окно.
-                let grabbed = if shift {
-                    state.soft_grab_begin(pos.x, pos.y)
-                } else {
-                    state.physics_drag_begin(pos.x, pos.y)
-                };
-                if let Some(win) = grabbed {
-                    state.focus_window(&win);
-                    state.needs_render = true;
-                    return;
-                }
-            } else if !pressed && (state.dragging || state.soft_grab_active()) {
-                state.physics_drag_end();
-                state.soft_grab_end();
+        if !pressed {
+            // Отпускание кнопки, нажатие которой съел WM (drag, захват края).
+            state.physics_drag_end();
+            state.soft_grab_end();
+            return;
+        }
+        if button == BTN_LEFT && super_down {
+            let shift = state
+                .seat
+                .get_keyboard()
+                .map(|k| k.modifier_state().shift)
+                .unwrap_or(false);
+            // Super+Shift+ЛКМ — тянуть окно за край (мягкое тело);
+            // Super+ЛКМ — схватить и тащить окно.
+            let grabbed = if shift {
+                state.soft_grab_begin(pos.x, pos.y)
+            } else {
+                state.physics_drag_begin(pos.x, pos.y)
+            };
+            if let Some(win) = grabbed {
+                state.focus_window(&win);
+                state.needs_render = true;
                 return;
             }
         }
-
-        let (focus, location) = physics_pointer_focus(state, pos.x, pos.y);
-        if let Some(ptr) = state.seat.get_pointer() {
-            ptr.motion(
-                state,
-                focus,
-                &MotionEvent {
-                    location,
-                    serial,
-                    time: time_msec,
-                },
-            );
+        if state.forwarded_buttons.is_empty() {
+            state.pointer_grab_target = state.physics_pointer_target(pos.x, pos.y).map(|(t, _)| t);
         }
-        if pressed {
-            let target = state.physics_pointer_target(pos.x, pos.y).map(|(t, _)| t);
-            if !pointer_grabbed(state) {
-                state.pointer_grab_target = target.clone();
-            }
-            click_focus(state, target.map(|t| t.window));
-        }
-        send_button(state, button, btn_state, serial, time_msec);
-        if !pressed && !pointer_grabbed(state) {
-            state.pointer_grab_target = None;
-        }
+        forward_button(state, button, btn_state, serial, time_msec, true);
+        state.forwarded_buttons.insert(button);
         return;
     }
 
-    // End resize on LMB release even if Super was released first
-    if button == BTN_LEFT && !pressed && state.resize_window.is_some() {
-        state.end_resize();
+    if !pressed {
+        // End resize on LMB release even if Super was released first.
+        if button == BTN_LEFT && state.resize_window.is_some() {
+            state.end_resize();
+        }
         return;
     }
 
     // Super + Left Mouse Button → start tile resize (TILING ONLY)
-    if button == BTN_LEFT && super_down && pressed {
+    if button == BTN_LEFT && super_down {
         if let Some(win) = state.space.element_under(pos).map(|(w, _)| w.clone()) {
             let geo = state.space.element_geometry(&win).unwrap_or_default();
             // Квадрант клика решает, какие края двигать.
@@ -610,23 +629,46 @@ fn handle_pointer_button(
         return;
     }
 
-    let under = tiling_focus(state, pos);
+    forward_button(state, button, btn_state, serial, time_msec, true);
+    state.forwarded_buttons.insert(button);
+}
+
+/// Отдаёт кнопку клиенту: motion с актуальным фокусом, фокус по клику
+/// (`focus_on_press`), button и frame.
+fn forward_button(
+    state: &mut AppState,
+    button: u32,
+    btn_state: ButtonState,
+    serial: Serial,
+    time: u32,
+    focus_on_press: bool,
+) {
+    let pos = state.pointer_location;
+    let (focus, location, window) = if state.layout_mode == LayoutMode::Physics {
+        let (focus, location) = physics_pointer_focus(state, pos.x, pos.y);
+        let window = state
+            .physics_pointer_target(pos.x, pos.y)
+            .map(|(t, _)| t.window);
+        (focus, location, window)
+    } else {
+        let window = state.space.element_under(pos).map(|(w, _)| w.clone());
+        (tiling_focus(state, pos), pos, window)
+    };
     if let Some(ptr) = state.seat.get_pointer() {
         ptr.motion(
             state,
-            under,
+            focus,
             &MotionEvent {
-                location: pos,
+                location,
                 serial,
-                time: time_msec,
+                time,
             },
         );
     }
-    if pressed {
-        let window = state.space.element_under(pos).map(|(w, _)| w.clone());
+    if focus_on_press && btn_state == ButtonState::Pressed {
         click_focus(state, window);
     }
-    send_button(state, button, btn_state, serial, time_msec);
+    send_button(state, button, btn_state, serial, time);
 }
 
 /// Фокус по клику (без лишних переключений для X11-попапов).

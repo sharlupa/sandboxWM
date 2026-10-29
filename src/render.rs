@@ -297,24 +297,14 @@ impl RenderElement<GlesRenderer> for PhysicsElement {
             .xf
             .then_after(&Affine::translation(self.local.loc.x, self.local.loc.y))
             .to_matrix();
-        // Локальные px → нормированные координаты текстуры.
-        let sx = src.size.w / self.local.size.w;
-        let sy = src.size.h / self.local.size.h;
-        let (ty, sy) = if tex.is_y_inverted() {
-            (src.loc.y + src.size.h, -sy)
-        } else {
-            (src.loc.y, sy)
-        };
-        let tex_matrix = Matrix3::new(
-            (sx / tex_size.w as f64) as f32,
-            0.0,
-            0.0,
-            0.0,
-            (sy / tex_size.h as f64) as f32,
-            0.0,
-            (src.loc.x / tex_size.w as f64) as f32,
-            (ty / tex_size.h as f64) as f32,
-            1.0,
+        // Локальные px → нормированные координаты текстуры (с учётом
+        // wl_surface.set_buffer_transform и y-inverted dmabuf).
+        let tex_matrix = texture_matrix(
+            src,
+            (self.local.size.w, self.local.size.h),
+            (tex_size.w, tex_size.h),
+            self.inner.transform(),
+            tex.is_y_inverted(),
         );
         let v = self.visible;
         let instances = [
@@ -330,14 +320,54 @@ impl RenderElement<GlesRenderer> for PhysicsElement {
     }
 }
 
+/// Матрица «локальные px квада (0..dest) → UV текстуры», как
+/// `build_texture_mat` в Smithay: масштаб в src, компенсация buffer
+/// transform, сдвиг на кроп src, нормировка. Для y-inverted текстуры
+/// `v → 1 − v` (у Smithay `−v`, что работает только с REPEAT-обёрткой).
+fn texture_matrix(
+    src: Rectangle<f64, Buffer>,
+    dest: (f64, f64),
+    texture: (i32, i32),
+    transform: Transform,
+    y_inverted: bool,
+) -> Matrix3<f32> {
+    use cgmath::{SquareMatrix, Vector2};
+    let dst_src = transform.transform_size(src.size);
+    let mut m = Matrix3::<f32>::identity();
+    m = Matrix3::from_nonuniform_scale(
+        (dst_src.w / dest.0.max(1e-6)) as f32,
+        (dst_src.h / dest.1.max(1e-6)) as f32,
+    ) * m;
+    let (w, h) = (dst_src.w as f32, dst_src.h as f32);
+    let translation = match transform {
+        Transform::Normal | Transform::Flipped90 => Vector2::new(0.0, 0.0),
+        Transform::_90 => Vector2::new(0.0, w),
+        Transform::_180 => Vector2::new(w, h),
+        Transform::_270 => Vector2::new(h, 0.0),
+        Transform::Flipped => Vector2::new(w, 0.0),
+        Transform::Flipped180 => Vector2::new(0.0, h),
+        Transform::Flipped270 => Vector2::new(h, w),
+    };
+    m = transform.matrix() * m;
+    m = Matrix3::from_translation(translation) * m;
+    m = Matrix3::from_translation(Vector2::new(src.loc.x as f32, src.loc.y as f32)) * m;
+    m = Matrix3::from_nonuniform_scale(
+        1.0 / texture.0.max(1) as f32,
+        1.0 / texture.1.max(1) as f32,
+    ) * m;
+    if y_inverted {
+        m = Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 1.0) * m;
+    }
+    m
+}
+
 /// Кэш id/commit физических элементов между кадрами.
 pub struct RenderCache {
     elements: HashMap<(Id, u32), CachedElement>,
     meshes: HashMap<u32, CachedMesh>,
     frame: u64,
-    overlay_id: Id,
-    overlay_print: u64,
-    overlay_commit: CommitCounter,
+    /// Слои оверлея: (id, отпечаток, commit).
+    overlays: [(Id, u64, CommitCounter); 3],
 }
 
 struct CachedMesh {
@@ -363,9 +393,7 @@ impl Default for RenderCache {
             elements: HashMap::new(),
             meshes: HashMap::new(),
             frame: 0,
-            overlay_id: Id::new(),
-            overlay_print: 0,
-            overlay_commit: CommitCounter::default(),
+            overlays: std::array::from_fn(|_| (Id::new(), 0, CommitCounter::default())),
         }
     }
 }
@@ -439,12 +467,13 @@ impl RenderCache {
         self.meshes.retain(|_, e| e.seen + 120 > frame);
     }
 
-    fn overlay_commit(&mut self, print: u64) -> (Id, CommitCounter) {
-        if print != self.overlay_print {
-            self.overlay_print = print;
-            self.overlay_commit.increment();
+    fn overlay_commit(&mut self, layer: usize, print: u64) -> (Id, CommitCounter) {
+        let (id, last, commit) = &mut self.overlays[layer];
+        if print != *last {
+            *last = print;
+            commit.increment();
         }
-        (self.overlay_id.clone(), self.overlay_commit)
+        (id.clone(), *commit)
     }
 }
 
@@ -582,14 +611,22 @@ pub fn collect_physics_elements(
     out
 }
 
-/// Оверлей физического режима (линии, верёвки, связи, превью, пол).
-fn overlay_element(state: &mut AppState) -> Option<CustomRenderElements> {
-    let geometry = state.overlay_geometry();
-    if geometry.is_empty() {
-        return None;
+/// Оверлей физического режима: интерфейс инструментов, мир, пол.
+fn overlay_elements(state: &mut AppState) -> Vec<CustomRenderElements> {
+    let layers = state.overlay_geometry();
+    let mut out = Vec::new();
+    for (layer, geometry) in layers.into_iter().enumerate() {
+        if geometry.is_empty() {
+            continue;
+        }
+        let (id, commit) = state
+            .render_cache
+            .overlay_commit(layer, geometry.fingerprint());
+        if let Some(e) = crate::overlay::OverlayElement::new(id, commit, geometry) {
+            out.push(CustomRenderElements::Overlay(e));
+        }
     }
-    let (id, commit) = state.render_cache.overlay_commit(geometry.fingerprint());
-    crate::overlay::OverlayElement::new(id, commit, geometry).map(CustomRenderElements::Overlay)
+    out
 }
 
 /// Все элементы кадра (без курсора), front-to-back. Общая точка для winit
@@ -608,10 +645,7 @@ pub fn frame_elements(
             .map(CustomRenderElements::Space)
             .collect();
     }
-    let mut elements = Vec::new();
-    if let Some(overlay) = overlay_element(state) {
-        elements.push(overlay);
-    }
+    let mut elements = overlay_elements(state);
     elements.extend(collect_physics_elements(renderer, state));
     elements
 }
@@ -619,6 +653,45 @@ pub fn frame_elements(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uv(m: &Matrix3<f32>, x: f32, y: f32) -> (f32, f32) {
+        let v = m * cgmath::Vector3::new(x, y, 1.0);
+        (v.x, v.y)
+    }
+
+    #[test]
+    fn texture_matrix_crops_flips_and_rotates() {
+        let src = Rectangle::new((0.0, 25.0).into(), (100.0, 50.0).into());
+        // Обычный буфер 100×100, кроп по Y 25..75, квад 200×100.
+        let m = texture_matrix(src, (200.0, 100.0), (100, 100), Transform::Normal, false);
+        assert_eq!(uv(&m, 0.0, 0.0), (0.0, 0.25));
+        assert_eq!(uv(&m, 200.0, 100.0), (1.0, 0.75));
+        // y-inverted: верх кропа — строка 75 снизу → v = 1 − 0.25.
+        let m = texture_matrix(src, (200.0, 100.0), (100, 100), Transform::Normal, true);
+        assert_eq!(uv(&m, 0.0, 0.0), (0.0, 0.75));
+        assert_eq!(uv(&m, 0.0, 100.0), (0.0, 0.25));
+        // Буфер 100×50 с transform 90: на экране 50×100.
+        let full = Rectangle::from_size((100.0, 50.0).into());
+        let m = texture_matrix(full, (50.0, 100.0), (100, 50), Transform::_90, false);
+        let corners = [
+            uv(&m, 0.0, 0.0),
+            uv(&m, 50.0, 0.0),
+            uv(&m, 0.0, 100.0),
+            uv(&m, 50.0, 100.0),
+        ];
+        for (u, v) in corners {
+            assert!((u - 0.0).abs() < 1e-5 || (u - 1.0).abs() < 1e-5, "u={u}");
+            assert!((v - 0.0).abs() < 1e-5 || (v - 1.0).abs() < 1e-5, "v={v}");
+        }
+        // Углы квада попадают в четыре разных угла текстуры.
+        let mut uniq: Vec<(i32, i32)> = corners
+            .iter()
+            .map(|(u, v)| (*u as i32, *v as i32))
+            .collect();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 4);
+    }
 
     #[test]
     fn affine_piece_maps_center_and_inverts() {

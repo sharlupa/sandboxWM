@@ -399,6 +399,13 @@ impl AppState {
     /// Убирает все куски окна (закрытие окна).
     pub fn physics_remove_window(&mut self, window: &Window) {
         let ids: Vec<u32> = self.pieces_of(window).map(|p| p.id).collect();
+        if let Some(phys) = self.physics.as_ref() {
+            if phys.drag_piece().is_some_and(|p| ids.contains(&p)) {
+                // Тащили закрывшееся окно — ховер клиентам больше не глушим.
+                self.dragging = false;
+            }
+        }
+        self.restore_tried.remove(window);
         for id in &ids {
             self.soft.remove(id);
             if self.soft_grab.as_ref().map_or(false, |(p, _)| p == id) {
@@ -434,6 +441,12 @@ impl AppState {
     /// Клиент поменял размер окна: куски следуют за ним. Неразрезанный
     /// кусок — это всё окно; разрезанные масштабируются пропорционально.
     pub fn physics_window_resized(&mut self, window: &Window) {
+        // В тайлинге клиент рисует тайловый размер — выключенные коллайдеры
+        // его не берут: при возврате в физику окну вернут прежний размер, а
+        // иначе тело включалось бы уже раздутым (в полу, куски — внахлёст).
+        if self.layout_mode != LayoutMode::Physics || self.transition.is_some() {
+            return;
+        }
         let size = window.geometry().size;
         if size.w <= 1 || size.h <= 1 {
             return;
@@ -729,6 +742,8 @@ impl AppState {
             self.target_camera_offset = (0.0, 0.0);
             self.camera_zoom = 1.0;
             self.layout_mode = LayoutMode::Tiling;
+            // Инструмент, включённый во время анимации, в тайлинге не нужен.
+            self.tool = Tool::None;
             self.recalculate_layout();
             println!("[physics] режим выключен, возврат к тайлингу");
         } else {
@@ -795,6 +810,7 @@ impl AppState {
         self.camera_pan_last_ptr = None;
         self.tool = Tool::None;
         self.pointer_grab_target = None;
+        self.soft_grab_end();
     }
 
     // ── Шаг симуляции ──────────────────────────────────────────────
@@ -983,7 +999,11 @@ impl AppState {
                 continue;
             }
             let main = self.main_piece(window).map(|p| p.id);
-            for piece in self.pieces_of(window) {
+            // Основной кусок первым: его попапы должны быть поверх остальных
+            // кусков окна (hit-test тоже отдаёт попапам приоритет).
+            let mut pieces: Vec<&Piece> = self.pieces_of(window).collect();
+            pieces.sort_by_key(|p| Some(p.id) != main);
+            for piece in pieces {
                 if let Some(xf) = self.piece_xf(piece) {
                     out.push(PieceDraw {
                         window: window.clone(),
@@ -999,14 +1019,19 @@ impl AppState {
         out
     }
 
-    /// Геометрия оверлея: пол, линии, верёвки, связи, превью инструментов.
-    pub fn overlay_geometry(&self) -> OverlayGeometry {
+    /// Геометрия оверлея тремя слоями, front-to-back: интерфейс инструментов
+    /// (превью, значок у курсора), мир (линии, верёвки, связи), пол. Слои —
+    /// отдельные render-элементы: значок, бегущий за курсором, перерисовывает
+    /// только свой прямоугольник, а не весь экран до пола.
+    pub fn overlay_geometry(&self) -> [OverlayGeometry; 3] {
+        let mut ui = OverlayGeometry::new();
         let mut g = OverlayGeometry::new();
+        let mut floor = OverlayGeometry::new();
         if self.layout_mode != LayoutMode::Physics {
-            return g;
+            return [ui, g, floor];
         }
         let Some(phys) = self.physics.as_ref() else {
-            return g;
+            return [ui, g, floor];
         };
         let cam = self.camera_offset;
         let zoom = self.camera_zoom;
@@ -1017,7 +1042,7 @@ impl AppState {
             let y = ((phys.floor_y() as f64 - cam.1) * zoom) as f32;
             if y > -10.0 && y < screen.h as f32 + 10.0 {
                 let color = crate::config::parse_color(&self.config.physics.floor_color);
-                g.segment(
+                floor.segment(
                     [-10.0, y + 1.5],
                     [screen.w as f32 + 10.0, y + 1.5],
                     3.0,
@@ -1108,13 +1133,13 @@ impl AppState {
                     let width = ((material.thickness(materials) as f64 * zoom) as f32).max(1.5);
                     let mut color = material.color(materials);
                     color[3] *= 0.8;
-                    g.polyline(&pts, width, color);
+                    ui.polyline(&pts, width, color);
                 }
-                self.tool_badge(&mut g, ptr, material.color(materials), 0);
+                self.tool_badge(&mut ui, ptr, material.color(materials), 0);
             }
             Tool::Knife { start, end } => {
                 if let Some(s) = start {
-                    g.dashed(
+                    ui.dashed(
                         [s.0 as f32, s.1 as f32],
                         [end.0 as f32, end.1 as f32],
                         2.0,
@@ -1122,7 +1147,7 @@ impl AppState {
                         [1.0, 0.3, 0.3, 1.0],
                     );
                 }
-                self.tool_badge(&mut g, ptr, [1.0, 0.3, 0.3, 1.0], 1);
+                self.tool_badge(&mut ui, ptr, [1.0, 0.3, 0.3, 1.0], 1);
             }
             Tool::Link { kind, first } => {
                 let color = match kind {
@@ -1135,15 +1160,15 @@ impl AppState {
                 if let Some(a) = first {
                     if let Some(p) = self.anchor_world(a) {
                         let s = to_screen(p, cam, zoom);
-                        g.dashed(s, ptr, 2.0, 6.0, color);
-                        g.disc(s, 5.0, color);
+                        ui.dashed(s, ptr, 2.0, 6.0, color);
+                        ui.disc(s, 5.0, color);
                     }
                 }
-                self.tool_badge(&mut g, ptr, color, 2);
+                self.tool_badge(&mut ui, ptr, color, 2);
             }
             Tool::None => {}
         }
-        g
+        [ui, g, floor]
     }
 
     /// Маленький значок инструмента рядом с курсором.
@@ -1384,6 +1409,9 @@ impl AppState {
 
     /// Включает/выключает инструмент рисования.
     pub fn toggle_draw_tool(&mut self) {
+        if self.transition.is_some() {
+            return;
+        }
         if matches!(self.tool, Tool::Draw { .. }) {
             self.tool = Tool::None;
         } else {
@@ -1406,6 +1434,9 @@ impl AppState {
     }
 
     pub fn toggle_knife_tool(&mut self) {
+        if self.transition.is_some() {
+            return;
+        }
         if matches!(self.tool, Tool::Knife { .. }) {
             self.tool = Tool::None;
         } else {
@@ -1424,6 +1455,9 @@ impl AppState {
     /// Инструмент связи. Если активное окно есть, оно сразу становится
     /// первым (точка крепления — центр), иначе первое окно выбирается кликом.
     pub fn start_link_tool(&mut self, kind: LinkKind) {
+        if self.transition.is_some() {
+            return;
+        }
         if let Tool::Link { kind: k, .. } = &self.tool {
             if *k == kind {
                 self.tool = Tool::None;
@@ -1439,7 +1473,7 @@ impl AppState {
     }
 
     /// Клавиши внутри активного инструмента (без Super). true — съедено.
-    pub fn tool_key(&mut self, keysym: u32) -> bool {
+    pub fn tool_key(&mut self, keysym: u32, evdev: u32) -> bool {
         use smithay::input::keyboard::keysyms as xkb;
         if keysym == xkb::KEY_Escape {
             if self.tool_active() {
@@ -1452,11 +1486,16 @@ impl AppState {
         let Tool::Draw { material, .. } = &mut self.tool else {
             return false;
         };
+        // Цифры — и по символу, и по физической клавише (AZERTY).
+        let digit = |d: &str| {
+            crate::config::ControlsConfig::matches_key(d, keysym)
+                || crate::config::ControlsConfig::matches_digit_key(d, evdev)
+        };
         let pick = match keysym {
-            xkb::KEY_1 => Some(Material::Steel),
-            xkb::KEY_2 => Some(Material::Glue),
-            xkb::KEY_3 => Some(Material::Trampoline),
-            xkb::KEY_4 => Some(Material::Rope),
+            _ if digit("1") => Some(Material::Steel),
+            _ if digit("2") => Some(Material::Glue),
+            _ if digit("3") => Some(Material::Trampoline),
+            _ if digit("4") => Some(Material::Rope),
             xkb::KEY_Tab => {
                 let i = Material::ALL
                     .iter()
@@ -2055,6 +2094,7 @@ impl AppState {
     }
 
     pub fn maybe_autosave(&mut self, now: Instant) {
+        self.maybe_relaunch(now);
         if self.autosave.as_mut().map_or(false, |a| a.due(now)) {
             self.save_session();
         }
@@ -2130,11 +2170,27 @@ impl AppState {
             self.enter_physics_mode();
         }
         if cfg.restore_apps {
-            let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
-            for (argv, cwd) in crate::session::relaunch_commands(&data) {
-                if let Err(e) = crate::session::spawn(&argv, cwd.as_deref(), &display) {
-                    eprintln!("[session] не удалось запустить {argv:?}: {e}");
-                }
+            // Запуск откладывается до готовности XWayland (DISPLAY), иначе
+            // восстановленные X11-приложения (Steam) стартуют без X-сервера.
+            self.pending_relaunch = crate::session::relaunch_commands(&data);
+            self.relaunch_deadline = Some(Instant::now() + std::time::Duration::from_secs(5));
+        }
+    }
+
+    /// Запускает приложения из сессии, как только XWayland готов (или через
+    /// 5 секунд без него).
+    fn maybe_relaunch(&mut self, now: Instant) {
+        let Some(deadline) = self.relaunch_deadline else {
+            return;
+        };
+        if self.xdisplay.is_none() && now < deadline {
+            return;
+        }
+        self.relaunch_deadline = None;
+        let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+        for (argv, cwd) in std::mem::take(&mut self.pending_relaunch) {
+            if let Err(e) = crate::session::spawn(&argv, cwd.as_deref(), &display) {
+                eprintln!("[session] не удалось запустить {argv:?}: {e}");
             }
         }
     }
@@ -2251,7 +2307,11 @@ impl AppState {
 
     /// Восстановить место окна из сессии, не включая физику (тайлинг).
     pub fn restore_window_for_later(&mut self, window: &Window) {
-        self.try_restore_window(window);
+        // Одна попытка на окно: сопоставление читает /proc, а видеоплеер
+        // коммитит по 60 раз в секунду.
+        if self.restore_tried.insert(window.clone()) {
+            self.try_restore_window(window);
+        }
     }
 
     // ── Мягкие тела (концепт §5) ───────────────────────────────────

@@ -142,6 +142,8 @@ pub struct AppState {
     /// Окно под указателем в момент нажатия кнопки: пока кнопка зажата,
     /// координаты считаются относительно него (выделение текста за краем).
     pub pointer_grab_target: Option<crate::sandbox::PointerTarget>,
+    /// Кнопки, нажатия которых отданы клиентам (их отпускание — тоже клиентам).
+    pub forwarded_buttons: std::collections::HashSet<u32>,
     pub render_cache: crate::render::RenderCache,
 
     // ── Сессия (концепт §3) ─────────────────────────────────────────────
@@ -151,6 +153,11 @@ pub struct AppState {
     pub restorer: Option<crate::session::SessionRestorer>,
     pub pending_joints: Vec<crate::session::SavedJoint>,
     pub restored_windows: std::collections::HashMap<usize, Vec<u32>>,
+    /// Окна, для которых уже пробовали найти место в сессии.
+    pub restore_tried: std::collections::HashSet<Window>,
+    /// Команды из сессии, ждущие готовности XWayland.
+    pub pending_relaunch: Vec<(Vec<String>, Option<String>)>,
+    pub relaunch_deadline: Option<std::time::Instant>,
 
     // Tracks windows that have received a configure event but haven't committed
     // a new buffer yet. This prevents us from spamming configure events faster
@@ -250,6 +257,7 @@ impl AppState {
             physics_sizes: Default::default(),
             last_physics_tick: None,
             pointer_grab_target: None,
+            forwarded_buttons: Default::default(),
             soft: Default::default(),
             soft_grab: None,
             snapshots: Default::default(),
@@ -260,6 +268,9 @@ impl AppState {
             restorer: None,
             pending_joints: Vec::new(),
             restored_windows: Default::default(),
+            restore_tried: Default::default(),
+            pending_relaunch: Vec::new(),
+            relaunch_deadline: None,
             pending_configures: std::collections::HashSet::new(),
             dmabuf_state,
             dmabuf_global: None,
@@ -344,7 +355,11 @@ impl AppState {
         let screen = self.output_size();
         Rectangle::new(
             (GAPS_OUT, GAPS_OUT).into(),
-            (screen.w - GAPS_OUT * 2, screen.h - GAPS_OUT * 2).into(),
+            (
+                (screen.w - GAPS_OUT * 2).max(1),
+                (screen.h - GAPS_OUT * 2).max(1),
+            )
+                .into(),
         )
     }
 
