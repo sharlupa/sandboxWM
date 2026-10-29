@@ -119,7 +119,7 @@ default=wlr;gtk
 Если картинка замирает или курсора не видно:
 - `SANDBOXWM_DEBUG_SCREENCOPY=1` — sandboxWM печатает каждый кадр захвата (`capture`, `copy…`, `ready`);
 - `SANDBOXWM_SCREENCOPY_DMABUF=0` — отключить захват через DMA-BUF (останется только shm);
-- лог портала: `/usr/lib/xdg-desktop-portal-wlr -r -l DEBUG` (путь зависит от дистрибутива, бывает `/usr/libexec/…`).
+- `SANDBOXWM_PORTAL_LOG=~/xdpw.log` — запуск из TTY: sandboxWM сам поднимает `xdg-desktop-portal-wlr -l DEBUG` и пишет его лог в этот файл (вручную: `/usr/lib/xdg-desktop-portal-wlr -r -l DEBUG`, путь бывает и `/usr/libexec/…`).
 
 ## Как это устроено
 

@@ -95,9 +95,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Основной портал опрашивает бэкенды один раз на старте: если wlr
         // ещё не на шине, интерфейс ScreenCast не экспортируется вовсе
         // (симптом: в OBS нет пункта «Захват экрана (PipeWire)»).
+        //
+        // SANDBOXWM_PORTAL_LOG=<файл>: вместо сервиса запускаем wlr-бэкенд сами
+        // с `-l DEBUG` и пишем его лог в этот файл (диагностика захвата в OBS).
+        let restart_wlr = if std::env::var_os("SANDBOXWM_PORTAL_LOG").is_some() {
+            "systemctl --user stop xdg-desktop-portal-wlr.service; \
+             for p in /usr/lib/xdg-desktop-portal-wlr /usr/libexec/xdg-desktop-portal-wlr \
+             /usr/lib/xdg-desktop-portal/xdg-desktop-portal-wlr \"$(command -v xdg-desktop-portal-wlr)\"; do \
+             if [ -x \"$p\" ]; then \"$p\" -r -l DEBUG > \"$SANDBOXWM_PORTAL_LOG\" 2>&1 & break; fi; done"
+        } else {
+            "systemctl --user restart --no-block xdg-desktop-portal-wlr.service"
+        };
         let _ = std::process::Command::new("sh")
             .arg("-c")
-            .arg("sleep 2; systemctl --user restart --no-block xdg-desktop-portal-wlr.service; sleep 1; systemctl --user restart --no-block xdg-desktop-portal.service")
+            .arg(format!(
+                "sleep 2; {restart_wlr}; sleep 1; systemctl --user restart --no-block xdg-desktop-portal.service"
+            ))
             .spawn();
     }
 

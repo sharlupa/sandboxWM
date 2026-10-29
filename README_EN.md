@@ -119,7 +119,7 @@ default=wlr;gtk
 If the picture freezes or the cursor is missing:
 - `SANDBOXWM_DEBUG_SCREENCOPY=1` makes sandboxWM print every capture frame (`capture`, `copy…`, `ready`);
 - `SANDBOXWM_SCREENCOPY_DMABUF=0` turns off DMA-BUF capture (shm only);
-- portal log: `/usr/lib/xdg-desktop-portal-wlr -r -l DEBUG` (the path depends on the distro, sometimes `/usr/libexec/…`).
+- `SANDBOXWM_PORTAL_LOG=~/xdpw.log` (when started from a TTY): sandboxWM starts `xdg-desktop-portal-wlr -l DEBUG` itself and writes its log to that file (by hand: `/usr/lib/xdg-desktop-portal-wlr -r -l DEBUG`, sometimes under `/usr/libexec/…`).
 
 ## How it works
 
