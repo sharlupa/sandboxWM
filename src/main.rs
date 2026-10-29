@@ -33,6 +33,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = AppState::new(display_handle.clone());
 
+    // Winit-бэкенд инициализируем ДО подмены WAYLAND_DISPLAY: иначе winit
+    // подключается как клиент к нашему же (ещё не обслуживаемому) сокету и
+    // навсегда зависает в roundtrip.
+    let winit_backend = if in_tty {
+        None
+    } else {
+        Some(winit::init::<smithay::backend::renderer::gles::GlesRenderer>()?)
+    };
+
     // Запускаем Wayland сокет (для клиентских приложений)
     let listening_socket = ListeningSocketSource::new_auto()?;
     let socket_name = listening_socket
@@ -112,7 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // ── Winit режим (вложенное окно в X11 / Wayland) ─────────────────
         println!("=====> Режим: Winit (вложенное окно)");
-        run_winit(event_loop, display, state, socket_name)?;
+        let (backend, winit_loop) = winit_backend.expect("winit backend initialized above");
+        run_winit(event_loop, display, state, backend, winit_loop)?;
         return Ok(());
     }
 
@@ -123,16 +133,22 @@ fn run_winit(
     mut event_loop: EventLoop<AppState>,
     mut display: Display<AppState>,
     mut state: AppState,
-    _socket_name: String,
+    backend: winit::WinitGraphicsBackend<smithay::backend::renderer::gles::GlesRenderer>,
+    winit_loop: winit::WinitEventLoop,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let loop_handle = event_loop.handle();
-
-    let (mut backend, winit_loop) =
-        winit::init::<smithay::backend::renderer::gles::GlesRenderer>()?;
+    // Бэкенд нужен и обработчику winit-событий, и основному циклу: после
+    // dispatch_clients коммиты клиентов поднимают needs_render, а без
+    // request_redraw winit спит до следующего события ввода — окно
+    // появлялось только после движения мыши.
+    let backend = std::rc::Rc::new(std::cell::RefCell::new(backend));
+    let mut backend_guard = backend.borrow_mut();
+    let backend_ref = &mut *backend_guard;
+    let backend_loop = backend.clone();
 
     // Создаём Output для winit окна
-    let size = backend.window_size();
-    backend.window().request_redraw();
+    let size = backend_ref.window_size();
+    backend_ref.window().request_redraw();
 
     let mode = Mode {
         size,
@@ -148,9 +164,12 @@ fn run_winit(
         },
     );
     let _global = output.create_global::<AppState>(&state.display_handle);
+    // Framebuffer winit-окна — обычный GL с началом координат внизу слева,
+    // поэтому как в примерах Smithay выход помечается Flipped180. С Normal
+    // вложенный режим рисовал всё вверх ногами.
     output.change_current_state(
         Some(mode),
-        Some(Transform::Normal),
+        Some(Transform::Flipped180),
         None,
         Some((0, 0).into()),
     );
@@ -165,13 +184,13 @@ fn run_winit(
     // linux-dmabuf global built from the renderer's supported formats, so GPU
     // clients can submit buffers as dmabuf file descriptors instead of wl_shm.
     use smithay::backend::renderer::{ImportDma, ImportEgl};
-    if let Err(e) = backend.renderer().bind_wl_display(&state.display_handle) {
+    if let Err(e) = backend_ref.renderer().bind_wl_display(&state.display_handle) {
         eprintln!("[Winit] EGL bind_wl_display failed: {e:?}");
     }
 
-    let dmabuf_formats = backend.renderer().dmabuf_formats();
+    let dmabuf_formats = backend_ref.renderer().dmabuf_formats();
     use smithay::backend::egl::EGLDevice;
-    let render_node = EGLDevice::device_for_display(backend.renderer().egl_context().display())
+    let render_node = EGLDevice::device_for_display(backend_ref.renderer().egl_context().display())
         .and_then(|device| device.try_get_render_node());
     let dmabuf_state = &mut state.dmabuf_state;
     match render_node {
@@ -194,7 +213,10 @@ fn run_winit(
         }
     }
 
+    drop(backend_guard);
+
     loop_handle.insert_source(winit_loop, move |event, _, state| {
+        let mut backend = backend_loop.borrow_mut();
         match event {
             WinitEvent::Resized { size, .. } => {
                 let new_mode = Mode { size, refresh: 60_000 };
@@ -322,6 +344,9 @@ fn run_winit(
         event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)?;
         display.dispatch_clients(&mut state)?;
         display.flush_clients()?;
+        if state.needs_render || state.layout_dirty {
+            backend.borrow().window().request_redraw();
+        }
     }
 
     Ok(())
