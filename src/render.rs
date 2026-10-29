@@ -26,6 +26,7 @@ render_elements! {
     Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     Cursor=SolidColorRenderElement,
     Physics=PhysicsElement,
+    Mesh=crate::mesh_render::MeshElement,
 }
 
 pub struct PhysicsElement {

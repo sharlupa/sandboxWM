@@ -1,10 +1,12 @@
 pub mod backend_drm;
 pub mod config;
 pub mod input;
+pub mod mesh_render;
 pub mod output_manager;
 pub mod physics;
 pub mod render;
 pub mod screencopy;
+pub mod softbody;
 pub mod state;
 pub mod tiling;
 pub mod xwm;
