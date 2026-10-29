@@ -107,6 +107,20 @@ The first directory found is used: `$SANDBOXWM_CONFIG`, `$XDG_CONFIG_HOME/sandbo
 
 The session is stored in `$XDG_STATE_HOME/sandboxWM/session.toml` by default (with a `.bak` next to it); panics are logged to `$XDG_STATE_HOME/sandboxWM/panic.log`.
 
+## Screen recording (OBS)
+
+OBS captures the screen through `xdg-desktop-portal-wlr` and PipeWire (the "Screen Capture (PipeWire)" source). sandboxWM sets `XDG_CURRENT_DESKTOP=sandboxWM` and restarts the portals itself; you need `~/.config/xdg-desktop-portal/sandboxWM-portals.conf`:
+
+```ini
+[preferred]
+default=wlr;gtk
+```
+
+If the picture freezes or the cursor is missing:
+- `SANDBOXWM_DEBUG_SCREENCOPY=1` makes sandboxWM print every capture frame (`capture`, `copy…`, `ready`);
+- `SANDBOXWM_SCREENCOPY_DMABUF=0` turns off DMA-BUF capture (shm only);
+- portal log: `/usr/lib/xdg-desktop-portal-wlr -r -l DEBUG` (the path depends on the distro, sometimes `/usr/libexec/…`).
+
 ## How it works
 
 - `src/main.rs` — startup, backend selection, the Winit loop.

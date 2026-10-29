@@ -7,17 +7,26 @@
 //!   клиентом wl_buffer и держит очередь кадров;
 //! - рендер — [`ScreencopyRenderer`]: в цикле рендера выхода рисует сцену в
 //!   offscreen-текстуру, читает нужный регион и пишет пиксели в shm-буфер
-//!   клиента с учётом его формата и stride. `copy_with_damage` ждёт, пока в
-//!   регионе что-то изменится, и перед `ready` получает события `damage`.
+//!   клиента с учётом его формата и stride (или копирует блитом в его
+//!   dmabuf). `copy_with_damage` ждёт, пока в регионе что-то изменится, и перед
+//!   `ready` получает события `damage`.
+//!
+//! xdg-desktop-portal-wlr 0.7 с протоколом v3 не стартует без события
+//! `linux_dmabuf`: объявляем dmabuf, если рендерер умеет в него рисовать.
+//!
+//! `SANDBOXWM_DEBUG_SCREENCOPY=1` печатает жизненный цикл кадров в stderr.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::{Buffer as _, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget, GlesTexture};
-use smithay::backend::renderer::{Bind, Color32F, ExportMem, Offscreen, Texture};
+use smithay::backend::renderer::{
+    Bind, Blit, Color32F, ExportMem, Offscreen, Texture, TextureFilter,
+};
 use smithay::output::Output;
 use smithay::utils::{Buffer, Clock, Monotonic, Physical, Rectangle, Size, Transform};
 use smithay::wayland::shm::{self, BufferData};
@@ -33,9 +42,29 @@ use wayland_server::{
 
 use crate::render::CustomRenderElements;
 
-/// Формат, который объявляем клиентам. Фон захвата непрозрачный, так что
-/// альфа всегда 0xFF; клиент может прислать и Xrgb/Abgr/Xbgr — их тоже пишем.
-const ADVERTISED_FORMAT: wl_shm::Format = wl_shm::Format::Argb8888;
+/// shm-формат, который объявляем клиентам, — как wlroots, один: Xrgb8888.
+/// К Argb portal-wlr предлагает PipeWire и вариант без альфы, а выбери его
+/// потребитель (OBS) — не находит такого shm-формата у нас и не создаёт
+/// буферы. Несколько событий `buffer` подряд сбивают wf-recorder (copy дважды).
+/// Клиент может прислать и Argb/Abgr/Xbgr — их тоже пишем, альфа всегда 0xFF.
+const ADVERTISED_FORMAT: wl_shm::Format = wl_shm::Format::Xrgb8888;
+
+/// dmabuf-форматы, которые готовы объявить, по убыванию предпочтения.
+const DMABUF_FORMATS: [Fourcc; 2] = [Fourcc::Xrgb8888, Fourcc::Argb8888];
+
+fn debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("SANDBOXWM_DEBUG_SCREENCOPY").is_some_and(|v| v != "0"))
+}
+
+macro_rules! sc_debug {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!("[screencopy] {}", format_args!($($arg)*));
+        }
+    };
+}
 
 /// Сколько прямоугольников damage копить на менеджер, прежде чем схлопнуть их
 /// в один охватывающий.
@@ -54,6 +83,15 @@ pub struct ScreencopyState {
     _global: GlobalId,
     /// Кадры, которые клиенты создали и которые ещё не получили ready/failed.
     pub pending_frames: Arc<Mutex<Vec<PendingFrame>>>,
+    /// Формат для события `linux_dmabuf`; None — рендерер не рисует в dmabuf.
+    dmabuf_format: Option<Fourcc>,
+}
+
+/// Буфер клиента из `copy` / `copy_with_damage`.
+enum CaptureBuffer {
+    Shm(WlBuffer),
+    /// Рисуем в него блитом из offscreen-текстуры, без чтения в память.
+    Dmabuf(Dmabuf),
 }
 
 /// Кадр захвата: ждёт `copy` от клиента, а затем — рендера своего выхода.
@@ -68,8 +106,8 @@ pub struct PendingFrame {
     /// Тот же регион в пикселях выхода — под него объявлен буфер.
     region: Rectangle<i32, Physical>,
     overlay_cursor: bool,
-    /// Проверенный wl_buffer из `copy` / `copy_with_damage`.
-    buffer: Option<WlBuffer>,
+    /// Проверенный буфер из `copy` / `copy_with_damage`.
+    buffer: Option<CaptureBuffer>,
     with_damage: bool,
 }
 
@@ -82,7 +120,24 @@ impl ScreencopyState {
         Self {
             _global: global,
             pending_frames: Arc::new(Mutex::new(Vec::new())),
+            dmabuf_format: None,
         }
+    }
+
+    /// Включает объявление dmabuf-буферов, если `renderer` умеет рисовать в
+    /// один из подходящих форматов. Вызывается бэкендом после создания рендерера.
+    /// `SANDBOXWM_SCREENCOPY_DMABUF=0` отключает dmabuf (останется только shm).
+    pub fn set_renderer(&mut self, renderer: &GlesRenderer) {
+        if std::env::var_os("SANDBOXWM_SCREENCOPY_DMABUF").is_some_and(|v| v == "0") {
+            self.dmabuf_format = None;
+            println!("[screencopy] dmabuf отключён (SANDBOXWM_SCREENCOPY_DMABUF=0)");
+            return;
+        }
+        let formats = renderer.egl_context().dmabuf_render_formats();
+        self.dmabuf_format = DMABUF_FORMATS
+            .into_iter()
+            .find(|code| formats.iter().any(|f| f.code == *code));
+        println!("[screencopy] dmabuf-формат: {:?}", self.dmabuf_format);
     }
 
     fn frames(&self) -> MutexGuard<'_, Vec<PendingFrame>> {
@@ -113,12 +168,23 @@ impl ScreencopyState {
 
         let (width, height) = (region.size.w as u32, region.size.h as u32);
         frame.buffer(ADVERTISED_FORMAT, width, height, width * 4);
-        // Протокол v3: после перечисления всех типов буферов клиент
-        // ждёт buffer_done. Без него xdg-desktop-portal-wlr зависает
-        // и захват экрана не стартует.
         if frame.version() >= 3 {
+            // portal-wlr 0.7 без linux_dmabuf в v3 не начинает захват.
+            if let Some(format) = self.dmabuf_format {
+                frame.linux_dmabuf(format as u32, width, height);
+            }
+            // После перечисления всех типов буферов клиент ждёт buffer_done.
+            // Без него xdg-desktop-portal-wlr зависает и захват не стартует.
             frame.buffer_done();
         }
+        sc_debug!(
+            "capture v{} {}x{} cursor={} dmabuf={:?}",
+            frame.version(),
+            width,
+            height,
+            overlay_cursor,
+            self.dmabuf_format
+        );
 
         self.frames().push(PendingFrame {
             frame,
@@ -150,20 +216,34 @@ impl ScreencopyState {
         }
 
         let size = frames[index].region.size;
-        match shm::with_buffer_contents(&buffer, |_, len, data| check_shm_buffer(&data, len, size))
-        {
-            Ok(Ok(_)) => {
+        let checked = match shm::with_buffer_contents(&buffer, |_, len, data| {
+            check_shm_buffer(&data, len, size)
+        }) {
+            Ok(Ok(_)) => Ok(CaptureBuffer::Shm(buffer)),
+            Ok(Err(reason)) => Err(reason.to_string()),
+            Err(_) => match smithay::wayland::dmabuf::get_dmabuf(&buffer) {
+                Ok(_) if self.dmabuf_format.is_none() => Err("dmabuf не объявлялся".into()),
+                Ok(dmabuf) => check_dmabuf(dmabuf, size).map(CaptureBuffer::Dmabuf),
+                Err(_) => Err("буфер не wl_shm и не dmabuf".into()),
+            },
+        };
+        match checked {
+            Ok(buffer) => {
+                sc_debug!(
+                    "copy{} ({})",
+                    if with_damage { "_with_damage" } else { "" },
+                    if matches!(buffer, CaptureBuffer::Shm(_)) {
+                        "shm"
+                    } else {
+                        "dmabuf"
+                    }
+                );
                 let pending = &mut frames[index];
                 pending.buffer = Some(buffer);
                 pending.with_damage = with_damage;
             }
-            Ok(Err(reason)) => {
+            Err(reason) => {
                 eprintln!("[screencopy] буфер клиента отклонён: {reason}");
-                frames.remove(index).frame.failed();
-            }
-            Err(e) => {
-                // Не wl_shm (например, dmabuf) — такой тип буфера мы не объявляли.
-                eprintln!("[screencopy] буфер клиента не wl_shm: {e:?}");
                 frames.remove(index).frame.failed();
             }
         }
@@ -401,7 +481,10 @@ impl ScreencopyRenderer {
             while i < frames.len() {
                 match self.action(&frames[i], output) {
                     FrameAction::Wait => i += 1,
-                    FrameAction::Fail => frames.remove(i).frame.failed(),
+                    FrameAction::Fail => {
+                        sc_debug!("failed: выход сменил режим");
+                        frames.remove(i).frame.failed()
+                    }
                     FrameAction::Copy(damage) => ready.push((frames.remove(i), damage)),
                 }
             }
@@ -444,6 +527,7 @@ impl ScreencopyRenderer {
                     for ((pending, damage), result) in batch.into_iter().zip(results) {
                         match result {
                             Ok(()) => {
+                                sc_debug!("ready, damage: {:?}", damage.as_ref().map(|d| d.len()));
                                 send_ready(&pending.frame, damage.as_deref(), time);
                                 self.reset_damage(&pending);
                             }
@@ -567,8 +651,32 @@ fn copy_to_client(
     target: &GlesTarget<'_>,
     pending: &PendingFrame,
 ) -> Result<(), String> {
-    let buffer = pending.buffer.as_ref().ok_or("кадр без буфера")?;
     let region = pending.region;
+    let buffer = match pending.buffer.as_ref().ok_or("кадр без буфера")? {
+        CaptureBuffer::Shm(buffer) => buffer,
+        CaptureBuffer::Dmabuf(dmabuf) => {
+            // Строки offscreen-текстуры и dmabuf идут в одном порядке (сверху
+            // вниз), так что блит без переворота.
+            let mut dmabuf = dmabuf.clone();
+            let mut dst = renderer
+                .bind(&mut dmabuf)
+                .map_err(|e| format!("bind dmabuf: {e:?}"))?;
+            renderer
+                .blit(
+                    target,
+                    &mut dst,
+                    region,
+                    Rectangle::from_size(region.size),
+                    TextureFilter::Nearest,
+                )
+                .map_err(|e| format!("blit: {e:?}"))?;
+            // Клиент читает буфер сразу после ready — дожидаемся GPU.
+            renderer
+                .with_context(|gl| unsafe { gl.Finish() })
+                .map_err(|e| format!("glFinish: {e:?}"))?;
+            return Ok(());
+        }
+    };
     let rect = Rectangle::<i32, Buffer>::new(
         (region.loc.x, region.loc.y).into(),
         (region.size.w, region.size.h).into(),
@@ -684,6 +792,21 @@ impl PixelLayout {
             _ => None,
         }
     }
+}
+
+/// Проверяет, что dmabuf клиента подходит под кадр размером `size`.
+fn check_dmabuf(dmabuf: &Dmabuf, size: Size<i32, Physical>) -> Result<Dmabuf, String> {
+    let dmabuf_size = dmabuf.size();
+    if (dmabuf_size.w, dmabuf_size.h) != (size.w, size.h) {
+        return Err("размер dmabuf не совпадает с объявленным".into());
+    }
+    if !DMABUF_FORMATS.contains(&dmabuf.format().code) {
+        return Err(format!(
+            "неподдерживаемый формат dmabuf {:?}",
+            dmabuf.format().code
+        ));
+    }
+    Ok(dmabuf.clone())
 }
 
 /// Проверяет, что shm-буфер клиента подходит под кадр размером `size`.
@@ -1133,6 +1256,47 @@ mod tests {
             assert_eq!(px(&bottom, 64, 30, 4), [0, 0, 255, 255]);
             assert_eq!(px(&bottom, 64, 30, 11), [0, 0, 255, 255]);
         }
+
+        // Путь dmabuf: блит региона в отдельную цель (здесь — текстуру) без
+        // переворота, как и чтение в shm.
+        let region = rect::<Physical>(0, 36, 64, 12);
+        let mut dst_tex = Offscreen::<GlesTexture>::create_buffer(
+            &mut renderer,
+            Fourcc::Abgr8888,
+            (64, 12).into(),
+        )
+        .unwrap();
+        sc.render_offscreen(
+            &mut renderer,
+            size,
+            1.0,
+            &elements,
+            clear,
+            |renderer, target| {
+                let mut dst = renderer.bind(&mut dst_tex).unwrap();
+                renderer
+                    .blit(
+                        target,
+                        &mut dst,
+                        region,
+                        Rectangle::from_size(region.size),
+                        TextureFilter::Nearest,
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+        let blitted = {
+            let target = renderer.bind(&mut dst_tex).unwrap();
+            read(&mut renderer, &target, rect(0, 0, 64, 12))
+        };
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * 64 + x) * 4;
+            [blitted[i], blitted[i + 1], blitted[i + 2], blitted[i + 3]]
+        };
+        assert_eq!(px(30, 3), [0, 0, 0, 255]);
+        assert_eq!(px(30, 4), [0, 0, 255, 255]);
+        assert_eq!(px(30, 11), [0, 0, 255, 255]);
 
         // Текстура переиспользуется при том же размере и пересоздаётся при другом.
         let first = sc.texture.as_ref().map(|t| t.tex_id());

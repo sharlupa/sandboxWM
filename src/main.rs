@@ -235,6 +235,7 @@ fn run_winit(
     }
 
     let dmabuf_formats = backend_ref.renderer().dmabuf_formats();
+    state.screencopy_state.set_renderer(backend_ref.renderer());
     use smithay::backend::egl::EGLDevice;
     let render_node = EGLDevice::device_for_display(backend_ref.renderer().egl_context().display())
         .and_then(|device| device.try_get_render_node());

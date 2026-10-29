@@ -192,6 +192,7 @@ pub fn run_tty(
     }
 
     let dmabuf_formats = renderer.dmabuf_formats();
+    state.screencopy_state.set_renderer(&renderer);
     // The GBM device wraps the same DRM node we render on; its dev_id is the
     // main device clients should target when allocating buffers for us.
     let main_device = DrmNode::from_path(&gpu_path)

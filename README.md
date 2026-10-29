@@ -107,6 +107,20 @@ cargo build --release
 
 Сессия по умолчанию лежит в `$XDG_STATE_HOME/sandboxWM/session.toml` (рядом — `.bak`), лог паник — в `$XDG_STATE_HOME/sandboxWM/panic.log`.
 
+## Запись экрана (OBS)
+
+OBS захватывает экран через `xdg-desktop-portal-wlr` и PipeWire (источник «Захват экрана (PipeWire)»). sandboxWM сам выставляет `XDG_CURRENT_DESKTOP=sandboxWM` и перезапускает порталы; нужен конфиг `~/.config/xdg-desktop-portal/sandboxWM-portals.conf`:
+
+```ini
+[preferred]
+default=wlr;gtk
+```
+
+Если картинка замирает или курсора не видно:
+- `SANDBOXWM_DEBUG_SCREENCOPY=1` — sandboxWM печатает каждый кадр захвата (`capture`, `copy…`, `ready`);
+- `SANDBOXWM_SCREENCOPY_DMABUF=0` — отключить захват через DMA-BUF (останется только shm);
+- лог портала: `/usr/lib/xdg-desktop-portal-wlr -r -l DEBUG` (путь зависит от дистрибутива, бывает `/usr/libexec/…`).
+
 ## Как это устроено
 
 - `src/main.rs` — запуск, выбор бэкенда, winit-цикл.
