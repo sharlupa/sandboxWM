@@ -96,8 +96,9 @@ pub struct AppState {
     /// wlr-layer-shell: панели (waybar), фоны, лаунчеры, уведомления.
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     /// Относительное движение мыши и захват указателя — для игр.
-    pub relative_pointer_state: RelativePointerManagerState,
-    pub pointer_constraints_state: PointerConstraintsState,
+    /// `None`, если `[input] pointer_lock = false`.
+    pub relative_pointer_state: Option<RelativePointerManagerState>,
+    pub pointer_constraints_state: Option<PointerConstraintsState>,
     /// ext-workspace-v1: рабочие столы для панелей.
     pub ext_workspace_state: crate::ext_workspace::ExtWorkspaceState,
 
@@ -243,8 +244,16 @@ impl AppState {
             smithay::wayland::viewporter::ViewporterState::new::<Self>(&display_handle);
         let layer_shell_state =
             smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<Self>(&display_handle);
-        let relative_pointer_state = RelativePointerManagerState::new::<Self>(&display_handle);
-        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
+        // Без этих глобалов XWayland работает с абсолютным курсором (как до
+        // рабочих столов) — см. `[input] pointer_lock`.
+        let (relative_pointer_state, pointer_constraints_state) = if config.input.pointer_lock {
+            (
+                Some(RelativePointerManagerState::new::<Self>(&display_handle)),
+                Some(PointerConstraintsState::new::<Self>(&display_handle)),
+            )
+        } else {
+            (None, None)
+        };
         let ext_workspace_state = crate::ext_workspace::ExtWorkspaceState::new(&display_handle);
         let workspaces = (0..config.workspaces.count)
             .map(|_| crate::workspace::Workspace::default())

@@ -58,6 +58,8 @@ pub struct Config {
     pub rendering: RenderingConfig,
     /// Рабочие столы.
     pub workspaces: WorkspacesConfig,
+    /// Мышь и игры.
+    pub input: InputConfig,
 }
 
 impl Config {
@@ -480,6 +482,30 @@ pub struct WorkspacesConfig {
 impl Default for WorkspacesConfig {
     fn default() -> Self {
         Self { count: 5 }
+    }
+}
+
+// ── Ввод ───────────────────────────────────────────────────────────
+
+/// Мышь в играх.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InputConfig {
+    /// Протоколы относительной мыши и захвата указателя
+    /// (`zwp_relative_pointer`, `zwp_pointer_constraints`).
+    ///
+    /// С ними XWayland эмулирует «вернуть курсор в центр» у X11-игр (TF2 и
+    /// другие на SDL, Wine/Proton) и шлёт «сырые» движения мыши, а
+    /// Wayland-игры (SDL3/GLFW) получают обзор мышью. `false` — как в версиях
+    /// до рабочих столов: XWayland видит только абсолютный курсор, возврат в
+    /// центр не работает и камеру тянет к курсору композитора (для
+    /// диагностики). Применяется при запуске WM.
+    pub pointer_lock: bool,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self { pointer_lock: true }
     }
 }
 
