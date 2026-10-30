@@ -104,6 +104,9 @@ pub struct AppState {
     // XWayland: shell-state, оконный менеджер X11 и номер X-дисплея
     pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     pub xwm: Option<smithay::xwayland::X11Wm>,
+    /// Новое X11-окно попадает в X-стек Smithay только после MapNotify —
+    /// порядок нужно повторить на его первом коммите.
+    pub x11_stacking_dirty: bool,
     pub xdisplay: Option<u32>,
 
     // WM states
@@ -261,6 +264,7 @@ impl AppState {
             ext_workspace_state,
             xwayland_shell_state,
             xwm: None,
+            x11_stacking_dirty: false,
             xdisplay: None,
             seat_state,
             xdg_decoration_state,
@@ -367,6 +371,7 @@ impl AppState {
             .seat
             .get_keyboard()
             .and_then(|k| k.current_focus())
+            .and_then(|f| f.surface())
             .is_some_and(|f| self.any_window_for_surface(&f).is_none());
         if was_focused || (self.get_focused_window().is_none() && !layer_focused) {
             let next_win = self.fullscreen_window().or_else(|| {
@@ -560,12 +565,29 @@ impl AppState {
     /// X11 stacking order. Steam/CEF uses many override-redirect popup windows;
     /// if the two stacks diverge, a popup may be visible on top while X11 sends
     /// the click to the main window underneath it.
+    ///
+    /// X11-окна скрытых рабочих столов в X-сервере остаются отображёнными —
+    /// они уходят в самый низ стека. Иначе XWayland, выбирающий окно для
+    /// клика по X-стеку, отдавал клик окну с другого стола (или окну под
+    /// полноэкранной игрой).
+    ///
+    /// Порядок для `update_stacking_order_downwards` — СВЕРХУ ВНИЗ: так
+    /// работает его код (документация Smithay утверждает обратное). Раньше
+    /// сюда шёл порядок Space снизу вверх, и X-стек получался перевёрнутым:
+    /// окно в фокусе (и полноэкранная игра) оказывалось в X внизу, а клики
+    /// уходили окнам, лежащим под ним.
     pub fn sync_x11_stacking(&mut self) {
-        let order: Vec<smithay::xwayland::X11Surface> = self
+        let visible = self
             .space
             .elements()
-            .filter_map(|w| w.x11_surface().cloned())
-            .collect();
+            .rev()
+            .filter_map(|w| w.x11_surface().cloned());
+        let hidden = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.windows.iter())
+            .filter_map(|w| w.x11_surface().cloned());
+        let order: Vec<smithay::xwayland::X11Surface> = visible.chain(hidden).collect();
         if let Some(xwm) = self.xwm.as_mut() {
             let _ = xwm.update_stacking_order_downwards(order.iter());
         }
@@ -636,11 +658,11 @@ impl AppState {
             }
         }
 
-        // Wayland keyboard focus on the XWayland wl_surface lets XWayland apply
-        // the client's ICCCM input model (including WM_TAKE_FOCUS).
-        if let Some(wl_surface) = window.wl_surface().map(|s| s.into_owned()) {
+        // X11-окну фокус ставится и в X-сервере (SetInputFocus/WM_TAKE_FOCUS
+        // по его ICCCM-модели), см. focus.rs; Wayland-окну — его поверхности.
+        if let Some(target) = crate::focus::KeyboardFocusTarget::for_window(window) {
             if let Some(kbd) = self.seat.get_keyboard() {
-                kbd.set_focus(self, Some(wl_surface), serial);
+                kbd.set_focus(self, Some(target), serial);
             }
         }
 
@@ -724,11 +746,8 @@ impl AppState {
     /// Get currently focused window
     pub fn get_focused_window(&self) -> Option<Window> {
         let kbd = self.seat.get_keyboard()?;
-        let surf = kbd.current_focus()?;
-        self.space
-            .elements()
-            .find(|w| w.wl_surface().map(|s| s.as_ref() == &surf).unwrap_or(false))
-            .cloned()
+        let focus = kbd.current_focus()?;
+        self.space.elements().find(|w| focus.is_window(w)).cloned()
     }
 
     /// Окно, которому принадлежит wl_surface (toplevel или X11).
@@ -827,6 +846,10 @@ impl CompositorHandler for AppState {
             // Client has committed a buffer, meaning it has processed the last
             // configure event. We can send new configure events to it now.
             self.pending_configures.remove(&window);
+            if self.x11_stacking_dirty && window.x11_surface().is_some() {
+                self.x11_stacking_dirty = false;
+                self.sync_x11_stacking();
+            }
             // Размер, отложенный backpressure-ом (например, сосед закрылся,
             // пока клиент ещё не ответил на прошлый configure), уходит сейчас:
             // иначе окно так и оставалось старого размера.
@@ -1037,6 +1060,7 @@ impl XdgShellHandler for AppState {
         else {
             return;
         };
+        let root = crate::focus::KeyboardFocusTarget::Wayland(root);
         let Ok(mut grab) = self.popup_manager.grab_popup(root, kind, &seat, serial) else {
             return;
         };
@@ -1149,14 +1173,20 @@ crate::delegate_output_manager!(AppState);
 
 // 4. Seat / Input
 impl SeatHandler for AppState {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = crate::focus::KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(
+        &mut self,
+        seat: &Seat<Self>,
+        focused: Option<&crate::focus::KeyboardFocusTarget>,
+    ) {
+        let focused = focused.and_then(|f| f.surface());
+        let focused = focused.as_ref();
         // Буфер обмена привязан к клиенту с клавиатурным фокусом: без этого
         // клиент не получает wl_data_offer и копирование/вставка не работают.
         let client = focused.and_then(|s| self.display_handle.get_client(s.id()).ok());

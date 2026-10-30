@@ -2,6 +2,7 @@ pub mod backend_drm;
 pub mod config;
 pub mod cursor;
 pub mod ext_workspace;
+pub mod focus;
 pub mod fullscreen;
 pub mod input;
 pub mod layer_shell;

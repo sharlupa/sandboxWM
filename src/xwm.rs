@@ -34,8 +34,16 @@ impl XwmHandler for AppState {
             eprintln!("[xwayland] set_mapped failed: {e:?}");
             return;
         }
+        // Игры (SDL, Wine) ставят _NET_WM_STATE_FULLSCREEN ещё до map или
+        // просто создают окно размером с экран в его начале — такое окно
+        // сразу становится полноэкранным, а не встаёт в тайл/падает телом.
+        let screen = self.output_size();
+        let geo = surface.geometry();
+        let wants_fullscreen = surface.is_fullscreen()
+            || (geo.loc == (0, 0).into() && geo.size.w >= screen.w && geo.size.h >= screen.h);
         let window = Window::new_x11_window(surface);
         self.space.map_element(window.clone(), (0, 0), true);
+        self.x11_stacking_dirty = true;
 
         // Как в new_toplevel: вставляем в BSP-дерево всегда, чтобы окно
         // корректно встало в тайл при возврате из физического режима.
@@ -53,7 +61,9 @@ impl XwmHandler for AppState {
         }
 
         // Поверх полноэкранного окна новое не выскакивает (см. new_toplevel).
-        if self.fullscreen_window().is_some() {
+        if wants_fullscreen {
+            self.set_fullscreen(&window, true);
+        } else if self.fullscreen_window().is_some() {
             self.place_fullscreen_window();
         } else {
             self.focus_window(&window);
@@ -66,6 +76,7 @@ impl XwmHandler for AppState {
         let geo = surface.geometry();
         let window = Window::new_x11_window(surface);
         self.space.map_element(window, geo.loc, true);
+        self.x11_stacking_dirty = true;
         // Keep visible CEF popups above their parent in both compositor and X11.
         self.sync_x11_stacking();
         self.needs_render = true;

@@ -194,7 +194,11 @@ fn maybe_activate_constraint(
     let Some((surface, origin)) = focus else {
         return;
     };
-    let keyboard_focus = state.seat.get_keyboard().and_then(|k| k.current_focus());
+    let keyboard_focus = state
+        .seat
+        .get_keyboard()
+        .and_then(|k| k.current_focus())
+        .and_then(|f| f.surface());
     if keyboard_focus.as_ref() != Some(&root_surface(surface)) {
         return;
     }

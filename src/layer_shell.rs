@@ -69,6 +69,7 @@ impl WlrLayerShellHandler for AppState {
             .seat
             .get_keyboard()
             .and_then(|k| k.current_focus())
+            .and_then(|f| f.surface())
             .is_some_and(|f| &f == surface.wl_surface());
         if had_focus {
             self.focus_top_window();
@@ -168,11 +169,11 @@ impl AppState {
         let Some(kbd) = self.seat.get_keyboard() else {
             return;
         };
-        if kbd.current_focus().as_ref() == Some(&surface) {
+        if kbd.current_focus().and_then(|f| f.surface()).as_ref() == Some(&surface) {
             return;
         }
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        kbd.set_focus(self, Some(surface), serial);
+        kbd.set_focus(self, Some(surface.into()), serial);
         self.needs_render = true;
     }
 
@@ -198,7 +199,12 @@ impl AppState {
 
     /// Слой с эксклюзивной клавиатурой держит фокус (лаунчер открыт).
     pub fn exclusive_layer_focus(&self) -> bool {
-        let Some(focus) = self.seat.get_keyboard().and_then(|k| k.current_focus()) else {
+        let Some(focus) = self
+            .seat
+            .get_keyboard()
+            .and_then(|k| k.current_focus())
+            .and_then(|f| f.surface())
+        else {
             return false;
         };
         self.space.outputs().any(|o| {
