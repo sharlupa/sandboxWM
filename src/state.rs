@@ -201,6 +201,9 @@ pub struct AppState {
     // Cursor
     pub cursor_status: CursorImageStatus,
     pub pointer_location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    /// Абсолютная позиция указателя хоста/планшета: из её изменений
+    /// считается относительное движение (под захватом наш курсор стоит).
+    pub host_pointer_location: Option<smithay::utils::Point<f64, smithay::utils::Logical>>,
 
     // Damage flag — the render loop only redraws when something actually changed
     // (window added/removed/focused/resized, surface committed, pointer moved).
@@ -322,6 +325,7 @@ impl AppState {
             session_paused: false,
             cursor_status: CursorImageStatus::default_named(),
             pointer_location: (0.0, 0.0).into(),
+            host_pointer_location: None,
             needs_render: true,
             layout_dirty: false,
         }

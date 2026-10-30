@@ -59,10 +59,15 @@ pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) 
     match event {
         InputEvent::Keyboard { event } => handle_keyboard::<WinitInput>(state, event),
         InputEvent::PointerMotionAbsolute { event } => {
-            let serial = SERIAL_COUNTER.next_serial();
+            // Хост даёт только абсолютные координаты — относительное движение
+            // для игр считается разницей с прошлой позицией.
+            // Считаем от прошлой позиции курсора хоста: под захватом наш
+            // курсор стоит на месте, и разница с ним накапливалась бы.
             let size = state.output_size();
             let pos = event.position_transformed(size);
-            handle_pointer_motion(state, pos.x, pos.y, serial, event.time_msec());
+            let delta = pos - state.host_pointer_location.unwrap_or(pos);
+            state.host_pointer_location = Some(pos);
+            pointer_moved(state, pos, delta, delta, event.time(), event.time_msec());
         }
         InputEvent::PointerAxis { event } => {
             handle_pointer_axis(
@@ -82,49 +87,81 @@ pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) 
     }
 }
 
+/// Движение мыши: относительное событие (игры: обзор мышью через
+/// zwp_relative_pointer, у XWayland — XI2 raw motion) и, если указатель
+/// не захвачен, обычное перемещение курсора. Захват (lock) держит курсор на
+/// месте, confine не выпускает его из окна.
+fn pointer_moved(
+    state: &mut AppState,
+    target: Point<f64, Logical>,
+    delta: Point<f64, Logical>,
+    delta_unaccel: Point<f64, Logical>,
+    utime: u64,
+    time_msec: u32,
+) {
+    let serial = SERIAL_COUNTER.next_serial();
+    let (mut x, mut y) = (target.x, target.y);
+    if let Some(ptr) = state.seat.get_pointer() {
+        let focus = ptr.current_focus();
+        if delta != Point::default() || delta_unaccel != Point::default() {
+            ptr.relative_motion(
+                state,
+                focus.clone().map(|s| (s, Point::default())),
+                &RelativeMotionEvent {
+                    delta,
+                    delta_unaccel,
+                    utime,
+                },
+            );
+        }
+        match focus.as_ref().and_then(|s| active_constraint(&ptr, s)) {
+            Some(Constraint::Locked) => {
+                ptr.frame(state);
+                return;
+            }
+            Some(Constraint::Confined) => {
+                if let Some(rect) = focus.as_ref().and_then(|s| confine_rect(state, s)) {
+                    x = x.clamp(rect.loc.x, rect.loc.x + rect.size.w - 1.0);
+                    y = y.clamp(rect.loc.y, rect.loc.y + rect.size.h - 1.0);
+                }
+            }
+            None => {}
+        }
+    }
+    handle_pointer_motion(state, x, y, serial, time_msec);
+}
+
+/// Указатель сейчас захвачен (pointer lock) поверхностью под ним.
+fn pointer_locked(state: &AppState) -> bool {
+    let Some(ptr) = state.seat.get_pointer() else {
+        return false;
+    };
+    ptr.current_focus()
+        .is_some_and(|s| matches!(active_constraint(&ptr, &s), Some(Constraint::Locked)))
+}
+
 /// Handler for libinput events (TTY/DRM backend)
 pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputInputBackend>) {
     match event {
         InputEvent::Keyboard { event } => handle_keyboard::<LibinputInputBackend>(state, event),
         InputEvent::PointerMotion { event } => {
-            let serial = SERIAL_COUNTER.next_serial();
-            let cur = state.pointer_location;
-            let (mut x, mut y) = (cur.x + event.delta_x(), cur.y + event.delta_y());
-            // Игры: относительное движение — всегда, захват (lock) держит
-            // курсор на месте, confine не выпускает его из окна.
-            if let Some(ptr) = state.seat.get_pointer() {
-                let focus = ptr.current_focus();
-                ptr.relative_motion(
-                    state,
-                    focus.clone().map(|s| (s, Point::default())),
-                    &RelativeMotionEvent {
-                        delta: event.delta(),
-                        delta_unaccel: event.delta_unaccel(),
-                        utime: event.time(),
-                    },
-                );
-                match focus.as_ref().and_then(|s| active_constraint(&ptr, s)) {
-                    Some(Constraint::Locked) => {
-                        ptr.frame(state);
-                        return;
-                    }
-                    Some(Constraint::Confined) => {
-                        if let Some(rect) = focus.as_ref().and_then(|s| confine_rect(state, s)) {
-                            x = x.clamp(rect.loc.x, rect.loc.x + rect.size.w - 1.0);
-                            y = y.clamp(rect.loc.y, rect.loc.y + rect.size.h - 1.0);
-                        }
-                    }
-                    None => {}
-                }
-            }
-            handle_pointer_motion(state, x, y, serial, event.time_msec());
+            let target = state.pointer_location + event.delta();
+            pointer_moved(
+                state,
+                target,
+                event.delta(),
+                event.delta_unaccel(),
+                event.time(),
+                event.time_msec(),
+            );
         }
         InputEvent::PointerMotionAbsolute { event } => {
             // Планшеты / тачпады в абсолютном режиме / VM-указатели.
-            let serial = SERIAL_COUNTER.next_serial();
             let size = state.output_size();
             let pos = event.position_transformed(size);
-            handle_pointer_motion(state, pos.x, pos.y, serial, event.time_msec());
+            let delta = pos - state.host_pointer_location.unwrap_or(pos);
+            state.host_pointer_location = Some(pos);
+            pointer_moved(state, pos, delta, delta, event.time(), event.time_msec());
         }
         InputEvent::PointerAxis { event } => {
             handle_pointer_axis(
@@ -876,7 +913,10 @@ fn forward_button(
 ) {
     let pos = state.pointer_location;
     let (focus, location, window) = pointer_focus(state, pos.x, pos.y);
-    if let Some(ptr) = state.seat.get_pointer() {
+    // Под захватом (обзор мышью в игре) абсолютных движений нет: лишний
+    // wl_pointer.motion сбивал бы XWayland эмулируемую позицию курсора.
+    let locked = pointer_locked(state);
+    if let Some(ptr) = state.seat.get_pointer().filter(|_| !locked) {
         ptr.motion(
             state,
             focus,
