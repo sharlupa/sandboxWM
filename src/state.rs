@@ -1204,6 +1204,13 @@ impl SeatHandler for AppState {
                     with_pointer_constraint(&surface, &pointer, |constraint| {
                         if let Some(c) = constraint {
                             if c.is_active() {
+                                if crate::input::debug_pointer() {
+                                    eprintln!(
+                                        "[pointer] constraint off: keyboard focus {:?} left pointer surface {}",
+                                        focused.map(|s| s.id().protocol_id()),
+                                        surface.id().protocol_id()
+                                    );
+                                }
                                 c.deactivate();
                             }
                         }
@@ -1254,6 +1261,13 @@ impl PointerConstraintsHandler for AppState {
         let fullscreen = self
             .fullscreen_window()
             .is_some_and(|w| w.wl_surface().as_deref() == Some(surface));
+        if crate::input::debug_pointer() {
+            eprintln!(
+                "[pointer] new constraint surface={} pointer_focus={:?} fullscreen={fullscreen}",
+                surface.id().protocol_id(),
+                pointer.current_focus().map(|s| s.id().protocol_id())
+            );
+        }
         if fullscreen && pointer.current_focus().as_ref() != Some(surface) {
             crate::input::refresh_pointer_focus(self);
         }
@@ -1262,6 +1276,12 @@ impl PointerConstraintsHandler for AppState {
         if pointer.current_focus().as_ref() == Some(surface) {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(constraint) = constraint {
+                    if crate::input::debug_pointer() {
+                        eprintln!(
+                            "[pointer] constraint on (new): surface {}",
+                            surface.id().protocol_id()
+                        );
+                    }
                     constraint.activate();
                 }
             });
@@ -1277,6 +1297,9 @@ impl PointerConstraintsHandler for AppState {
         let active = with_pointer_constraint(surface, pointer, |constraint| {
             constraint.is_some_and(|c| c.is_active())
         });
+        if crate::input::debug_pointer() {
+            eprintln!("[pointer] cursor hint {location:?} active={active}");
+        }
         if !active {
             return;
         }

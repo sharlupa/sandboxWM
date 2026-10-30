@@ -14,7 +14,7 @@ use smithay::{
         keyboard::{FilterResult, keysyms as xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle, RelativeMotionEvent},
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{Logical, Point, SERIAL_COUNTER, Serial},
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
     wayland::seat::WaylandFocus,
@@ -87,6 +87,13 @@ pub fn process_input_event(state: &mut AppState, event: InputEvent<WinitInput>) 
     }
 }
 
+/// `SANDBOXWM_DEBUG_POINTER=1`: лог захвата указателя и движений мыши
+/// (диагностика обзора мышью в играх).
+pub fn debug_pointer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SANDBOXWM_DEBUG_POINTER").is_some_and(|v| v != "0"))
+}
+
 /// Движение мыши: относительное событие (игры: обзор мышью через
 /// zwp_relative_pointer, у XWayland — XI2 raw motion) и, если указатель
 /// не захвачен, обычное перемещение курсора. Захват (lock) держит курсор на
@@ -103,6 +110,29 @@ fn pointer_moved(
     let (mut x, mut y) = (target.x, target.y);
     if let Some(ptr) = state.seat.get_pointer() {
         let focus = ptr.current_focus();
+        if debug_pointer() {
+            let constraint = focus.as_ref().map(|s| {
+                with_pointer_constraint(s, &ptr, |c| {
+                    c.map(|c| {
+                        let kind = match &*c {
+                            PointerConstraint::Locked(_) => "lock",
+                            PointerConstraint::Confined(_) => "confine",
+                        };
+                        format!("{kind}{}", if c.is_active() { "+active" } else { "" })
+                    })
+                })
+            });
+            eprintln!(
+                "[pointer] move delta=({:.1},{:.1}) at=({:.0},{:.0}) focus={:?} constraint={:?} fullscreen={}",
+                delta.x,
+                delta.y,
+                state.pointer_location.x,
+                state.pointer_location.y,
+                focus.as_ref().map(|s| s.id().protocol_id()),
+                constraint.flatten(),
+                state.fullscreen_window().is_some()
+            );
+        }
         if delta != Point::default() || delta_unaccel != Point::default() {
             ptr.relative_motion(
                 state,
@@ -250,6 +280,12 @@ fn maybe_activate_constraint(
             if !c.is_active() {
                 let point = (location - *origin).to_i32_round();
                 if c.region().is_none_or(|r| r.contains(point)) {
+                    if debug_pointer() {
+                        eprintln!(
+                            "[pointer] constraint on: surface {}",
+                            surface.id().protocol_id()
+                        );
+                    }
                     c.activate();
                 }
             }

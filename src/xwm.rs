@@ -109,6 +109,15 @@ impl XwmHandler for AppState {
         // До map — честно отвечаем на запрос размера, чтобы клиент не завис.
         // После map размер диктует наш тайлинг/физика.
         let mapped = self.x11_window(&surface).is_some();
+        if crate::input::debug_pointer() {
+            eprintln!(
+                "[pointer] x11 configure request {:?} {:?}x{:?} mapped={mapped} now={:?}",
+                (_x, _y),
+                w,
+                h,
+                surface.geometry()
+            );
+        }
         if !mapped {
             let mut geo = surface.geometry();
             if let Some(w) = w {
@@ -118,6 +127,11 @@ impl XwmHandler for AppState {
                 geo.size.h = h as i32;
             }
             let _ = surface.configure(geo);
+        } else {
+            // Отказ по ICCCM: синтетический ConfigureNotify с текущей
+            // геометрией, иначе клиент (SDL-игры) ждёт ответа и считает свои
+            // размер/позицию не теми, что на экране.
+            let _ = surface.configure(None);
         }
     }
 

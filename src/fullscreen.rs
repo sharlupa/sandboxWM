@@ -207,6 +207,13 @@ impl AppState {
         if let Some(x11) = window.x11_surface() {
             let target = Rectangle::from_size(self.output_size());
             if x11.geometry() != target {
+                if crate::input::debug_pointer() {
+                    eprintln!(
+                        "[pointer] fullscreen x11 {:?} -> {:?}",
+                        x11.geometry(),
+                        target
+                    );
+                }
                 let _ = x11.configure(target);
             }
         }
