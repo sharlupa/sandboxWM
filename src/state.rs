@@ -1247,8 +1247,18 @@ smithay::delegate_primary_selection!(AppState);
 // 6. Игры: относительное движение мыши и захват указателя (FPS-камера).
 impl PointerConstraintsHandler for AppState {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
-        // Захват включается, только когда указатель уже над поверхностью;
-        // иначе — при входе на неё (см. input.rs).
+        // Полноэкранная игра закрывает весь экран: указатель переводим на неё
+        // сразу, не дожидаясь движения мыши. Иначе захват ждал бы движения,
+        // а до тех пор XWayland не мог эмулировать возврат курсора в центр —
+        // игра видела смещение к нашему курсору и камеру «тянуло» в одну точку.
+        let fullscreen = self
+            .fullscreen_window()
+            .is_some_and(|w| w.wl_surface().as_deref() == Some(surface));
+        if fullscreen && pointer.current_focus().as_ref() != Some(surface) {
+            crate::input::refresh_pointer_focus(self);
+        }
+        // Иначе захват включается, только когда указатель уже над
+        // поверхностью, или при входе на неё (см. input.rs).
         if pointer.current_focus().as_ref() == Some(surface) {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(constraint) = constraint {

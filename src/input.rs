@@ -231,12 +231,18 @@ fn maybe_activate_constraint(
     let Some((surface, origin)) = focus else {
         return;
     };
+    let root = root_surface(surface);
     let keyboard_focus = state
         .seat
         .get_keyboard()
         .and_then(|k| k.current_focus())
         .and_then(|f| f.surface());
-    if keyboard_focus.as_ref() != Some(&root_surface(surface)) {
+    // Полноэкранное окно (игра) захватывает мышь всегда: другого окна под
+    // курсором всё равно нет.
+    let fullscreen = state
+        .fullscreen_window()
+        .is_some_and(|w| w.wl_surface().as_deref() == Some(&root));
+    if keyboard_focus.as_ref() != Some(&root) && !fullscreen {
         return;
     }
     with_pointer_constraint(surface, ptr, |constraint| {
