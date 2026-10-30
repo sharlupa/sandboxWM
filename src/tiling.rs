@@ -361,13 +361,40 @@ pub fn split_rect(
 }
 
 /// Shrink `rect` by `gaps` on every side.
+///
+/// The result never grows past the cell: a minimum of 100 px used to make
+/// windows in small cells (many windows on screen) overlap their neighbours.
 pub fn shrink(rect: Rectangle<i32, Logical>, gaps: i32) -> Rectangle<i32, Logical> {
+    let gx = gaps.min((rect.size.w - 1) / 2).max(0);
+    let gy = gaps.min((rect.size.h - 1) / 2).max(0);
     Rectangle::new(
-        (rect.loc.x + gaps, rect.loc.y + gaps).into(),
-        (
-            (rect.size.w - gaps * 2).max(100),
-            (rect.size.h - gaps * 2).max(100),
-        )
-            .into(),
+        (rect.loc.x + gx, rect.loc.y + gy).into(),
+        ((rect.size.w - gx * 2).max(1), (rect.size.h - gy * 2).max(1)).into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrink_stays_inside_cell() {
+        let cell = Rectangle::new((10, 20).into(), (60, 30).into());
+        let r = shrink(cell, 4);
+        assert_eq!(r, Rectangle::new((14, 24).into(), (52, 22).into()));
+        // Ячейка меньше двойного отступа: окно всё равно внутри неё.
+        let tiny = Rectangle::new((0, 0).into(), (5, 3).into());
+        let r = shrink(tiny, 4);
+        assert!(r.loc.x >= 0 && r.loc.x + r.size.w <= 5);
+        assert!(r.loc.y >= 0 && r.loc.y + r.size.h <= 3);
+        assert!(r.size.w >= 1 && r.size.h >= 1);
+    }
+
+    #[test]
+    fn split_never_overflows() {
+        let area = Rectangle::new((0, 0).into(), (101, 7).into());
+        let (a, b) = split_rect(area, SplitDir::H, 0.5);
+        assert_eq!(a.size.w + b.size.w, 101);
+        assert_eq!(b.loc.x, a.loc.x + a.size.w);
+    }
 }

@@ -173,7 +173,7 @@ impl CursorRenderer {
                     Kind::Cursor,
                 )
                 .into_iter()
-                .map(CustomRenderElements::CursorSurface)
+                .map(CustomRenderElements::Surface)
                 .collect()
             }
             CursorImageStatus::Named(icon) => {

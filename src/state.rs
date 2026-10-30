@@ -15,7 +15,7 @@ use smithay::{
     },
     input::{
         Seat, SeatHandler, SeatState,
-        pointer::{CursorImageStatus, Focus},
+        pointer::{CursorImageStatus, Focus, PointerHandle},
     },
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -25,11 +25,15 @@ use smithay::{
             protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
         },
     },
-    utils::{Clock, Logical, Monotonic, Rectangle, Serial, Size},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
         output::{OutputHandler, OutputManagerState},
+        pointer_constraints::{
+            PointerConstraintsHandler, PointerConstraintsState, with_pointer_constraint,
+        },
+        relative_pointer::RelativePointerManagerState,
         seat::WaylandFocus,
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -89,6 +93,13 @@ pub struct AppState {
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_output_manager_state: crate::output_manager::OutputManagerState,
     pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
+    /// wlr-layer-shell: панели (waybar), фоны, лаунчеры, уведомления.
+    pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
+    /// Относительное движение мыши и захват указателя — для игр.
+    pub relative_pointer_state: RelativePointerManagerState,
+    pub pointer_constraints_state: PointerConstraintsState,
+    /// ext-workspace-v1: рабочие столы для панелей.
+    pub ext_workspace_state: crate::ext_workspace::ExtWorkspaceState,
 
     // XWayland: shell-state, оконный менеджер X11 и номер X-дисплея
     pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
@@ -105,6 +116,13 @@ pub struct AppState {
     pub resize_start_ptr: Option<(f64, f64)>,
     pub resize_edges: Option<(bool, bool)>, // (drag_left, drag_top)
     pub tile_tree: Option<crate::tiling::TileNode>,
+
+    // ── Рабочие столы (см. workspace.rs) ────────────────────────────────
+    /// Данные неактивных столов; слот активного пуст — его данные в полях ниже.
+    pub workspaces: Vec<crate::workspace::Workspace>,
+    pub active_workspace: usize,
+    /// Полноэкранное окно активного стола (см. fullscreen.rs).
+    pub fullscreen: Option<crate::workspace::Fullscreen>,
 
     // ── Физический режим (см. sandbox.rs) ───────────────────────────────
     pub layout_mode: LayoutMode,
@@ -144,6 +162,8 @@ pub struct AppState {
     pub pointer_grab_target: Option<crate::sandbox::PointerTarget>,
     /// Кнопки, нажатия которых отданы клиентам (их отпускание — тоже клиентам).
     pub forwarded_buttons: std::collections::HashSet<u32>,
+    /// Нажатие ушло поверхности слоя (панели): до отпускания указатель — ей.
+    pub pointer_on_layer: bool,
     pub render_cache: crate::render::RenderCache,
 
     // ── Сессия (концепт §3) ─────────────────────────────────────────────
@@ -152,7 +172,10 @@ pub struct AppState {
     pub autosave: Option<crate::session::Autosave>,
     pub restorer: Option<crate::session::SessionRestorer>,
     pub pending_joints: Vec<crate::session::SavedJoint>,
-    pub restored_windows: std::collections::HashMap<usize, Vec<u32>>,
+    /// Восстановленные окна сессии: индекс → (рабочий стол, куски).
+    pub restored_windows: std::collections::HashMap<usize, (usize, Vec<u32>)>,
+    /// Рабочий стол каждого сохранённого окна (индекс — как в restorer).
+    pub restore_workspaces: Vec<usize>,
     /// Окна, для которых уже пробовали найти место в сессии.
     pub restore_tried: std::collections::HashSet<Window>,
     /// Команды из сессии, ждущие готовности XWayland.
@@ -212,6 +235,14 @@ impl AppState {
         // буферы; рендер-элементы Smithay учитывают viewport автоматически.
         let viewporter_state =
             smithay::wayland::viewporter::ViewporterState::new::<Self>(&display_handle);
+        let layer_shell_state =
+            smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<Self>(&display_handle);
+        let relative_pointer_state = RelativePointerManagerState::new::<Self>(&display_handle);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
+        let ext_workspace_state = crate::ext_workspace::ExtWorkspaceState::new(&display_handle);
+        let workspaces = (0..config.workspaces.count)
+            .map(|_| crate::workspace::Workspace::default())
+            .collect();
 
         Self {
             display_handle,
@@ -224,6 +255,10 @@ impl AppState {
             output_manager_state,
             wlr_output_manager_state,
             viewporter_state,
+            layer_shell_state,
+            relative_pointer_state,
+            pointer_constraints_state,
+            ext_workspace_state,
             xwayland_shell_state,
             xwm: None,
             xdisplay: None,
@@ -239,6 +274,9 @@ impl AppState {
             resize_start_ptr: None,
             resize_edges: None,
             tile_tree: None,
+            workspaces,
+            active_workspace: 0,
+            fullscreen: None,
             layout_mode: LayoutMode::default(),
             physics: None,
             pieces: Vec::new(),
@@ -258,6 +296,7 @@ impl AppState {
             last_physics_tick: None,
             pointer_grab_target: None,
             forwarded_buttons: Default::default(),
+            pointer_on_layer: false,
             soft: Default::default(),
             soft_grab: None,
             snapshots: Default::default(),
@@ -268,6 +307,7 @@ impl AppState {
             restorer: None,
             pending_joints: Vec::new(),
             restored_windows: Default::default(),
+            restore_workspaces: Vec::new(),
             restore_tried: Default::default(),
             pending_relaunch: Vec::new(),
             relaunch_deadline: None,
@@ -299,7 +339,14 @@ impl AppState {
     /// оно оставалось там, и после возврата в тайлинг закрытое окно занимало
     /// пустую ячейку (и даже заново попадало в Space).
     pub fn remove_window_common(&mut self, window: &Window) {
+        // Окно со скрытого рабочего стола: убираем из его данных.
+        if self.remove_hidden_window(window) {
+            return;
+        }
         let was_focused = self.get_focused_window().as_ref() == Some(window);
+        if self.is_fullscreen(window) {
+            self.fullscreen = None;
+        }
         self.space.unmap_elem(window);
         self.pending_configures.remove(window);
         self.physics_remove_window(window);
@@ -315,13 +362,20 @@ impl AppState {
             self.recalculate_layout();
         }
 
-        if was_focused || self.get_focused_window().is_none() {
-            let next_win = self
-                .space
-                .elements()
-                .rev()
-                .find(|w| !w.x11_surface().map_or(false, |x| x.is_override_redirect()))
-                .cloned();
+        // Фокус у панели/лаунчера не отнимаем.
+        let layer_focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|k| k.current_focus())
+            .is_some_and(|f| self.any_window_for_surface(&f).is_none());
+        if was_focused || (self.get_focused_window().is_none() && !layer_focused) {
+            let next_win = self.fullscreen_window().or_else(|| {
+                self.space
+                    .elements()
+                    .rev()
+                    .find(|w| !w.x11_surface().map_or(false, |x| x.is_override_redirect()))
+                    .cloned()
+            });
             if let Some(win) = next_win {
                 self.focus_window(&win);
             }
@@ -350,17 +404,26 @@ impl AppState {
         crate::config::parse_color(&self.config.rendering.background)
     }
 
-    /// Область тайлинга (экран минус внешние отступы).
+    /// Область тайлинга: экран без панелей (layer-shell) и внешних отступов.
     pub fn tiling_area(&self) -> Rectangle<i32, Logical> {
-        let screen = self.output_size();
+        let usable = self.usable_area();
         Rectangle::new(
-            (GAPS_OUT, GAPS_OUT).into(),
+            (usable.loc.x + GAPS_OUT, usable.loc.y + GAPS_OUT).into(),
             (
-                (screen.w - GAPS_OUT * 2).max(1),
-                (screen.h - GAPS_OUT * 2).max(1),
+                (usable.size.w - GAPS_OUT * 2).max(1),
+                (usable.size.h - GAPS_OUT * 2).max(1),
             )
                 .into(),
         )
+    }
+
+    /// Тайловый прямоугольник окна (как его расставит `recalculate_layout`).
+    pub fn tile_rect(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        let cell = self
+            .tile_tree
+            .as_ref()?
+            .area_for(window, self.tiling_area())?;
+        Some(crate::tiling::shrink(cell, GAPS_IN))
     }
 
     /// BSP tiling layout calculation.
@@ -378,6 +441,10 @@ impl AppState {
         let order: Vec<Window> = self.space.elements().cloned().collect();
         let mut moved = false;
         for (win, rect) in rects {
+            // Полноэкранное окно живёт вне тайлов.
+            if self.is_fullscreen(&win) {
+                continue;
+            }
             moved |= self.apply_window_geometry(&win, rect);
         }
         if moved {
@@ -385,6 +452,65 @@ impl AppState {
                 self.space.raise_element(w, false);
             }
         }
+        self.place_fullscreen_window();
+    }
+
+    /// Где поставить окно в тайле `rect`. Пока клиент не перерисовался в
+    /// новый размер, окно прижато к неподвижному краю тайла (ресайз за
+    /// левый/верхний край без рывков); как только размер совпал — ровно в
+    /// тайл. Раньше прижатое положение так и оставалось после коммита: окно,
+    /// занявшее место закрытого соседа слева, уезжало за правый край экрана.
+    fn tile_location(&self, window: &Window, rect: Rectangle<i32, Logical>) -> Point<i32, Logical> {
+        let current = window.geometry().size;
+        let mut loc = rect.loc;
+        if current == rect.size {
+            return loc;
+        }
+        if let Some(old_geo) = self.space.element_geometry(window) {
+            let old_right = old_geo.loc.x + old_geo.size.w;
+            let old_bottom = old_geo.loc.y + old_geo.size.h;
+            let target_right = rect.loc.x + rect.size.w;
+            let target_bottom = rect.loc.y + rect.size.h;
+            if (target_right - old_right).abs() < 5 && rect.loc.x != old_geo.loc.x {
+                loc.x = target_right - current.w;
+            }
+            if (target_bottom - old_bottom).abs() < 5 && rect.loc.y != old_geo.loc.y {
+                loc.y = target_bottom - current.h;
+            }
+        }
+        loc
+    }
+
+    /// Коммит окна в тайлинге: после смены размера поставить его ровно в
+    /// свой тайл (см. [`Self::tile_location`]).
+    fn reposition_tiled_window(&mut self, window: &Window) {
+        if self.layout_mode != LayoutMode::Tiling
+            || self.is_fullscreen(window)
+            || window
+                .x11_surface()
+                .is_some_and(|x| x.is_override_redirect())
+        {
+            return;
+        }
+        let Some(rect) = self.tile_rect(window) else {
+            return;
+        };
+        let loc = self.tile_location(window, rect);
+        if self.space.element_location(window) == Some(loc) {
+            return;
+        }
+        let order: Vec<Window> = self.space.elements().cloned().collect();
+        self.space.map_element(window.clone(), loc, false);
+        for w in &order {
+            self.space.raise_element(w, false);
+        }
+        if let Some(x11) = window.x11_surface() {
+            let target = Rectangle::new(loc, rect.size);
+            if x11.geometry() != target {
+                let _ = x11.configure(target);
+            }
+        }
+        self.needs_render = true;
     }
 
     /// Ставит окно в прямоугольник тайла. Возвращает true, если окно
@@ -394,28 +520,7 @@ impl AppState {
             // Окно уже закрыто/размаплено — не возвращаем его в Space.
             return false;
         }
-        let current_buffer_geo = window.geometry();
-        let mut loc = rect.loc;
-
-        if let Some(old_geo) = self.space.element_geometry(window) {
-            let old_left = old_geo.loc.x;
-            let old_right = old_geo.loc.x + old_geo.size.w;
-            let target_right = rect.loc.x + rect.size.w;
-
-            let old_top = old_geo.loc.y;
-            let old_bottom = old_geo.loc.y + old_geo.size.h;
-            let target_bottom = rect.loc.y + rect.size.h;
-
-            // If the right edge is conceptually fixed, anchor visual location to the right
-            if (target_right - old_right).abs() < 5 && (rect.loc.x - old_left).abs() > 0 {
-                loc.x = target_right - current_buffer_geo.size.w;
-            }
-
-            // If the bottom edge is conceptually fixed, anchor visual location to the bottom
-            if (target_bottom - old_bottom).abs() < 5 && (rect.loc.y - old_top).abs() > 0 {
-                loc.y = target_bottom - current_buffer_geo.size.h;
-            }
-        }
+        let loc = self.tile_location(window, rect);
 
         let moved = self.space.element_location(window) != Some(loc);
         if moved {
@@ -477,6 +582,13 @@ impl AppState {
             .map_or(false, |x| x.is_override_redirect())
         {
             return;
+        }
+        // Фокус ушёл на другое окно (Super+стрелки, перенос) — полноэкранное
+        // окно возвращается в обычный размер, иначе фокус был бы невидим.
+        if let Some(fs) = self.fullscreen_window() {
+            if &fs != window {
+                self.set_fullscreen(&fs, false);
+            }
         }
 
         let already_focused = self
@@ -682,6 +794,11 @@ impl CompositorHandler for AppState {
         // Обновляем буферы рендера
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
+        // Панель/фон/лаунчер (layer-shell).
+        if self.layer_commit(surface) {
+            return;
+        }
+
         // Найдём окно, которому принадлежит эта поверхность, и обновим его bbox.
         // ВАЖНО: recalculate_layout() здесь НЕ вызываем — это создаёт петлю
         // commit → configure → commit → ... (~30–40% CPU на простое рабочем столе,
@@ -694,11 +811,33 @@ impl CompositorHandler for AppState {
                 break;
             }
         }
+        if found.is_none() {
+            // Окно скрытого рабочего стола: на экране его нет, но ответ на
+            // configure засчитываем, иначе после возврата ему не уйдёт новый.
+            if let Some(window) =
+                self.find_hidden_window(|w| w.wl_surface().as_deref() == Some(surface))
+            {
+                window.on_commit();
+                self.pending_configures.remove(&window);
+                return;
+            }
+        }
         if let Some(window) = found {
             window.on_commit();
             // Client has committed a buffer, meaning it has processed the last
             // configure event. We can send new configure events to it now.
             self.pending_configures.remove(&window);
+            // Размер, отложенный backpressure-ом (например, сосед закрылся,
+            // пока клиент ещё не ответил на прошлый configure), уходит сейчас:
+            // иначе окно так и оставалось старого размера.
+            if let Some(toplevel) = window.toplevel() {
+                if toplevel.is_initial_configure_sent() && toplevel.has_pending_changes() {
+                    toplevel.send_configure();
+                    self.pending_configures.insert(window.clone());
+                }
+            }
+            // Окно перерисовалось в размер тайла — ставим его ровно в тайл.
+            self.reposition_tiled_window(&window);
 
             let is_or = window
                 .x11_surface()
@@ -767,7 +906,15 @@ impl ShmHandler for AppState {
 smithay::delegate_shm!(AppState);
 
 // 2.5 Output
-impl OutputHandler for AppState {}
+impl OutputHandler for AppState {
+    fn output_bound(
+        &mut self,
+        _output: smithay::output::Output,
+        wl_output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+    ) {
+        self.ext_workspace_output_bound(&wl_output);
+    }
+}
 smithay::delegate_output!(AppState);
 
 // 3. XDG Shell
@@ -803,18 +950,64 @@ impl XdgShellHandler for AppState {
             self.recalculate_layout();
         }
 
-        // Передаём клавиатурный фокус новому окну
-        self.focus_window(&window);
+        // Передаём клавиатурный фокус новому окну. Поверх полноэкранного
+        // (игра) новое окно не выскакивает: остаётся под ним без фокуса.
+        if self.fullscreen_window().is_some() {
+            self.place_fullscreen_window();
+        } else {
+            self.focus_window(&window);
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let is_it = |w: &Window| w.toplevel().map(|t| t == &surface).unwrap_or(false);
         let window = self
             .space
             .elements()
-            .find(|w| w.toplevel().map(|t| t == &surface).unwrap_or(false))
-            .cloned();
+            .find(|w| is_it(w))
+            .cloned()
+            .or_else(|| self.find_hidden_window(is_it));
         if let Some(window) = window {
             self.remove_window_common(&window);
+        }
+    }
+
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        let is_it = |w: &Window| w.toplevel().map(|t| t == &surface).unwrap_or(false);
+        let window = self
+            .space
+            .elements()
+            .find(|w| is_it(w))
+            .cloned()
+            .or_else(|| self.find_hidden_window(is_it));
+        match window {
+            Some(window) => self.set_fullscreen(&window, true),
+            None => {
+                // До map: просто подтверждаем состояние (окно встанет в тайл).
+                surface.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                });
+                if surface.is_initial_configure_sent() {
+                    surface.send_configure();
+                }
+            }
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let is_it = |w: &Window| w.toplevel().map(|t| t == &surface).unwrap_or(false);
+        let window = self
+            .space
+            .elements()
+            .find(|w| is_it(w))
+            .cloned()
+            .or_else(|| self.find_hidden_window(is_it));
+        if let Some(window) = window {
+            self.set_fullscreen(&window, false);
         }
     }
 
@@ -969,6 +1162,21 @@ impl SeatHandler for AppState {
         let client = focused.and_then(|s| self.display_handle.get_client(s.id()).ok());
         set_data_device_focus(&self.display_handle, seat, client.clone());
         set_primary_focus(&self.display_handle, seat, client);
+        // Клавиатура ушла с игры — захват мыши снимается, иначе
+        // заблокированный курсор так и не покинул бы её окно.
+        if let Some(pointer) = seat.get_pointer() {
+            if let Some(surface) = pointer.current_focus() {
+                if focused != Some(&surface) {
+                    with_pointer_constraint(&surface, &pointer, |constraint| {
+                        if let Some(c) = constraint {
+                            if c.is_active() {
+                                c.deactivate();
+                            }
+                        }
+                    });
+                }
+            }
+        }
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
@@ -1001,3 +1209,57 @@ impl PrimarySelectionHandler for AppState {
 
 smithay::delegate_data_device!(AppState);
 smithay::delegate_primary_selection!(AppState);
+
+// 6. Игры: относительное движение мыши и захват указателя (FPS-камера).
+impl PointerConstraintsHandler for AppState {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        // Захват включается, только когда указатель уже над поверхностью;
+        // иначе — при входе на неё (см. input.rs).
+        if pointer.current_focus().as_ref() == Some(surface) {
+            with_pointer_constraint(surface, pointer, |constraint| {
+                if let Some(constraint) = constraint {
+                    constraint.activate();
+                }
+            });
+        }
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
+    ) {
+        let active = with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.is_some_and(|c| c.is_active())
+        });
+        if !active {
+            return;
+        }
+        if let Some(origin) = self.surface_screen_origin(surface) {
+            let pos = origin + location;
+            pointer.set_location(pos);
+            self.pointer_location = pos;
+            self.needs_render = true;
+        }
+    }
+}
+smithay::delegate_pointer_constraints!(AppState);
+smithay::delegate_relative_pointer!(AppState);
+
+impl AppState {
+    /// Где на экране начало поверхности окна (тайлинг или полноэкранное
+    /// окно; в физике окна повёрнуты/масштабированы — `None`).
+    pub fn surface_screen_origin(&self, surface: &WlSurface) -> Option<Point<f64, Logical>> {
+        let window = self.window_for_surface(surface)?;
+        let geo_loc = window.geometry().loc;
+        if self.is_fullscreen(&window) {
+            return Some((Point::<i32, Logical>::default() - geo_loc).to_f64());
+        }
+        if self.layout_mode != LayoutMode::Tiling {
+            return None;
+        }
+        let loc = self.space.element_location(&window)?;
+        Some((loc - geo_loc).to_f64())
+    }
+}

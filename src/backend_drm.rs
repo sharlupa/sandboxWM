@@ -362,7 +362,9 @@ pub fn run_tty(
             );
 
             let mut comp = compositor_t.borrow_mut();
-            let frame_flags = if state.layout_mode == crate::state::LayoutMode::Physics {
+            let frame_flags = if state.layout_mode == crate::state::LayoutMode::Physics
+                && state.fullscreen_window().is_none()
+            {
                 // Без primary/overlay scanout: иначе DRM кладёт неповёрнутый буфер
                 // на плоскость рядом с GLES-поворотом → «копия» окна на кадр.
                 // Cursor-плоскость безопасна: на неё попадают только Kind::Cursor.
@@ -380,14 +382,7 @@ pub fn run_tty(
                     comp.queue_frame(()).ok();
                     state.space.refresh();
                     let now = state.clock.now();
-                    for window in state.space.elements() {
-                        window.send_frame(
-                            &output_t,
-                            now,
-                            Some(Duration::ZERO),
-                            |_, _| Some(output_t.clone()),
-                        );
-                    }
+                    crate::render::send_frames(state, &output_t, now);
                     crate::cursor::send_frames(&state.cursor_status, &output_t, now);
 
                     // Frame submitted successfully — clear the damage flag so we
@@ -443,6 +438,7 @@ pub fn run_tty(
     // referencing a partially-torn-down world during field-order drops).
     state.pieces.clear();
     state.physics = None;
+    state.workspaces.clear();
 
     drop(loop_handle);
     drop(event_loop);

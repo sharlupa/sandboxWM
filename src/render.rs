@@ -1,6 +1,7 @@
 //! Render-элементы и сборка кадра.
 //!
-//! В тайлинге кадр строит обычный [`Space`]. В физическом режиме каждое окно
+//! В тайлинге окна рисуются как есть, обрезанные по своему тайлу (клиент,
+//! не умеющий сжаться до тайла, не налезает на соседей). В физическом режиме каждое окно
 //! состоит из одного или нескольких кусков (разрезание ножом) и рисуется
 //! [`PhysicsElement`]-ами: текстура поверхности, повёрнутая/масштабированная
 //! аффинным преобразованием «координаты окна → экран» и обрезанная по
@@ -10,6 +11,9 @@
 //! меняется буфер поверхности или трансформа куска. Раньше все физические
 //! элементы делили общий счётчик и отдавали полный damage каждый кадр — любое
 //! движение мыши в DRM-режиме перекомпоновывало все окна целиком.
+//!
+//! Слои layer-shell (панели, фоны) и полноэкранное окно рисуются в экранных
+//! координатах в обоих режимах.
 
 use std::collections::HashMap;
 
@@ -18,12 +22,15 @@ use smithay::backend::renderer::{
     element::{
         Element, Id, Kind, RenderElement, UnderlyingStorage, render_elements,
         solid::SolidColorRenderElement,
-        surface::{WaylandSurfaceRenderElement, WaylandSurfaceTexture},
+        surface::{
+            WaylandSurfaceRenderElement, WaylandSurfaceTexture, render_elements_from_surface_tree,
+        },
+        utils::CropRenderElement,
     },
     gles::{GlesError, GlesFrame, GlesRenderer},
     utils::{CommitCounter, DamageSet, OpaqueRegions},
 };
-use smithay::desktop::{PopupManager, Window, space::SpaceRenderElements};
+use smithay::desktop::{PopupManager, Window};
 use smithay::output::Output;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::seat::WaylandFocus;
@@ -33,9 +40,11 @@ use crate::state::AppState;
 
 render_elements! {
     pub CustomRenderElements<=GlesRenderer>;
-    Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    /// Поверхность как есть: окна тайлинга/полноэкранное, слои, курсор.
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    /// Поверхность окна, обрезанная по тайлу.
+    Cropped=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     Cursor=SolidColorRenderElement,
-    CursorSurface=WaylandSurfaceRenderElement<GlesRenderer>,
     CursorImage=smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
     Physics=PhysicsElement,
     Overlay=crate::overlay::OverlayElement,
@@ -731,6 +740,11 @@ fn tiling_borders(state: &mut AppState) -> Vec<CustomRenderElements> {
         if width <= 0.0 {
             continue;
         }
+        // Окно больше тайла обрезано по нему — рамка тоже.
+        let geo = state
+            .tile_rect(&window)
+            .and_then(|tile| tile.intersection(geo))
+            .unwrap_or(geo);
         let e = width * 0.5;
         let (x0, y0) = (geo.loc.x as f32 - e, geo.loc.y as f32 - e);
         let (x1, y1) = (
@@ -764,6 +778,101 @@ fn overlay_elements(state: &mut AppState) -> Vec<CustomRenderElements> {
     out
 }
 
+/// Окно в экранных координатах: начало его геометрии — в `screen_loc`.
+/// Попапы — поверх и без обрезки, само окно — обрезанное по `crop`.
+fn window_elements(
+    renderer: &mut GlesRenderer,
+    window: &Window,
+    screen_loc: Point<i32, Logical>,
+    crop: Option<Rectangle<i32, Logical>>,
+) -> Vec<CustomRenderElements> {
+    let mut out = Vec::new();
+    let Some(surface) = window.wl_surface().map(|s| s.into_owned()) else {
+        return out;
+    };
+    for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
+        let loc = screen_loc + popup_offset - popup.geometry().loc;
+        let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            render_elements_from_surface_tree(
+                renderer,
+                popup.wl_surface(),
+                loc.to_physical(1),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            );
+        out.extend(elements.into_iter().map(CustomRenderElements::Surface));
+    }
+    let loc = screen_loc - window.geometry().loc;
+    let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+        render_elements_from_surface_tree(
+            renderer,
+            &surface,
+            loc.to_physical(1),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        );
+    match crop {
+        Some(crop) => {
+            let crop = Rectangle::new(crop.loc.to_physical(1), crop.size.to_physical(1));
+            out.extend(
+                elements
+                    .into_iter()
+                    .filter_map(|e| CropRenderElement::from_element(e, 1.0, crop))
+                    .map(CustomRenderElements::Cropped),
+            );
+        }
+        None => out.extend(elements.into_iter().map(CustomRenderElements::Surface)),
+    }
+    out
+}
+
+fn is_override_redirect(window: &Window) -> bool {
+    window
+        .x11_surface()
+        .is_some_and(|x| x.is_override_redirect())
+}
+
+/// Окна тайлинга front-to-back, каждое обрезано по своему тайлу.
+fn tiling_window_elements(
+    renderer: &mut GlesRenderer,
+    state: &AppState,
+) -> Vec<CustomRenderElements> {
+    let mut out = Vec::new();
+    for window in state.space.elements().rev() {
+        let Some(geo) = state.space.element_geometry(window) else {
+            continue;
+        };
+        let crop = if is_override_redirect(window) {
+            None
+        } else {
+            state.tile_rect(window)
+        };
+        out.extend(window_elements(renderer, window, geo.loc, crop));
+    }
+    out
+}
+
+/// X11-меню/тултипы (override-redirect): их координаты всегда экранные.
+fn override_redirect_elements(
+    renderer: &mut GlesRenderer,
+    state: &AppState,
+) -> Vec<CustomRenderElements> {
+    let mut out = Vec::new();
+    for window in state
+        .space
+        .elements()
+        .rev()
+        .filter(|w| is_override_redirect(w))
+    {
+        if let Some(geo) = state.space.element_geometry(window) {
+            out.extend(window_elements(renderer, window, geo.loc, None));
+        }
+    }
+    out
+}
+
 /// Все элементы кадра (без курсора), front-to-back. Общая точка для winit
 /// и DRM, чтобы оба бэкенда рисовали одно и то же.
 pub fn frame_elements(
@@ -771,20 +880,40 @@ pub fn frame_elements(
     state: &mut AppState,
     output: &Output,
 ) -> Vec<CustomRenderElements> {
-    if state.layout_mode == crate::state::LayoutMode::Tiling {
-        let mut elements: Vec<CustomRenderElements> = state
-            .space
-            .render_elements_for_output(renderer, output, 1.0)
-            .unwrap_or_default()
-            .into_iter()
-            .map(CustomRenderElements::Space)
-            .collect();
-        elements.extend(tiling_borders(state));
+    use crate::layer_shell::layer_elements;
+    use smithay::wayland::shell::wlr_layer::Layer;
+    // Полноэкранное окно: только оно, его X11-меню и слой overlay.
+    if let Some(window) = state.fullscreen_window() {
+        let mut elements = layer_elements(renderer, output, &[Layer::Overlay]);
+        elements.extend(override_redirect_elements(renderer, state));
+        elements.extend(window_elements(renderer, &window, (0, 0).into(), None));
         return elements;
     }
-    let mut elements = overlay_elements(state);
-    elements.extend(collect_physics_elements(renderer, state));
+    let mut elements = layer_elements(renderer, output, &[Layer::Overlay, Layer::Top]);
+    if state.layout_mode == crate::state::LayoutMode::Tiling {
+        elements.extend(tiling_window_elements(renderer, state));
+        elements.extend(tiling_borders(state));
+    } else {
+        elements.extend(overlay_elements(state));
+        elements.extend(collect_physics_elements(renderer, state));
+    }
+    elements.extend(layer_elements(
+        renderer,
+        output,
+        &[Layer::Bottom, Layer::Background],
+    ));
     elements
+}
+
+/// Кадровые колбэки после отрисовки: окнам активного стола и слоям.
+/// Окна скрытых столов колбэков не получают (как свёрнутые).
+pub fn send_frames<T: Into<std::time::Duration> + Copy>(state: &AppState, output: &Output, now: T) {
+    for window in state.space.elements() {
+        window.send_frame(output, now, Some(std::time::Duration::ZERO), |_, _| {
+            Some(output.clone())
+        });
+    }
+    state.send_layer_frames(output, now);
 }
 
 #[cfg(test)]

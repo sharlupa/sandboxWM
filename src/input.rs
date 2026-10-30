@@ -12,10 +12,13 @@ use smithay::{
     },
     input::{
         keyboard::{FilterResult, keysyms as xkb},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle, RelativeMotionEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER, Serial},
+    wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    wayland::seat::WaylandFocus,
+    wayland::shell::wlr_layer::Layer,
 };
 
 // BTN_LEFT = 272 (0x110)
@@ -86,13 +89,35 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
         InputEvent::PointerMotion { event } => {
             let serial = SERIAL_COUNTER.next_serial();
             let cur = state.pointer_location;
-            handle_pointer_motion(
-                state,
-                cur.x + event.delta_x(),
-                cur.y + event.delta_y(),
-                serial,
-                event.time_msec(),
-            );
+            let (mut x, mut y) = (cur.x + event.delta_x(), cur.y + event.delta_y());
+            // Игры: относительное движение — всегда, захват (lock) держит
+            // курсор на месте, confine не выпускает его из окна.
+            if let Some(ptr) = state.seat.get_pointer() {
+                let focus = ptr.current_focus();
+                ptr.relative_motion(
+                    state,
+                    focus.clone().map(|s| (s, Point::default())),
+                    &RelativeMotionEvent {
+                        delta: event.delta(),
+                        delta_unaccel: event.delta_unaccel(),
+                        utime: event.time(),
+                    },
+                );
+                match focus.as_ref().and_then(|s| active_constraint(&ptr, s)) {
+                    Some(Constraint::Locked) => {
+                        ptr.frame(state);
+                        return;
+                    }
+                    Some(Constraint::Confined) => {
+                        if let Some(rect) = focus.as_ref().and_then(|s| confine_rect(state, s)) {
+                            x = x.clamp(rect.loc.x, rect.loc.x + rect.size.w - 1.0);
+                            y = y.clamp(rect.loc.y, rect.loc.y + rect.size.h - 1.0);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            handle_pointer_motion(state, x, y, serial, event.time_msec());
         }
         InputEvent::PointerMotionAbsolute { event } => {
             // Планшеты / тачпады в абсолютном режиме / VM-указатели.
@@ -119,6 +144,90 @@ pub fn process_libinput_event(state: &mut AppState, event: InputEvent<LibinputIn
     }
 }
 
+/// Активный захват указателя на поверхности.
+enum Constraint {
+    Locked,
+    Confined,
+}
+
+fn active_constraint(ptr: &PointerHandle<AppState>, surface: &WlSurface) -> Option<Constraint> {
+    with_pointer_constraint(surface, ptr, |constraint| match constraint {
+        Some(c) if c.is_active() => Some(match &*c {
+            PointerConstraint::Locked(_) => Constraint::Locked,
+            PointerConstraint::Confined(_) => Constraint::Confined,
+        }),
+        _ => None,
+    })
+}
+
+/// Экранный прямоугольник окна, в котором удерживается курсор (confine).
+fn confine_rect(
+    state: &AppState,
+    surface: &WlSurface,
+) -> Option<smithay::utils::Rectangle<f64, Logical>> {
+    let origin = state.surface_screen_origin(surface)?;
+    let window = state.any_window_for_surface(surface)?;
+    let geo = window.geometry();
+    Some(smithay::utils::Rectangle::new(
+        origin + geo.loc.to_f64(),
+        geo.size.to_f64(),
+    ))
+}
+
+/// Корень дерева поверхностей (подповерхность → её окно).
+fn root_surface(surface: &WlSurface) -> WlSurface {
+    let mut root = surface.clone();
+    while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+        root = parent;
+    }
+    root
+}
+
+/// Указатель вошёл на поверхность с захватом — включаем его, но только у
+/// окна с клавиатурным фокусом (иначе мышь «залипла» бы при наведении).
+fn maybe_activate_constraint(
+    state: &AppState,
+    ptr: &PointerHandle<AppState>,
+    focus: Option<&(WlSurface, Point<f64, Logical>)>,
+    location: Point<f64, Logical>,
+) {
+    let Some((surface, origin)) = focus else {
+        return;
+    };
+    let keyboard_focus = state.seat.get_keyboard().and_then(|k| k.current_focus());
+    if keyboard_focus.as_ref() != Some(&root_surface(surface)) {
+        return;
+    }
+    with_pointer_constraint(surface, ptr, |constraint| {
+        if let Some(c) = constraint {
+            if !c.is_active() {
+                let point = (location - *origin).to_i32_round();
+                if c.region().is_none_or(|r| r.contains(point)) {
+                    c.activate();
+                }
+            }
+        }
+    });
+}
+
+/// Пересчитать фокус указателя на месте (сменился рабочий стол, окно ушло
+/// на весь экран и т.п.).
+pub fn refresh_pointer_focus(state: &mut AppState) {
+    let pos = state.pointer_location;
+    let time = std::time::Duration::from(state.clock.now()).as_millis() as u32;
+    handle_pointer_motion(state, pos.x, pos.y, SERIAL_COUNTER.next_serial(), time);
+}
+
+/// Номер рабочего стола по физической клавише верхнего ряда:
+/// 1…9 → 0…8, 0 → 9.
+fn workspace_from_evdev(evdev: u32) -> Option<usize> {
+    match evdev {
+        2..=10 => Some((evdev - 2) as usize),
+        11 => Some(9),
+        _ => None,
+    }
+}
+
 fn handle_pointer_axis(
     state: &mut AppState,
     horizontal: f64,
@@ -129,7 +238,11 @@ fn handle_pointer_axis(
     time: u32,
 ) {
     // Super+колесо в физическом режиме — зум камеры к курсору, клиенту не шлём.
-    if state.layout_mode == LayoutMode::Physics && super_held(state) && vertical != 0.0 {
+    if state.layout_mode == LayoutMode::Physics
+        && state.fullscreen_window().is_none()
+        && super_held(state)
+        && vertical != 0.0
+    {
         state.zoom_camera(if vertical < 0.0 { 1.1 } else { 1.0 / 1.1 });
         return;
     }
@@ -228,6 +341,21 @@ fn handle_key(
         return FilterResult::Intercept(());
     }
 
+    // Super+цифра — рабочий стол, Super+Shift+цифра — перенести туда окно.
+    // По физической клавише: работает в любой раскладке и с Shift.
+    if key_state == KeyState::Pressed && modifiers.logo {
+        if let Some(idx) = workspace_from_evdev(evdev) {
+            if idx < app_state.workspaces.len() {
+                if modifiers.shift {
+                    app_state.move_focused_to_workspace(idx);
+                } else {
+                    app_state.switch_workspace(idx);
+                }
+                return FilterResult::Intercept(());
+            }
+        }
+    }
+
     // Бинд совпадает по символу с модификаторами, по латинскому символу
     // без них (кириллица) или — для цифр — по физической клавише
     // (AZERTY: «1» на первом уровне даёт `&`).
@@ -238,7 +366,8 @@ fn handle_key(
             || C::matches_digit_key(name, evdev)
     };
 
-    if app_state.layout_mode == LayoutMode::Physics {
+    // Камера и вращение не трогают полноэкранное окно (игра).
+    if app_state.layout_mode == LayoutMode::Physics && app_state.fullscreen_window().is_none() {
         if modifiers.logo && key_state == KeyState::Pressed {
             if base == xkb::KEY_minus {
                 app_state.zoom_camera(1.0 / 1.1);
@@ -303,7 +432,8 @@ fn handle_key(
     }
 
     type Action = fn(&mut AppState);
-    let actions: [(&str, Action); 16] = [
+    let actions: [(&str, Action); 17] = [
+        (&ctrl.fullscreen, AppState::toggle_fullscreen_focused),
         (&ctrl.toggle_physics, AppState::toggle_physics),
         // Режимы гравитации (концепт §1).
         (&ctrl.gravity_normal, AppState::gravity_normal),
@@ -345,7 +475,9 @@ fn handle_key(
     for (name, (dx, dy)) in arrows {
         if mk(name) {
             if app_state.layout_mode == LayoutMode::Physics {
-                app_state.move_camera(dx * step, dy * step);
+                if app_state.fullscreen_window().is_none() {
+                    app_state.move_camera(dx * step, dy * step);
+                }
             } else {
                 app_state.focus_direction(dx, dy);
             }
@@ -416,6 +548,59 @@ fn physics_pointer_focus(
     }
 }
 
+/// Что под указателем вне активных взаимодействий WM: (поверхность и её
+/// начало, позиция для клиента, окно). Порядок: панели и лаунчеры
+/// (layer-shell `overlay`/`top`), полноэкранное окно, окна режима, фоновые
+/// слои (`bottom`/`background`).
+fn pointer_focus(
+    state: &mut AppState,
+    x: f64,
+    y: f64,
+) -> (
+    Option<(WlSurface, Point<f64, Logical>)>,
+    Point<f64, Logical>,
+    Option<smithay::desktop::Window>,
+) {
+    let pos: Point<f64, Logical> = (x, y).into();
+    // Кнопка зажата над панелью — до отпускания всё идёт панели.
+    if state.pointer_on_layer && !state.forwarded_buttons.is_empty() {
+        let focus = state
+            .layer_surface_under(pos, state.upper_layers())
+            .map(|(focus, _)| focus);
+        return (focus, pos, None);
+    }
+    if state.forwarded_buttons.is_empty() {
+        if let Some((focus, _)) = state.layer_surface_under(pos, state.upper_layers()) {
+            return (Some(focus), pos, None);
+        }
+    }
+    let (focus, location, window) = if let Some(window) = state.fullscreen_window() {
+        let render_loc = (Point::<i32, Logical>::default() - window.geometry().loc).to_f64();
+        let focus = window
+            .surface_under(pos - render_loc, smithay::desktop::WindowSurfaceType::ALL)
+            .map(|(surface, loc)| (surface, render_loc + loc.to_f64()));
+        (focus, pos, Some(window))
+    } else if state.layout_mode == LayoutMode::Physics {
+        let (focus, location) = physics_pointer_focus(state, x, y);
+        let window = state.physics_pointer_target(x, y).map(|(t, _)| t.window);
+        (focus, location, window)
+    } else {
+        match tiling_focus(state, pos) {
+            Some((focus, window)) => (Some(focus), pos, Some(window)),
+            None => (None, pos, None),
+        }
+    };
+    if focus.is_none() && window.is_none() && state.forwarded_buttons.is_empty() {
+        // Над пустым столом — фоновые слои (виджеты рабочего стола).
+        if let Some((focus, _)) =
+            state.layer_surface_under(pos, &[Layer::Bottom, Layer::Background])
+        {
+            return (Some(focus), pos, None);
+        }
+    }
+    (focus, location, window)
+}
+
 /// Update pointer position and find the window under cursor
 fn handle_pointer_motion(state: &mut AppState, mut x: f64, mut y: f64, serial: Serial, time: u32) {
     // Clamp to screen bounds
@@ -429,77 +614,68 @@ fn handle_pointer_motion(state: &mut AppState, mut x: f64, mut y: f64, serial: S
         state.needs_render = true;
     }
 
-    if state.layout_mode == LayoutMode::Physics {
+    let (focus, location) = if state.fullscreen_window().is_some() {
+        let (focus, location, _) = pointer_focus(state, x, y);
+        (focus, location)
+    } else if state.layout_mode == LayoutMode::Physics {
         // Удержание средней кнопки двигает камеру как схваченный холст.
         if state.physics_camera_pan_update(x, y) {
             return;
         }
         state.tool_motion(x, y);
         state.soft_grab_update(x, y);
-        let (focus, location) = if state.dragging || state.tool_active() || state.soft_grab_active()
-        {
-            // Пока тащим окно или работаем инструментом, ховер клиентам не нужен.
-            (None, pos)
-        } else {
-            physics_pointer_focus(state, x, y)
-        };
         if state.dragging {
             state.needs_render = true;
         }
-        reset_cursor_over_desktop(state, focus.is_none());
-        if let Some(ptr) = state.seat.get_pointer() {
-            ptr.motion(
-                state,
-                focus,
-                &MotionEvent {
-                    location,
-                    serial,
-                    time,
-                },
-            );
-            ptr.frame(state);
+        if state.dragging || state.tool_active() || state.soft_grab_active() {
+            // Пока тащим окно или работаем инструментом, ховер клиентам не нужен.
+            (None, pos)
+        } else {
+            let (focus, location, _) = pointer_focus(state, x, y);
+            (focus, location)
         }
-        return;
-    }
-
-    // --- Super+LMB tile resize ---
-    if let (Some(resize_win), Some((start_x, start_y)), Some((drag_left, drag_top))) = (
-        state.resize_window.clone(),
-        state.resize_start_ptr,
-        state.resize_edges,
-    ) {
-        let dx = x - start_x;
-        let dy = y - start_y;
-        if dx.abs() < 1.0 && dy.abs() < 1.0 {
+    } else {
+        // --- Super+LMB tile resize ---
+        if let (Some(resize_win), Some((start_x, start_y)), Some((drag_left, drag_top))) = (
+            state.resize_window.clone(),
+            state.resize_start_ptr,
+            state.resize_edges,
+        ) {
+            let dx = x - start_x;
+            let dy = y - start_y;
+            if dx.abs() < 1.0 && dy.abs() < 1.0 {
+                return;
+            }
+            let area = state.tiling_area();
+            if let Some(mut tree) = state.tile_tree.take() {
+                if tree.resize_target(&resize_win, dx, dy, drag_left, drag_top, area) {
+                    state.resize_start_ptr = Some((x, y));
+                    // Раскладка — раз в кадр через layout_dirty, а не на каждое
+                    // событие мыши (100–1000 Гц).
+                    state.layout_dirty = true;
+                    state.needs_render = true;
+                }
+                state.tile_tree = Some(tree);
+            }
             return;
         }
-        let area = state.tiling_area();
-        if let Some(mut tree) = state.tile_tree.take() {
-            if tree.resize_target(&resize_win, dx, dy, drag_left, drag_top, area) {
-                state.resize_start_ptr = Some((x, y));
-                // Раскладка — раз в кадр через layout_dirty, а не на каждое
-                // событие мыши (100–1000 Гц).
-                state.layout_dirty = true;
-                state.needs_render = true;
-            }
-            state.tile_tree = Some(tree);
-        }
-        return;
-    }
+        let (focus, location, _) = pointer_focus(state, x, y);
+        (focus, location)
+    };
 
-    let under = tiling_focus(state, pos);
-    reset_cursor_over_desktop(state, under.is_none());
+    reset_cursor_over_desktop(state, focus.is_none());
     if let Some(ptr) = state.seat.get_pointer() {
         ptr.motion(
             state,
-            under,
+            focus.clone(),
             &MotionEvent {
-                location: pos,
+                location,
                 serial,
                 time,
             },
         );
         ptr.frame(state);
+        maybe_activate_constraint(state, &ptr, focus.as_ref(), location);
     }
 }
 
@@ -516,18 +692,39 @@ fn reset_cursor_over_desktop(state: &mut AppState, nothing_under: bool) {
     }
 }
 
-/// Поверхность под точкой в тайлинге (координаты Space = экранные).
+/// Поверхность и окно под точкой в тайлинге (координаты Space = экранные).
+/// Окно ловит указатель только внутри своего тайла (больший тайла клиент
+/// обрезан по нему), попапы — где угодно.
 fn tiling_focus(
     state: &AppState,
     pos: Point<f64, Logical>,
-) -> Option<(WlSurface, Point<f64, Logical>)> {
-    let (w, loc) = state
-        .space
-        .element_under(pos)
-        .map(|(w, loc)| (w.clone(), loc))?;
-    let loc_f64 = loc.to_f64();
-    w.surface_under(pos - loc_f64, smithay::desktop::WindowSurfaceType::ALL)
-        .map(|(surf, surf_loc)| (surf, loc_f64 + surf_loc.to_f64()))
+) -> Option<((WlSurface, Point<f64, Logical>), smithay::desktop::Window)> {
+    use smithay::desktop::WindowSurfaceType;
+    for window in state.space.elements().rev() {
+        let Some(loc) = state.space.element_location(window) else {
+            continue;
+        };
+        let render_loc = (loc - window.geometry().loc).to_f64();
+        let is_or = window
+            .x11_surface()
+            .is_some_and(|x| x.is_override_redirect());
+        let in_tile = is_or
+            || state
+                .tile_rect(window)
+                .is_none_or(|r| r.to_f64().contains(pos));
+        let kind = if in_tile {
+            WindowSurfaceType::ALL
+        } else {
+            WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE
+        };
+        if let Some((surface, surface_loc)) = window.surface_under(pos - render_loc, kind) {
+            if !in_tile && window.wl_surface().as_deref() == Some(&surface) {
+                continue;
+            }
+            return Some(((surface, render_loc + surface_loc.to_f64()), window.clone()));
+        }
+    }
+    None
 }
 
 /// Shared click-to-focus + Super+LMB tile resize (Tiling) / drag body (Physics)
@@ -551,8 +748,34 @@ fn handle_pointer_button(
         forward_button(state, button, btn_state, serial, time_msec, false);
         if state.forwarded_buttons.is_empty() {
             state.pointer_grab_target = None;
+            state.pointer_on_layer = false;
         }
         return;
+    }
+
+    if pressed {
+        // Панель, лаунчер, уведомление (layer-shell) — клик им, без
+        // инструментов и перетаскиваний WM.
+        if state.forwarded_buttons.is_empty() || state.pointer_on_layer {
+            if let Some((_, layer)) = state.layer_surface_under(pos, state.upper_layers()) {
+                if state.forwarded_buttons.is_empty() {
+                    state.pointer_on_layer = true;
+                    state.pointer_grab_target = None;
+                }
+                if layer.can_receive_keyboard_focus() {
+                    state.focus_layer(&layer);
+                }
+                forward_button(state, button, btn_state, serial, time_msec, false);
+                state.forwarded_buttons.insert(button);
+                return;
+            }
+        }
+        // Полноэкранное окно (игра) получает все кнопки как есть.
+        if state.fullscreen_window().is_some() {
+            forward_button(state, button, btn_state, serial, time_msec, true);
+            state.forwarded_buttons.insert(button);
+            return;
+        }
     }
 
     if state.layout_mode == LayoutMode::Physics {
@@ -613,8 +836,11 @@ fn handle_pointer_button(
 
     // Super + Left Mouse Button → start tile resize (TILING ONLY)
     if button == BTN_LEFT && super_down {
-        if let Some(win) = state.space.element_under(pos).map(|(w, _)| w.clone()) {
-            let geo = state.space.element_geometry(&win).unwrap_or_default();
+        if let Some((_, win)) = tiling_focus(state, pos) {
+            let geo = state
+                .tile_rect(&win)
+                .or_else(|| state.space.element_geometry(&win))
+                .unwrap_or_default();
             // Квадрант клика решает, какие края двигать.
             let rel_x = (pos.x - geo.loc.x as f64) / geo.size.w.max(1) as f64;
             let rel_y = (pos.y - geo.loc.y as f64) / geo.size.h.max(1) as f64;
@@ -645,16 +871,7 @@ fn forward_button(
     focus_on_press: bool,
 ) {
     let pos = state.pointer_location;
-    let (focus, location, window) = if state.layout_mode == LayoutMode::Physics {
-        let (focus, location) = physics_pointer_focus(state, pos.x, pos.y);
-        let window = state
-            .physics_pointer_target(pos.x, pos.y)
-            .map(|(t, _)| t.window);
-        (focus, location, window)
-    } else {
-        let window = state.space.element_under(pos).map(|(w, _)| w.clone());
-        (tiling_focus(state, pos), pos, window)
-    };
+    let (focus, location, window) = pointer_focus(state, pos.x, pos.y);
     if let Some(ptr) = state.seat.get_pointer() {
         ptr.motion(
             state,

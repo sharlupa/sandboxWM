@@ -73,6 +73,49 @@ pub struct SessionData {
     pub windows: Vec<SavedWindow>,
     pub lines: Vec<SavedLine>,
     pub joints: Vec<SavedJoint>,
+    /// Рабочий стол этих данных (с нуля). Верхний уровень файла — стол,
+    /// указанный здесь (обычно первый), остальные — в `workspaces`.
+    pub workspace: usize,
+    /// Активный рабочий стол на момент сохранения (только верхний уровень).
+    pub active_workspace: usize,
+    /// Остальные рабочие столы: у каждого свои окна, линии, связи и камера.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<SessionData>,
+}
+
+impl SessionData {
+    /// Данные всех столов по отдельности: верхний уровень (без вложенных) и
+    /// вложенные `workspaces`.
+    pub fn into_workspace_blocks(mut self) -> Vec<SessionData> {
+        let nested = std::mem::take(&mut self.workspaces);
+        let mut blocks = vec![self];
+        blocks.extend(nested.into_iter().map(|mut b| {
+            b.workspaces.clear();
+            b
+        }));
+        blocks
+    }
+
+    /// Окна и скрепления всех столов одним списком (для сопоставления окон
+    /// и перезапуска приложений) + стол каждого окна. Индексы окон в
+    /// скреплениях пересчитаны в общий список.
+    pub fn merge_workspace_blocks(blocks: &[SessionData]) -> (SessionData, Vec<usize>) {
+        let mut merged = SessionData::default();
+        let mut workspace_of = Vec::new();
+        for block in blocks {
+            let offset = merged.windows.len();
+            merged.windows.extend(block.windows.iter().cloned());
+            workspace_of.extend(std::iter::repeat_n(block.workspace, block.windows.len()));
+            merged
+                .joints
+                .extend(block.joints.iter().cloned().map(|mut j| {
+                    j.a.window += offset;
+                    j.b.window += offset;
+                    j
+                }));
+        }
+        (merged, workspace_of)
+    }
 }
 
 impl Default for SessionData {
@@ -88,6 +131,9 @@ impl Default for SessionData {
             windows: Vec::new(),
             lines: Vec::new(),
             joints: Vec::new(),
+            workspace: 0,
+            active_workspace: 0,
+            workspaces: Vec::new(),
         }
     }
 }
@@ -368,6 +414,16 @@ pub fn load(path: &Path, format: SessionFormat) -> Option<SessionData> {
     let report = validate(&mut data);
     if !report.is_clean() {
         eprintln!("[session] исправлено при загрузке: {report}");
+    }
+    for (i, ws) in data.workspaces.iter_mut().enumerate() {
+        ws.workspaces.clear();
+        let report = validate(ws);
+        if !report.is_clean() {
+            eprintln!(
+                "[session] рабочий стол {}: исправлено при загрузке: {report}",
+                ws.workspace.max(i + 1) + 1
+            );
+        }
     }
     Some(data)
 }
@@ -1247,6 +1303,9 @@ mod tests {
                     },
                 },
             ],
+            workspace: 0,
+            active_workspace: 0,
+            workspaces: Vec::new(),
         }
     }
 
@@ -1279,6 +1338,37 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn workspace_blocks_merge_with_offsets() {
+        let mut top = sample();
+        let mut second = sample();
+        second.workspace = 2;
+        second.windows.truncate(2);
+        second.joints.retain(|j| j.a.window < 2 && j.b.window < 2);
+        let second_joints = second.joints.len();
+        top.workspaces.push(second);
+        top.active_workspace = 2;
+
+        // Вложенные столы переживают сохранение.
+        let text = serialize(&top, SessionFormat::Toml).unwrap();
+        let back = parse(&text, SessionFormat::Toml).unwrap();
+        assert_eq!(back, top);
+
+        let top_windows = top.windows.len();
+        let top_joints = top.joints.len();
+        let blocks = top.into_workspace_blocks();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|b| b.workspaces.is_empty()));
+        let (merged, ws_of) = SessionData::merge_workspace_blocks(&blocks);
+        assert_eq!(merged.windows.len(), top_windows + 2);
+        assert_eq!(ws_of[0], 0);
+        assert_eq!(ws_of[top_windows], 2);
+        assert_eq!(merged.joints.len(), top_joints + second_joints);
+        for j in &merged.joints[top_joints..] {
+            assert!(j.a.window >= top_windows && j.b.window >= top_windows);
         }
     }
 

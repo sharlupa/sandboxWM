@@ -13,10 +13,10 @@
 | Concept item | Status | How it works |
 |---|---|---|
 | §1 Infinite canvas, gravity, floor | ✅ | rapier2d, windows are dynamic bodies, the floor sits at the bottom of the screen, camera zooms around the cursor |
-| §1 Mode 1: normal gravity | ✅ | `Super+1` |
-| §1 Mode 2: windows smoothly line up into tiling | ✅ | `Super+2` / `Super+G`, animated in both directions; going back puts windows where they were |
-| §1 Mode 3: zero gravity for one window | ✅ | `Super+3`, the body becomes kinematic: it hangs in place and can't be pushed, but can still be dragged and spun |
-| §1 Mode 4: zero gravity for everything | ✅ | `Super+4` |
+| §1 Mode 1: normal gravity | ✅ | `Super+F1` |
+| §1 Mode 2: windows smoothly line up into tiling | ✅ | `Super+F2` / `Super+G`, animated in both directions; going back puts windows where they were |
+| §1 Mode 3: zero gravity for one window | ✅ | `Super+F3`, the body becomes kinematic: it hangs in place and can't be pushed, but can still be dragged and spun |
+| §1 Mode 4: zero gravity for everything | ✅ | `Super+F4` |
 | §2 Drawing lines: steel, glue, trampoline, rope | ✅ | `Super+P`; chains of capsule colliders, a rope is a chain of hinged segments |
 | §2 Glue lets go when yanked with the mouse | ✅ | The bond is a fixed joint that breaks above `detach_force` |
 | §2 Rope falls and dangles, a window can hang from it | ✅ | The start is pinned; drag a window to the free end and it hooks on |
@@ -26,7 +26,7 @@
 | §6 Inverse projection of input | ✅ | Clicks and text selection go through rotation, zoom, slicing and the deformed mesh |
 | §7 Slicing a window with a knife | ✅ | `Super+X`, swipe across a window; the parts are crops of one buffer and the app keeps working as a whole |
 
-Beyond the concept: XWayland (Steam, Discord and other X11 clients), DMA-BUF, wlr-screencopy (OBS via xdg-desktop-portal-wlr), wlr-output-management (read-only), clipboard and primary selection, `wp_viewporter`, server-side decorations, VT switching, render on demand.
+Beyond the concept: workspaces (5 by default, each with its own tiling/physics), fullscreen windows in both modes (games: relative-pointer and pointer-constraints for mouse capture), bars over wlr-layer-shell (waybar, swaybg, mako, wofi) and ext-workspace (the waybar `ext/workspaces` module), XWayland (Steam, Discord and other X11 clients), DMA-BUF, wlr-screencopy (OBS via xdg-desktop-portal-wlr), wlr-output-management (read-only), clipboard and primary selection, `wp_viewporter`, server-side decorations, VT switching, render on demand.
 
 ## Controls
 
@@ -40,6 +40,9 @@ Every shortcut uses `Super`. Keys are configurable in `[controls]`.
 | `Super+W` | Close the focused window |
 | `Super+Q` / `Super+Esc` | Quit (the session is saved) |
 | `Super+G` | Tiling ↔ physics (animated) |
+| `Super+F` | Toggle fullscreen for the focused window (tiling and physics; games can request it themselves) |
+| `Super+1…9`, `Super+0` | Workspace 1–10 (how many there are: `[workspaces] count`, 5 by default) |
+| `Super+Shift+1…9`, `Super+Shift+0` | Move the focused window to a workspace |
 | `Super+Arrows` | Tiling: focus the neighbouring window in that direction; physics: move the camera |
 | `Super+LMB` + drag | Tiling: resize tile ratios; physics: drag a window by the grabbed point (it swings and can be thrown) |
 | `LMB` | Focus and normal interaction |
@@ -50,14 +53,14 @@ Every shortcut uses `Super`. Keys are configurable in `[controls]`.
 
 | Key | Action |
 |---|---|
-| `Super+1` | Mode 1: normal gravity (enters physics) |
-| `Super+2` | Mode 2: gravity off, windows line up into tiling |
-| `Super+3` | Mode 3: zero gravity for the focused window (toggle) |
-| `Super+4` | Mode 4: zero gravity for everything (toggle) |
+| `Super+F1` | Mode 1: normal gravity (enters physics) |
+| `Super+F2` | Mode 2: gravity off, windows line up into tiling |
+| `Super+F3` | Mode 3: zero gravity for the focused window (toggle) |
+| `Super+F4` | Mode 4: zero gravity for everything (toggle) |
 | `Super+A` / `Super+D` | Hold to spin the focused window |
 | `Super+wheel`, `Super+-` / `Super+=` | Zoom around the cursor |
-| `Super+0` | Reset the camera |
-| `Super+C` | Gather all scattered windows into view: a grid on the floor, the camera adjusts |
+| `Super+0` | Reset the camera (when there are fewer than 10 workspaces) |
+| `Super+C` | Gather all scattered windows into view: a grid on the floor, the camera adjusts; all joints, glue and rope hooks are released |
 | Middle button + drag | Pan the camera |
 
 ### Tools
@@ -104,8 +107,27 @@ The first directory found is used: `$SANDBOXWM_CONFIG`, `$XDG_CONFIG_HOME/sandbo
 | `session.conf` | `[session]`: autosave, path, TOML/JSON format, relaunching apps |
 | `window.conf` | `[window_props]` and per-app overrides: `[window_props.apps."org.gnome.Nautilus"] weight = 2.0, softness = 0.3, floating = true` |
 | `rendering.conf` | `[rendering]`: background colour, window borders (width, normal and active colour) |
+| `workspaces.conf` | `[workspaces]`: `count` — number of workspaces (1–32, 5 by default) |
 
-The session is stored in `$XDG_STATE_HOME/sandboxWM/session.toml` by default (with a `.bak` next to it); panics are logged to `$XDG_STATE_HOME/sandboxWM/panic.log`.
+The session keeps every workspace (windows come back to their own workspace) and is stored in `$XDG_STATE_HOME/sandboxWM/session.toml` by default (with a `.bak` next to it); panics are logged to `$XDG_STATE_HOME/sandboxWM/panic.log`.
+
+## Bars (waybar) and workspaces
+
+sandboxWM supports `wlr-layer-shell`: waybar, swaybg, mako and wofi/fuzzel/rofi-wayland work like they do in sway/Hyprland. A bar reserves its space (`exclusive zone`): tiling lays windows out below it, and the physics floor sits above a bottom bar. The `top` layer (a normal bar) hides under a fullscreen window, `overlay` does not.
+
+Workspaces are exposed to bars over `ext-workspace-v1`: in waybar ≥ 0.12 that is the `ext/workspaces` module (clicking switches workspace). Example `~/.config/waybar/config`:
+
+```json
+{
+  "layer": "top",
+  "position": "top",
+  "modules-left": ["ext/workspaces"],
+  "modules-center": ["clock"],
+  "ext/workspaces": { "format": "{name}", "on-click": "activate" }
+}
+```
+
+Start it alongside the WM, e.g. from a terminal: `waybar &`.
 
 ## Screen recording (OBS)
 
@@ -138,6 +160,7 @@ If the picture freezes or the cursor is missing:
 - `src/overlay.rs` — lines, ropes, joints, tool previews and the floor in one draw call; damage clipping.
 - `src/session.rs` — session save/load, window matching, app relaunch.
 - `src/cursor.rs` — the DRM-mode cursor (client surfaces, xcursor theme, hardware plane).
+- `src/workspace.rs` — workspaces; `src/fullscreen.rs` — fullscreen windows; `src/layer_shell.rs` — bars and other layer surfaces; `src/ext_workspace.rs` — workspaces for bars.
 - `src/tiling.rs` — the BSP/Dwindle tree; `src/xwm.rs` — XWayland; `src/screencopy.rs`, `src/output_manager.rs` — wlr protocols.
 
 Differences from the concept's original technical plan:

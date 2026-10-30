@@ -203,13 +203,14 @@ impl AppState {
     }
 
     /// Создаёт физический мир при первой необходимости. Пол — на нижнем
-    /// краю экрана (или из конфига/сессии).
+    /// краю экрана над нижней панелью (или из конфига/сессии).
     pub fn ensure_physics(&mut self) -> &mut WindowPhysics {
         if self.physics.is_none() {
+            let usable = self.usable_area();
             let floor = self
                 .restored_floor_y
                 .or(self.config.physics.floor_y)
-                .unwrap_or_else(|| self.output_size().h as f32);
+                .unwrap_or_else(|| (usable.loc.y + usable.size.h) as f32);
             self.physics = Some(WindowPhysics::new(&self.config, floor));
         }
         self.physics.as_mut().expect("physics just created")
@@ -341,7 +342,11 @@ impl AppState {
 
     /// Создаёт тело для окна, которое впервые отрисовалось в физике.
     pub fn physics_spawn_window(&mut self, window: &Window) {
-        if Self::is_override_redirect(window) || self.pieces_of(window).next().is_some() {
+        // Полноэкранное окно получит тело, когда выйдет из полноэкранного режима.
+        if Self::is_override_redirect(window)
+            || self.pieces_of(window).next().is_some()
+            || self.is_fullscreen(window)
+        {
             return;
         }
         let size = window.geometry().size;
@@ -444,7 +449,11 @@ impl AppState {
         // В тайлинге клиент рисует тайловый размер — выключенные коллайдеры
         // его не берут: при возврате в физику окну вернут прежний размер, а
         // иначе тело включалось бы уже раздутым (в полу, куски — внахлёст).
-        if self.layout_mode != LayoutMode::Physics || self.transition.is_some() {
+        // Полноэкранный размер — временный: тело остаётся прежним.
+        if self.layout_mode != LayoutMode::Physics
+            || self.transition.is_some()
+            || self.is_fullscreen(window)
+        {
             return;
         }
         let size = window.geometry().size;
@@ -573,6 +582,7 @@ impl AppState {
         if self.layout_mode == LayoutMode::Physics {
             return;
         }
+        self.exit_fullscreen();
         self.end_resize();
         self.ensure_physics();
         let geoms: Vec<(Window, Rectangle<i32, Logical>)> = self
@@ -674,6 +684,7 @@ impl AppState {
         if self.transition.is_some() {
             return;
         }
+        self.exit_fullscreen();
         self.cancel_interactions();
         self.saved_camera = (self.camera_offset.0, self.camera_offset.1, self.camera_zoom);
         // Тайлинг поменяет размеры окон — запоминаем физические, чтобы
@@ -724,7 +735,7 @@ impl AppState {
     }
 
     /// Тайловые прямоугольники окон (как их расставит `recalculate_layout`).
-    fn tile_rects(&self) -> HashMap<Window, Rectangle<i32, Logical>> {
+    pub fn tile_rects(&self) -> HashMap<Window, Rectangle<i32, Logical>> {
         let mut rects = Vec::new();
         if let Some(tree) = &self.tile_tree {
             tree.collect_rects(self.tiling_area(), crate::state::GAPS_IN, &mut rects);
@@ -732,7 +743,7 @@ impl AppState {
         rects.into_iter().collect()
     }
 
-    fn finish_transition(&mut self) {
+    pub fn finish_transition(&mut self) {
         let Some(t) = self.transition.take() else {
             return;
         };
@@ -798,7 +809,7 @@ impl AppState {
     }
 
     /// Сбрасывает незавершённые drag/spin/инструменты.
-    fn cancel_interactions(&mut self) {
+    pub fn cancel_interactions(&mut self) {
         if let Some(phys) = self.physics.as_mut() {
             phys.drag_end();
             phys.set_spin(None);
@@ -918,7 +929,8 @@ impl AppState {
         let order: Vec<Window> = self.space.elements().cloned().collect();
         let mut moved = false;
         for window in &order {
-            if Self::is_override_redirect(window) {
+            // Полноэкранное окно стоит в начале экрана (place_fullscreen_window).
+            if Self::is_override_redirect(window) || self.is_fullscreen(window) {
                 continue;
             }
             let Some(piece) = self.main_piece(window).cloned() else {
@@ -954,6 +966,7 @@ impl AppState {
                 self.space.raise_element(window, false);
             }
         }
+        self.place_fullscreen_window();
     }
 
     // ── Отрисовка ──────────────────────────────────────────────────
@@ -1887,11 +1900,14 @@ impl AppState {
     ///
     /// Окна выстраиваются сеткой на полу (ряды снизу вверх) в текущем месте
     /// камеры — ровно, без скорости; разрезанные — вместе со своими
-    /// кусками. Если сетка не помещается в кадр, камера отдаляется.
+    /// кусками. Все связи окон (сварка, пружины, верёвки, клей, подвесы)
+    /// снимаются — иначе сваренные/подвешенные окна тянули бы друг друга
+    /// из сетки. Если сетка не помещается в кадр, камера отдаляется.
     pub fn gather_windows(&mut self) {
         if self.layout_mode != LayoutMode::Physics || self.transition.is_some() {
             return;
         }
+        self.exit_fullscreen();
         let Some(floor_y) = self.physics.as_ref().map(|p| p.floor_y() as f64) else {
             return;
         };
@@ -1912,6 +1928,12 @@ impl AppState {
             return;
         }
         self.cancel_interactions();
+        let ids: Vec<u32> = self.pieces.iter().map(|p| p.id).collect();
+        if let Some(phys) = self.physics.as_mut() {
+            for id in ids {
+                phys.unlink_piece(id);
+            }
+        }
 
         const GAP: f64 = 40.0;
         let n = windows.len();
@@ -2050,8 +2072,38 @@ impl AppState {
 
     // ── Сессия (концепт §3) ────────────────────────────────────────
 
-    /// Снимок рабочего пространства для сохранения.
-    pub fn session_snapshot(&self) -> crate::session::SessionData {
+    /// Снимок всех рабочих столов для сохранения: верхний уровень — первый
+    /// стол, остальные — в `workspaces` (пустые столы в тайлинге не пишутся).
+    pub fn session_snapshot(&mut self) -> crate::session::SessionData {
+        let active_windows: Vec<Window> = self
+            .space
+            .elements()
+            .filter(|w| !Self::is_override_redirect(w))
+            .cloned()
+            .collect();
+        let mut blocks = Vec::new();
+        for idx in 0..self.workspaces.len().max(1) {
+            let windows = if idx == self.active_workspace {
+                active_windows.clone()
+            } else {
+                self.workspaces[idx].windows.clone()
+            };
+            let mut block = self.with_workspace(idx, |s| s.workspace_snapshot(&windows));
+            block.workspace = idx;
+            blocks.push(block);
+        }
+        let mut top = blocks.remove(0);
+        top.active_workspace = self.active_workspace;
+        top.workspaces = blocks
+            .into_iter()
+            .filter(|b| !b.windows.is_empty() || !b.lines.is_empty() || b.layout_mode == "physics")
+            .collect();
+        top
+    }
+
+    /// Снимок стола, чьи данные сейчас в полях `AppState`; `windows` — его
+    /// окна в порядке стека.
+    fn workspace_snapshot(&self, windows: &[Window]) -> crate::session::SessionData {
         use crate::session::{
             SavedAnchor, SavedJoint, SavedLine, SavedPiece, SavedWindow, SessionData,
         };
@@ -2071,9 +2123,19 @@ impl AppState {
             },
             ..Default::default()
         };
-        let Some(phys) = self.physics.as_ref() else {
-            data.layout_mode = "tiling".into();
-            return data;
+        // Стол ни разу не был в физике: мира нет, но окна (для перезапуска
+        // приложений и их стола) сохраняются — с пустым временным миром.
+        let empty;
+        let phys = match self.physics.as_ref() {
+            Some(phys) => {
+                data.floor_y = Some(phys.floor_y());
+                phys
+            }
+            None => {
+                data.layout_mode = "tiling".into();
+                empty = WindowPhysics::new(&self.config, self.output_size().h as f32);
+                &empty
+            }
         };
         data.gravity_mode = if phys.zero_gravity() {
             "zero"
@@ -2081,14 +2143,10 @@ impl AppState {
             "normal"
         }
         .into();
-        data.floor_y = Some(phys.floor_y());
 
         // Окна в порядке стека; запоминаем индекс каждого куска для связей.
         let mut piece_index: HashMap<u32, (usize, usize)> = HashMap::new();
-        for window in self.space.elements() {
-            if Self::is_override_redirect(window) {
-                continue;
-            }
+        for window in windows {
             let pieces: Vec<&Piece> = self.pieces_of(window).collect();
             let size = window.geometry().size;
             let pid = window_pid(&self.display_handle, window);
@@ -2185,13 +2243,15 @@ impl AppState {
         }
         let data = self.session_snapshot();
         let (path, format) = self.session_file();
+        let all = || std::iter::once(&data).chain(data.workspaces.iter());
         match crate::session::save(&path, format, &data) {
             Ok(()) => println!(
-                "[session] сохранено: {} ({} окон, {} линий, {} связей)",
+                "[session] сохранено: {} ({} окон, {} линий, {} связей, {} рабочих столов)",
                 path.display(),
-                data.windows.len(),
-                data.lines.len(),
-                data.joints.len()
+                all().map(|d| d.windows.len()).sum::<usize>(),
+                all().map(|d| d.lines.len()).sum::<usize>(),
+                all().map(|d| d.joints.len()).sum::<usize>(),
+                all().count()
             ),
             Err(e) => eprintln!("[session] не удалось сохранить {}: {e}", path.display()),
         }
@@ -2235,52 +2295,80 @@ impl AppState {
         let Some(data) = crate::session::load(&path, format) else {
             return;
         };
-        println!(
-            "[session] загружено: {} ({} окон, {} линий, {} связей)",
-            path.display(),
-            data.windows.len(),
-            data.lines.len(),
-            data.joints.len()
-        );
-        self.restored_floor_y = data.floor_y;
-        self.saved_camera = (
-            data.camera[0],
-            data.camera[1],
-            data.camera[2].clamp(self.config.physics.zoom_min, self.config.physics.zoom_max),
-        );
-        {
-            let phys = self.ensure_physics();
-            for line in &data.lines {
-                let Some(material) = Material::from_name(&line.material) else {
-                    continue;
-                };
-                let pts: Vec<Vector> = line
-                    .points
-                    .iter()
-                    .map(|p| Vector::new(p[0], p[1]))
-                    .collect();
-                let pinned = (line.pinned.len() == 2).then(|| [line.pinned[0], line.pinned[1]]);
-                phys.add_line(material, &pts, pinned);
-            }
-            if data.gravity_mode == "zero" {
-                phys.set_zero_gravity(true);
-            }
+        let active = data.active_workspace;
+        let top_floor = data.floor_y;
+        let last = self.workspaces.len().saturating_sub(1);
+        let mut blocks = data.into_workspace_blocks();
+        for block in &mut blocks {
+            // Столов в конфиге стало меньше — лишние уходят на последний.
+            block.workspace = block.workspace.min(last);
         }
-        self.pending_joints = data.joints.clone();
+        let (merged, workspace_of) = crate::session::SessionData::merge_workspace_blocks(&blocks);
+        println!(
+            "[session] загружено: {} ({} окон, {} рабочих столов)",
+            path.display(),
+            merged.windows.len(),
+            blocks.len()
+        );
+        for block in &blocks {
+            self.with_workspace(block.workspace, |s| s.restore_workspace_world(block));
+        }
+        self.restored_floor_y = top_floor;
+        self.pending_joints = merged.joints.clone();
+        self.restore_workspaces = workspace_of;
         self.restorer = Some(crate::session::SessionRestorer::new(
-            &data,
+            &merged,
             Instant::now(),
             std::time::Duration::from_secs(cfg.restore_timeout_secs.max(1) as u64),
         ));
         self.restored_windows.clear();
-        if data.layout_mode == "physics" {
-            self.enter_physics_mode();
+        if active != self.active_workspace && active < self.workspaces.len() {
+            self.switch_workspace(active);
         }
         if cfg.restore_apps {
             // Запуск откладывается до готовности XWayland (DISPLAY), иначе
             // восстановленные X11-приложения (Steam) стартуют без X-сервера.
-            self.pending_relaunch = crate::session::relaunch_commands(&data);
+            self.pending_relaunch = crate::session::relaunch_commands(&merged);
             self.relaunch_deadline = Some(Instant::now() + std::time::Duration::from_secs(5));
+        }
+    }
+
+    /// Мир стола из сессии: пол, камера, линии, гравитация, режим. Данные
+    /// стола уже в полях `AppState` (см. `with_workspace`).
+    fn restore_workspace_world(&mut self, block: &crate::session::SessionData) {
+        self.restored_floor_y = block.floor_y;
+        self.saved_camera = (
+            block.camera[0],
+            block.camera[1],
+            block.camera[2].clamp(self.config.physics.zoom_min, self.config.physics.zoom_max),
+        );
+        let phys = self.ensure_physics();
+        for line in &block.lines {
+            let Some(material) = Material::from_name(&line.material) else {
+                continue;
+            };
+            let pts: Vec<Vector> = line
+                .points
+                .iter()
+                .map(|p| Vector::new(p[0], p[1]))
+                .collect();
+            let pinned = (line.pinned.len() == 2).then(|| [line.pinned[0], line.pinned[1]]);
+            phys.add_line(material, &pts, pinned);
+        }
+        if block.gravity_mode == "zero" {
+            phys.set_zero_gravity(true);
+        }
+        if block.layout_mode != "physics" {
+            return;
+        }
+        if block.workspace == self.active_workspace {
+            self.enter_physics_mode();
+        } else {
+            // Скрытый стол: окон в Space нет, камера ставится сразу.
+            self.layout_mode = LayoutMode::Physics;
+            self.camera_offset = (self.saved_camera.0, self.saved_camera.1);
+            self.target_camera_offset = self.camera_offset;
+            self.camera_zoom = self.saved_camera.2;
         }
     }
 
@@ -2317,6 +2405,39 @@ impl AppState {
         ) else {
             return false;
         };
+        // Окно было на другом рабочем столе — уезжает туда, тела создаются
+        // в мире того стола.
+        let ws = self
+            .restore_workspaces
+            .get(index)
+            .copied()
+            .filter(|ws| *ws < self.workspaces.len())
+            .unwrap_or(self.active_workspace);
+        let ids = if ws != self.active_workspace {
+            self.move_window_to_workspace(window, ws);
+            self.with_workspace(ws, |s| s.restore_pieces(window, &saved, false))
+        } else {
+            self.restore_pieces(window, &saved, true)
+        };
+        if ids.is_empty() {
+            // Перенесённое окно уже не на этом столе: тело ему создаст
+            // показ его стола.
+            return ws != self.active_workspace;
+        }
+        println!("[session] восстановлено окно {:?}", saved.app_id);
+        self.restored_windows.insert(index, (ws, ids));
+        self.restore_pending_joints();
+        true
+    }
+
+    /// Куски окна на сохранённых местах (данные стола — в полях `AppState`;
+    /// `active` — это активный стол, и его анимация перехода — его).
+    fn restore_pieces(
+        &mut self,
+        window: &Window,
+        saved: &crate::session::SavedWindow,
+        active: bool,
+    ) -> Vec<u32> {
         let size = window.geometry().size;
         let (sx, sy) = (
             if saved.size[0] > 0 {
@@ -2352,15 +2473,12 @@ impl AppState {
                     phys.set_floating(id, true);
                 }
             }
-            if self.layout_mode == LayoutMode::Tiling || self.transition.is_some() {
+            if self.layout_mode == LayoutMode::Tiling || (active && self.transition.is_some()) {
                 if let Some(phys) = self.physics.as_mut() {
                     phys.set_piece_enabled(id, false);
                 }
             }
             ids.push(id);
-        }
-        if ids.is_empty() {
-            return false;
         }
         if saved.softness > 0.0 {
             let mut params = self.soft_params(window);
@@ -2369,29 +2487,27 @@ impl AppState {
                 self.make_soft(id, params);
             }
         }
-        println!("[session] восстановлено окно {:?}", saved.app_id);
-        self.restored_windows.insert(index, ids);
-        self.restore_pending_joints();
-        true
+        ids
     }
 
     /// Связи, оба конца которых уже восстановлены.
     fn restore_pending_joints(&mut self) {
         let mut rest = Vec::new();
         for joint in std::mem::take(&mut self.pending_joints) {
-            let a = self
-                .restored_windows
-                .get(&joint.a.window)
-                .and_then(|ids| ids.get(joint.a.piece))
-                .copied();
-            let b = self
-                .restored_windows
-                .get(&joint.b.window)
-                .and_then(|ids| ids.get(joint.b.piece))
-                .copied();
+            let end = |a: &crate::session::SavedAnchor| {
+                self.restored_windows
+                    .get(&a.window)
+                    .and_then(|(ws, ids)| Some((*ws, *ids.get(a.piece)?)))
+            };
+            let (a, b) = (end(&joint.a), end(&joint.b));
             match (a, b, LinkKind::from_name(&joint.kind)) {
-                (Some(a), Some(b), Some(kind)) => {
-                    if let Some(phys) = self.physics.as_mut() {
+                // Связь между окнами разных столов невозможна — отбрасываем.
+                (Some((wa, _)), Some((wb, _)), Some(_)) if wa != wb => {}
+                (Some((ws, a)), Some((_, b)), Some(kind)) => {
+                    self.with_workspace(ws, |s| {
+                        let Some(phys) = s.physics.as_mut() else {
+                            return;
+                        };
                         phys.add_link(
                             kind,
                             Anchor {
@@ -2403,7 +2519,7 @@ impl AppState {
                                 local: Vector::new(joint.b.local[0], joint.b.local[1]),
                             },
                         );
-                    }
+                    });
                 }
                 (_, _, Some(_)) => rest.push(joint),
                 _ => {}

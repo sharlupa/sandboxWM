@@ -1,7 +1,10 @@
 pub mod backend_drm;
 pub mod config;
 pub mod cursor;
+pub mod ext_workspace;
+pub mod fullscreen;
 pub mod input;
+pub mod layer_shell;
 pub mod mesh_render;
 pub mod output_manager;
 pub mod overlay;
@@ -13,6 +16,7 @@ pub mod session;
 pub mod softbody;
 pub mod state;
 pub mod tiling;
+pub mod workspace;
 pub mod xwm;
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -249,7 +253,10 @@ fn run_winit(
     // linux-dmabuf global built from the renderer's supported formats, so GPU
     // clients can submit buffers as dmabuf file descriptors instead of wl_shm.
     use smithay::backend::renderer::{ImportDma, ImportEgl};
-    if let Err(e) = backend_ref.renderer().bind_wl_display(&state.display_handle) {
+    if let Err(e) = backend_ref
+        .renderer()
+        .bind_wl_display(&state.display_handle)
+    {
         eprintln!("[Winit] EGL bind_wl_display failed: {e:?}");
     }
 
@@ -285,8 +292,13 @@ fn run_winit(
         let mut backend = backend_loop.borrow_mut();
         match event {
             WinitEvent::Resized { size, .. } => {
-                let new_mode = Mode { size, refresh: 60_000 };
+                let new_mode = Mode {
+                    size,
+                    refresh: 60_000,
+                };
                 output.change_current_state(Some(new_mode), None, None, None);
+                // Панели (layer-shell) растягиваются под новый размер.
+                state.arrange_layers();
                 // Defer layout to the Redraw handler — during drag-resize
                 // of the winit window, Resized fires at the mouse event rate
                 // (100-1000 Hz). layout_dirty batches them to ~60 Hz.
@@ -381,14 +393,7 @@ fn run_winit(
                     state.space.refresh();
                     state.popup_manager.cleanup();
                     let now = state.clock.now();
-                    state.space.elements().for_each(|window| {
-                        window.send_frame(
-                            &output,
-                            now,
-                            Some(std::time::Duration::ZERO),
-                            |_, _| Some(output.clone()),
-                        );
-                    });
+                    crate::render::send_frames(state, &output, now);
                     crate::cursor::send_frames(&state.cursor_status, &output, now);
                     state.needs_render = false;
                 }

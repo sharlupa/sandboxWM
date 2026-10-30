@@ -52,7 +52,12 @@ impl XwmHandler for AppState {
             self.recalculate_layout();
         }
 
-        self.focus_window(&window);
+        // Поверх полноэкранного окна новое не выскакивает (см. new_toplevel).
+        if self.fullscreen_window().is_some() {
+            self.place_fullscreen_window();
+        } else {
+            self.focus_window(&window);
+        }
         self.needs_render = true;
     }
 
@@ -67,11 +72,7 @@ impl XwmHandler for AppState {
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, surface: X11Surface) {
-        let window = self
-            .space
-            .elements()
-            .find(|w| w.x11_surface().map(|x| x == &surface).unwrap_or(false))
-            .cloned();
+        let window = self.x11_window(&surface);
         if let Some(window) = window {
             self.remove_window_common(&window);
         }
@@ -96,10 +97,7 @@ impl XwmHandler for AppState {
     ) {
         // До map — честно отвечаем на запрос размера, чтобы клиент не завис.
         // После map размер диктует наш тайлинг/физика.
-        let mapped = self
-            .space
-            .elements()
-            .any(|win| win.x11_surface().map(|x| x == &surface).unwrap_or(false));
+        let mapped = self.x11_window(&surface).is_some();
         if !mapped {
             let mut geo = surface.geometry();
             if let Some(w) = w {
@@ -143,6 +141,37 @@ impl XwmHandler for AppState {
     ) {
     }
     fn move_request(&mut self, _xwm: XwmId, _surface: X11Surface, _button: u32) {}
+
+    /// Игры (Wine/Proton) просят _NET_WM_STATE_FULLSCREEN.
+    fn fullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
+        match self.x11_window(&surface) {
+            Some(window) => self.set_fullscreen(&window, true),
+            None => {
+                let _ = surface.set_fullscreen(true);
+            }
+        }
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
+        match self.x11_window(&surface) {
+            Some(window) => self.set_fullscreen(&window, false),
+            None => {
+                let _ = surface.set_fullscreen(false);
+            }
+        }
+    }
+}
+
+impl AppState {
+    /// Окно X11-поверхности на любом рабочем столе.
+    fn x11_window(&self, surface: &X11Surface) -> Option<Window> {
+        let is_it = |w: &Window| w.x11_surface() == Some(surface);
+        self.space
+            .elements()
+            .find(|w| is_it(w))
+            .cloned()
+            .or_else(|| self.find_hidden_window(is_it))
+    }
 }
 
 /// Спавнит Xwayland и вешает обработчик готовности на event loop.

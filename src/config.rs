@@ -25,6 +25,7 @@
 //!   - `session.conf`    — `[session]`
 //!   - `window.conf`     — `[window_props]`
 //!   - `rendering.conf`  — `[rendering]`
+//!   - `workspaces.conf` — `[workspaces]`
 //!
 //! Отсутствующие файлы/поля → [`Default`].
 
@@ -55,6 +56,8 @@ pub struct Config {
     /// Свойства окон по умолчанию и per-app overrides.
     pub window_props: WindowPropsConfig,
     pub rendering: RenderingConfig,
+    /// Рабочие столы.
+    pub workspaces: WorkspacesConfig,
 }
 
 impl Config {
@@ -129,6 +132,7 @@ impl Config {
         if p.floor_y.is_some_and(|y| !y.is_finite()) {
             p.floor_y = None;
         }
+        self.workspaces.count = self.workspaces.count.clamp(1, MAX_WORKSPACES);
     }
 
     fn find_config_dir() -> Option<PathBuf> {
@@ -309,8 +313,10 @@ pub struct ControlsConfig {
     pub camera_right: String,
     pub camera_up: String,
     pub camera_down: String,
+    /// Окно на весь экран (тайлинг и физика) ↔ обратно.
+    pub fullscreen: String,
 
-    // Режимы гравитации (концепт §1).
+    // Режимы гравитации (концепт §1). Super+цифры заняты рабочими столами.
     /// Режим 1: обычная гравитация (включает физику, если был тайлинг).
     pub gravity_normal: String,
     /// Режим 2: гравитация выключена → окна плавно встают в тайлинг.
@@ -357,10 +363,11 @@ impl Default for ControlsConfig {
             camera_right: "Right".into(),
             camera_up: "Up".into(),
             camera_down: "Down".into(),
-            gravity_normal: "1".into(),
-            gravity_tiling: "2".into(),
-            float_window: "3".into(),
-            gravity_zero: "4".into(),
+            fullscreen: "f".into(),
+            gravity_normal: "F1".into(),
+            gravity_tiling: "F2".into(),
+            float_window: "F3".into(),
+            gravity_zero: "F4".into(),
             draw_tool: "p".into(),
             knife_tool: "x".into(),
             weld_windows: "e".into(),
@@ -452,6 +459,28 @@ fn keysym_name(keysym: u32) -> Option<&'static str> {
         xkb::KEY_9 => "9",
         _ => return None,
     })
+}
+
+// ── Рабочие столы ──────────────────────────────────────────────────
+
+/// Верхний предел числа рабочих столов.
+pub const MAX_WORKSPACES: usize = 32;
+
+/// Рабочие столы: у каждого свои окна, тайлинг, физический мир и камера.
+/// `Super+1…9, 0` — перейти на стол 1–10, `Super+Shift+цифра` — перенести
+/// туда активное окно. Столы после десятого доступны только из панели
+/// (waybar, модуль `ext/workspaces`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspacesConfig {
+    /// Сколько рабочих столов (1–32).
+    pub count: usize,
+}
+
+impl Default for WorkspacesConfig {
+    fn default() -> Self {
+        Self { count: 5 }
+    }
 }
 
 // ── Режимы гравитации ──────────────────────────────────────────────
@@ -868,6 +897,8 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
         let cfg = Config::load_from_dir(&dir).unwrap();
         assert_eq!(cfg.controls.toggle_physics, "g");
+        assert_eq!(cfg.workspaces.count, 5);
+        assert_eq!(cfg.controls.gravity_normal, "F1");
     }
 
     #[test]
@@ -875,8 +906,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.physics.zoom_min = 5.0;
         cfg.physics.zoom_max = 0.5;
+        cfg.workspaces.count = 0;
         cfg.sanitize();
         assert!(cfg.physics.zoom_min <= cfg.physics.zoom_max);
+        assert_eq!(cfg.workspaces.count, 1);
         assert!(ControlsConfig::matches_digit_key("1", 2));
         assert!(ControlsConfig::matches_digit_key("0", 11));
         assert!(!ControlsConfig::matches_digit_key("1", 3));
