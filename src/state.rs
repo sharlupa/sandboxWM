@@ -168,6 +168,9 @@ pub struct AppState {
     pub forwarded_buttons: std::collections::HashSet<u32>,
     /// Нажатие ушло поверхности слоя (панели): до отпускания указатель — ей.
     pub pointer_on_layer: bool,
+    /// Поверхности с новым захватом указателя, ждущие включения (см.
+    /// PointerConstraintsHandler::new_constraint).
+    pub pending_constraints: Vec<WlSurface>,
     pub render_cache: crate::render::RenderCache,
 
     // ── Сессия (концепт §3) ─────────────────────────────────────────────
@@ -317,6 +320,7 @@ impl AppState {
             pointer_grab_target: None,
             forwarded_buttons: Default::default(),
             pointer_on_layer: false,
+            pending_constraints: Vec::new(),
             soft: Default::default(),
             soft_grab: None,
             snapshots: Default::default(),
@@ -835,6 +839,12 @@ impl CompositorHandler for AppState {
             return;
         }
 
+        self.pending_constraints.retain(|s| s.is_alive());
+        if let Some(i) = self.pending_constraints.iter().position(|s| s == surface) {
+            let surface = self.pending_constraints.swap_remove(i);
+            self.activate_new_constraint(&surface);
+        }
+
         // Найдём окно, которому принадлежит эта поверхность, и обновим его bbox.
         // ВАЖНО: recalculate_layout() здесь НЕ вызываем — это создаёт петлю
         // commit → configure → commit → ... (~30–40% CPU на простое рабочем столе,
@@ -1281,23 +1291,13 @@ impl PointerConstraintsHandler for AppState {
                 pointer.current_focus().map(|s| s.id().protocol_id())
             );
         }
-        if fullscreen && pointer.current_focus().as_ref() != Some(surface) {
-            crate::input::refresh_pointer_focus(self);
-        }
-        // Иначе захват включается, только когда указатель уже над
-        // поверхностью, или при входе на неё (см. input.rs).
-        if pointer.current_focus().as_ref() == Some(surface) {
-            with_pointer_constraint(surface, pointer, |constraint| {
-                if let Some(constraint) = constraint {
-                    if crate::input::debug_pointer() {
-                        eprintln!(
-                            "[pointer] constraint on (new): surface {}",
-                            surface.id().protocol_id()
-                        );
-                    }
-                    constraint.activate();
-                }
-            });
+        // Smithay 0.7 зовёт этот обработчик посреди запроса lock_pointer /
+        // confine_pointer, пока объект захвата ещё создаётся. Включаем захват
+        // на ближайшем коммите поверхности (или движении мыши), уже вне
+        // этого запроса.
+        let _ = (fullscreen, pointer);
+        if !self.pending_constraints.contains(surface) {
+            self.pending_constraints.push(surface.clone());
         }
     }
 
@@ -1373,6 +1373,39 @@ smithay::reexports::wayland_server::delegate_dispatch!(AppState: [
 smithay::delegate_relative_pointer!(AppState);
 
 impl AppState {
+    /// Включить захват, созданный клиентом (вне запроса, создавшего его).
+    fn activate_new_constraint(&mut self, surface: &WlSurface) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        // Полноэкранная игра закрывает весь экран: указатель переводим на неё
+        // сразу, не дожидаясь движения мыши.
+        let fullscreen = self
+            .fullscreen_window()
+            .is_some_and(|w| w.wl_surface().as_deref() == Some(surface));
+        if fullscreen && pointer.current_focus().as_ref() != Some(surface) {
+            crate::input::refresh_pointer_focus(self);
+        }
+        // Иначе захват включается, только когда указатель уже над
+        // поверхностью, или при входе на неё (см. input.rs).
+        if pointer.current_focus().as_ref() != Some(surface) {
+            return;
+        }
+        with_pointer_constraint(surface, &pointer, |constraint| {
+            if let Some(constraint) = constraint {
+                if !constraint.is_active() {
+                    if crate::input::debug_pointer() {
+                        eprintln!(
+                            "[pointer] constraint on (new): surface {}",
+                            surface.id().protocol_id()
+                        );
+                    }
+                    constraint.activate();
+                }
+            }
+        });
+    }
+
     /// Где на экране начало поверхности окна (тайлинг или полноэкранное
     /// окно; в физике окна повёрнуты/масштабированы — `None`).
     pub fn surface_screen_origin(&self, surface: &WlSurface) -> Option<Point<f64, Logical>> {

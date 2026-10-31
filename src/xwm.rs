@@ -206,13 +206,24 @@ pub fn spawn_xwayland(
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, AppState>,
     display_handle: &smithay::reexports::wayland_server::DisplayHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // SANDBOXWM_XWAYLAND_LOG=<файл>: XWayland пишет в него свой протокол
+    // Wayland (WAYLAND_DEBUG=client) — диагностика мыши в X11-играх.
+    let debug_log = std::env::var_os("SANDBOXWM_XWAYLAND_LOG")
+        .and_then(|path| std::fs::File::create(&path).ok());
+    let (envs, stderr) = match debug_log {
+        Some(file) => (
+            vec![("WAYLAND_DEBUG".to_string(), "client".to_string())],
+            Stdio::from(file),
+        ),
+        None => (Vec::new(), Stdio::null()),
+    };
     let (xwayland, client) = XWayland::spawn(
         display_handle,
         None,
-        std::iter::empty::<(String, String)>(),
+        envs,
         true,
         Stdio::null(),
-        Stdio::null(),
+        stderr,
         |_| {},
     )?;
 
