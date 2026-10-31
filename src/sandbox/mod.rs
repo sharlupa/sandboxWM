@@ -34,6 +34,7 @@ mod modes;
 mod pieces;
 mod pointer;
 mod session;
+pub mod shape;
 mod soft;
 mod step;
 mod tools;
@@ -43,8 +44,11 @@ mod tools;
 pub struct Piece {
     pub id: u32,
     pub window: Window,
-    /// Обрезка в координатах окна.
+    /// Охват куска в координатах окна; его центр — центр тела в мире.
     pub rect: Rectangle<f64, Logical>,
+    /// Форма после косого разреза: выпуклый многоугольник в координатах
+    /// окна. `None` — кусок занимает весь `rect`.
+    pub shape: Option<Vec<shape::Pt>>,
 }
 
 impl Piece {
@@ -54,6 +58,31 @@ impl Piece {
             self.rect.loc.y + self.rect.size.h * 0.5,
         )
     }
+
+    /// Контур куска в координатах окна.
+    fn outline(&self) -> Vec<shape::Pt> {
+        self.shape
+            .clone()
+            .unwrap_or_else(|| shape::rect_outline(self.rect))
+    }
+
+    fn area(&self) -> f64 {
+        match &self.shape {
+            Some(poly) => shape::area(poly),
+            None => self.rect.size.w * self.rect.size.h,
+        }
+    }
+
+    /// Точка (координаты окна) внутри куска.
+    fn contains(&self, x: f64, y: f64) -> bool {
+        match &self.shape {
+            Some(poly) => shape::contains(poly, [x, y]),
+            None => {
+                let r = self.rect;
+                x >= r.loc.x && y >= r.loc.y && x < r.loc.x + r.size.w && y < r.loc.y + r.size.h
+            }
+        }
+    }
 }
 
 /// Мягкое тело куска (концепт §5): сетка + параметры + прошлая скорость
@@ -61,7 +90,11 @@ impl Piece {
 pub struct SoftPiece {
     pub mesh: crate::softbody::SoftMesh,
     pub params: crate::softbody::SoftParams,
+    /// Мягкое или желе.
+    pub kind: crate::config::BodyKind,
     prev_vel: Option<Vector>,
+    /// Постоянная нагрузка (вес на полу) сетку не сминает.
+    load: crate::softbody::LoadFilter,
     rest_generation: u64,
 }
 
@@ -128,6 +161,7 @@ struct TransitionItem {
     window: Window,
     key: u32,
     clip: Rectangle<f64, Logical>,
+    shape: Option<Vec<shape::Pt>>,
     popups: bool,
     from: ScreenPose,
     to: ScreenPose,
@@ -171,39 +205,6 @@ fn wrap_angle(a: f64) -> f64 {
 
 fn v2(x: f64, y: f64) -> Vector {
     Vector::new(x as f32, y as f32)
-}
-
-/// Пересечение отрезка `p0→p1` с прямоугольником (Liang–Barsky):
-/// параметры входа/выхода `t ∈ [0,1]`.
-fn clip_segment(p0: (f64, f64), p1: (f64, f64), r: Rectangle<f64, Logical>) -> Option<(f64, f64)> {
-    let dx = p1.0 - p0.0;
-    let dy = p1.1 - p0.1;
-    let mut t0 = 0.0f64;
-    let mut t1 = 1.0f64;
-    let checks = [
-        (-dx, p0.0 - r.loc.x),
-        (dx, r.loc.x + r.size.w - p0.0),
-        (-dy, p0.1 - r.loc.y),
-        (dy, r.loc.y + r.size.h - p0.1),
-    ];
-    for (p, q) in checks {
-        if p.abs() < 1e-12 {
-            if q < 0.0 {
-                return None;
-            }
-        } else {
-            let t = q / p;
-            if p < 0.0 {
-                t0 = t0.max(t);
-            } else {
-                t1 = t1.min(t);
-            }
-            if t0 > t1 {
-                return None;
-            }
-        }
-    }
-    Some((t0, t1))
 }
 
 /// app_id (Wayland) или WM_CLASS class (X11).
@@ -257,14 +258,6 @@ pub fn window_pid(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clip_segment_crosses_rect() {
-        let r = Rectangle::new((0.0, 0.0).into(), (100.0, 50.0).into());
-        let (t0, t1) = clip_segment((-50.0, 25.0), (150.0, 25.0), r).unwrap();
-        assert!((t0 - 0.25).abs() < 1e-9 && (t1 - 0.75).abs() < 1e-9);
-        assert!(clip_segment((-50.0, 80.0), (150.0, 80.0), r).is_none());
-    }
 
     #[test]
     fn wrap_angles() {

@@ -117,7 +117,14 @@ impl AppState {
                 let cx = (geo.loc.x as f64 + geo.size.w as f64 * 0.5) / cam_to.2 + cam_to.0;
                 let cy = (geo.loc.y as f64 + geo.size.h as f64 * 0.5) / cam_to.2 + cam_to.1;
                 let props = self.window_override(&window);
-                self.spawn_piece(&window, rect, v2(cx, cy), 0.0, props.weight.unwrap_or(1.0));
+                self.spawn_piece(
+                    &window,
+                    rect,
+                    None,
+                    v2(cx, cy),
+                    0.0,
+                    props.weight.unwrap_or(1.0),
+                );
                 if props.floating.unwrap_or(false) {
                     self.set_window_floating(&window, true);
                 }
@@ -154,6 +161,7 @@ impl AppState {
                     window: window.clone(),
                     key: piece.id,
                     clip: piece.rect,
+                    shape: piece.shape.clone(),
                     popups: Some(piece.id) == main,
                     from: ScreenPose {
                         angle: angle - wrap_angle(angle),
@@ -230,6 +238,7 @@ impl AppState {
                 window: piece.window.clone(),
                 key: piece.id,
                 clip: piece.rect,
+                shape: piece.shape.clone(),
                 popups,
                 from,
                 to,

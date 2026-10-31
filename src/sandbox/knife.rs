@@ -7,17 +7,19 @@ use smithay::utils::{Logical, Rectangle};
 use crate::physics::{Anchor, LinkKind};
 use crate::state::{AppState, LayoutMode};
 
-use super::{LinkEnd, Piece, clip_segment, v2};
+use super::{LinkEnd, Piece, shape, v2};
 
 impl AppState {
-    /// Режет верхнее окно, через которое прошёл отрезок (экранные координаты).
-    /// Разрез выровнен по осям окна: части — прямоугольные кадры одного
-    /// буфера, как у `wp_viewporter`, приложение продолжает работать целиком.
+    /// Режет верхнее окно, через которое прошёл штрих (экранные координаты):
+    /// каждый задетый кусок — по прямой штриха, под любым углом. Почти
+    /// горизонтальный или вертикальный штрих режет ровно по оси окна. Части —
+    /// кадры одного буфера (косые рисуются сеткой по снимку окна),
+    /// приложение продолжает работать целиком.
     pub(super) fn knife_cut(&mut self, s0: (f64, f64), s1: (f64, f64)) {
         if (s1.0 - s0.0).hypot(s1.1 - s0.1) < 8.0 {
             return;
         }
-        let min_piece = self.config.slicing.min_piece_size.max(1.0) as f64;
+        let min_piece = self.config.slicing.min_piece_size.max(0.0) as f64;
         let gap = self.config.slicing.cut_gap.max(0.0) as f64;
         let candidates: Vec<Window> = self
             .space
@@ -35,43 +37,29 @@ impl AppState {
                 };
                 let a = inv.apply(s0.0, s0.1);
                 let b = inv.apply(s1.0, s1.1);
-                let Some((t0, t1)) = clip_segment(a, b, piece.rect) else {
+                let (a, b) = ([a.0, a.1], [b.0, b.1]);
+                let outline = piece.outline();
+                // Штрих должен задеть кусок; режет вся его прямая.
+                let Some((t0, t1)) = shape::clip_segment(&outline, a, b) else {
                     continue;
                 };
                 if t1 - t0 < 1e-6 {
                     continue;
                 }
-                let p0 = (a.0 + (b.0 - a.0) * t0, a.1 + (b.1 - a.1) * t0);
-                let p1 = (a.0 + (b.0 - a.0) * t1, a.1 + (b.1 - a.1) * t1);
-                let r = piece.rect;
-                // Горизонтальный штрих → горизонтальный разрез, и наоборот.
-                let horizontal = (b.0 - a.0).abs() >= (b.1 - a.1).abs();
-                let (r1, r2) = if horizontal {
-                    let y = ((p0.1 + p1.1) * 0.5).round();
-                    if y - r.loc.y < min_piece || r.loc.y + r.size.h - y < min_piece {
-                        continue;
-                    }
-                    (
-                        Rectangle::new(r.loc, (r.size.w, y - r.loc.y).into()),
-                        Rectangle::new(
-                            (r.loc.x, y).into(),
-                            (r.size.w, r.loc.y + r.size.h - y).into(),
-                        ),
-                    )
-                } else {
-                    let x = ((p0.0 + p1.0) * 0.5).round();
-                    if x - r.loc.x < min_piece || r.loc.x + r.size.w - x < min_piece {
-                        continue;
-                    }
-                    (
-                        Rectangle::new(r.loc, (x - r.loc.x, r.size.h).into()),
-                        Rectangle::new(
-                            (x, r.loc.y).into(),
-                            (r.loc.x + r.size.w - x, r.size.h).into(),
-                        ),
-                    )
+                let (la, lb) = cut_line(a, b, (t0 + t1) * 0.5);
+                let Some((left, right)) = shape::split(&outline, la, lb) else {
+                    continue;
                 };
-                self.split_piece(&piece, r1, r2, horizontal, gap);
+                if shape::thickness(&left, la, lb) < min_piece
+                    || shape::thickness(&right, la, lb) < min_piece
+                {
+                    continue;
+                }
+                // Нормаль к разрезу в сторону левой части.
+                let (dx, dy) = (lb[0] - la[0], lb[1] - la[1]);
+                let len = dx.hypot(dy);
+                let normal = [-dy / len, dx / len];
+                self.split_piece(&piece, left, right, normal, gap);
                 cut_any = true;
             }
             if cut_any {
@@ -86,12 +74,14 @@ impl AppState {
         }
     }
 
+    /// Кусок → две части по разрезу. Части чуть расходятся по `normal`
+    /// (к левой части) и наследуют позу, скорость и вес куска.
     fn split_piece(
         &mut self,
         piece: &Piece,
-        r1: Rectangle<f64, Logical>,
-        r2: Rectangle<f64, Logical>,
-        horizontal: bool,
+        left: Vec<shape::Pt>,
+        right: Vec<shape::Pt>,
+        normal: shape::Pt,
         gap: f64,
     ) {
         let Some(phys) = self.physics.as_ref() else {
@@ -104,19 +94,6 @@ impl AppState {
         let floating = phys.is_floating(piece.id);
         let weight = phys.piece_weight(piece.id);
         let (pc_x, pc_y) = piece.center();
-        let world_of = |r: &Rectangle<f64, Logical>, sign: f64| -> Vector {
-            let rc = (r.loc.x + r.size.w * 0.5, r.loc.y + r.size.h * 0.5);
-            let mut d = (rc.0 - pc_x, rc.1 - pc_y);
-            // Части чуть расходятся по нормали к разрезу.
-            if horizontal {
-                d.1 += sign * gap * 0.5;
-            } else {
-                d.0 += sign * gap * 0.5;
-            }
-            c + crate::physics::rotate(v2(d.0, d.1), angle)
-        };
-        let c1 = world_of(&r1, -1.0);
-        let c2 = world_of(&r2, 1.0);
         let window = piece.window.clone();
         let links = self.take_links(&[piece.id]);
         // Разрезанная сетка теряет смысл — части снова жёсткие.
@@ -125,8 +102,19 @@ impl AppState {
             phys.remove_piece(piece.id);
         }
         self.pieces.retain(|p| p.id != piece.id);
-        for (rect, center) in [(r1, c1), (r2, c2)] {
-            let id = self.spawn_piece(&window, rect, center, angle, weight);
+        for (poly, sign) in [(left, 1.0), (right, -1.0)] {
+            let rect = shape::bounds(&poly);
+            let rc = (
+                rect.loc.x + rect.size.w * 0.5,
+                rect.loc.y + rect.size.h * 0.5,
+            );
+            let d = (
+                rc.0 - pc_x + normal[0] * sign * gap * 0.5,
+                rc.1 - pc_y + normal[1] * sign * gap * 0.5,
+            );
+            let center = c + crate::physics::rotate(v2(d.0, d.1), angle);
+            let shape = (!shape::is_axis_rect(&poly)).then_some(poly);
+            let id = self.spawn_piece(&window, rect, shape, center, angle, weight);
             if let Some(phys) = self.physics.as_mut() {
                 phys.set_piece_velocity(id, linvel, angvel);
                 if floating {
@@ -170,12 +158,7 @@ impl AppState {
                 LinkEnd::Anchor(a) => Some(a),
                 LinkEnd::Window(x, y) => {
                     let piece = pieces.iter().min_by(|a, b| {
-                        let d = |p: &Piece| {
-                            let r = p.rect;
-                            let dx = (r.loc.x - x).max(x - (r.loc.x + r.size.w)).max(0.0);
-                            let dy = (r.loc.y - y).max(y - (r.loc.y + r.size.h)).max(0.0);
-                            dx * dx + dy * dy
-                        };
+                        let d = |p: &Piece| shape::distance_sq(&p.outline(), [x, y]);
                         d(a).total_cmp(&d(b))
                     })?;
                     let c = piece.center();
@@ -346,7 +329,7 @@ impl AppState {
             }
         }
         self.pieces.retain(|p| p.window != window);
-        let id = self.spawn_piece(&window, full, center, angle, weight);
+        let id = self.spawn_piece(&window, full, None, center, angle, weight);
         if floating {
             if let Some(phys) = self.physics.as_mut() {
                 phys.set_floating(id, true);
@@ -369,5 +352,26 @@ impl AppState {
             }
         }
         self.needs_render = true;
+    }
+}
+
+/// Прямая разреза через точку штриха с параметром `t` (внутри куска).
+/// Штрих в пределах [`shape::AXIS_SNAP`] от оси окна выравнивается по ней, а
+/// разрез встаёт на целый пиксель — края кусков остаются ровными.
+fn cut_line(a: shape::Pt, b: shape::Pt, t: f64) -> (shape::Pt, shape::Pt) {
+    let m = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    let angle = (b[1] - a[1]).atan2(b[0] - a[0]);
+    let quarter = std::f64::consts::FRAC_PI_2;
+    let axis = (angle / quarter).round() * quarter;
+    if (angle - axis).abs() > shape::AXIS_SNAP {
+        return (a, b);
+    }
+    let (dx, dy) = (axis.cos().round(), axis.sin().round());
+    if dx != 0.0 {
+        let y = m[1].round();
+        ([m[0], y], [m[0] + dx, y])
+    } else {
+        let x = m[0].round();
+        ([x, m[1]], [x, m[1] + dy])
     }
 }

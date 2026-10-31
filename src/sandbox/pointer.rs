@@ -43,9 +43,7 @@ impl AppState {
                 }
             }
         }
-        let inside =
-            x >= r.loc.x && y >= r.loc.y && x < r.loc.x + r.size.w && y < r.loc.y + r.size.h;
-        Some(((x, y).into(), inside))
+        Some(((x, y).into(), piece.contains(x, y)))
     }
 
     /// Окно/кусок под экранной точкой и координаты в окне (физический режим).

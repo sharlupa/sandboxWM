@@ -194,6 +194,9 @@ pub struct PieceDraw {
     pub key: u32,
     /// Обрезка в координатах окна (начало = верхний левый угол геометрии).
     pub clip: Option<Rectangle<f64, Logical>>,
+    /// Форма косо отрезанного куска (координаты окна) — тогда кусок
+    /// рисуется сеткой `mesh`, а `clip` — её охват.
+    pub shape: Option<Vec<[f64; 2]>>,
     /// Координаты окна → экранные физические пиксели.
     pub xf: Affine,
     /// Рисовать xdg-попапы окна с этой трансформой (основной кусок).
@@ -607,8 +610,18 @@ fn piece_border(draw: &PieceDraw, width: f32, color: [f32; 4]) -> OverlayGeometr
     // Масштаб камеры: толщина рамки растёт и уменьшается вместе с окном.
     let scale = (draw.xf.a * draw.xf.a + draw.xf.b * draw.xf.b).sqrt() as f32;
     let w = (width * scale).max(1.0);
-    let outline: Vec<[f32; 2]> = match &draw.mesh {
-        Some(mesh) => {
+    let outline: Vec<[f32; 2]> = match (&draw.shape, &draw.mesh) {
+        (Some(shape), _) => {
+            // Как у прямоугольника: рамка снаружи края.
+            crate::sandbox::shape::offset(shape, (width * 0.5) as f64)
+                .into_iter()
+                .map(|[x, y]| {
+                    let (sx, sy) = draw.xf.apply(x, y);
+                    [sx as f32, sy as f32]
+                })
+                .collect()
+        }
+        (None, Some(mesh)) => {
             // Граница сетки (res+1)×(res+1), вершины построчно.
             let n = mesh.positions.len();
             let side = (n as f64).sqrt().round() as usize;
@@ -623,7 +636,7 @@ fn piece_border(draw: &PieceDraw, width: f32, color: [f32; 4]) -> OverlayGeometr
             ring.extend((1..side - 1).rev().map(|y| idx(0, y)));
             ring.into_iter().map(|i| mesh.positions[i]).collect()
         }
-        None => {
+        (None, None) => {
             // Рамка снаружи окна: центр линии на полтолщины за краем.
             let e = (width * 0.5) as f64;
             let (x0, y0) = (rect.loc.x - e, rect.loc.y - e);

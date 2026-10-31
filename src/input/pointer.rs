@@ -569,13 +569,12 @@ pub(super) fn handle_pointer_button(
                 .get_keyboard()
                 .map(|k| k.modifier_state().shift)
                 .unwrap_or(false);
-            // Super+Shift+ЛКМ — тянуть окно за край (мягкое тело);
-            // Super+ЛКМ — схватить и тащить окно.
-            let grabbed = if shift {
-                state.soft_grab_begin(pos.x, pos.y)
-            } else {
-                state.physics_drag_begin(pos.x, pos.y)
-            };
+            // Super+Shift+ЛКМ — тянуть мягкое окно за край (жёсткое не
+            // мнётся и просто тащится); Super+ЛКМ — схватить и тащить окно.
+            let grabbed = shift
+                .then(|| state.soft_grab_begin(pos.x, pos.y))
+                .flatten()
+                .or_else(|| state.physics_drag_begin(pos.x, pos.y));
             if let Some(win) = grabbed {
                 state.focus_window(&win);
                 state.needs_render = true;

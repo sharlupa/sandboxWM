@@ -22,7 +22,7 @@
 | §2 Rope falls and dangles, a window can hang from it | ✅ | The start is pinned; drag a window to the free end and it hooks on |
 | §3 Session persistence | ✅ | Lines, joints, windows, camera and mode; autosave, apps are relaunched on start |
 | §4 Weld, spring and rope between windows | ✅ | `Super+E/S/R`, then click two windows; a rope passes through the windows it links |
-| §5 Soft windows (jelly, stretching, squashing) | ✅ | `Super+J`, `Super+Shift+LMB`; PBD mesh + a mesh shader over a window snapshot |
+| §5 Soft windows (jelly, stretching, squashing) | ✅ | `Super+J`: rigid → soft → jelly, `Super+Shift+LMB`; PBD mesh + a mesh shader over a window snapshot |
 | §6 Inverse projection of input | ✅ | Clicks and text selection go through rotation, zoom, slicing and the deformed mesh |
 | §7 Slicing a window with a knife | ✅ | `Super+X`, swipe across a window; the parts are crops of one buffer and the app keeps working as a whole |
 
@@ -57,7 +57,7 @@ Every shortcut uses `Super`. Keys are configurable in `[controls]`.
 | `Super+F2` | Mode 2: gravity off, windows line up into tiling |
 | `Super+F3` | Mode 3: zero gravity for the focused window (toggle) |
 | `Super+F4` | Mode 4: zero gravity for everything (toggle) |
-| `Super+A` / `Super+D` | Hold to spin the focused window |
+| `Super+A` / `Super+D` | Hold to spin the window piece you hold with the mouse (`Super+LMB`) or point at; otherwise the focused window |
 | `Super+wheel`, `Super+-` / `Super+=` | Zoom around the cursor |
 | `Super+0` | Reset the camera (when there are fewer than 10 workspaces) |
 | `Super+C` | Gather all scattered windows into view: a grid on the floor, the camera adjusts; all joints, glue and rope hooks are released |
@@ -68,11 +68,11 @@ Every shortcut uses `Super`. Keys are configurable in `[controls]`.
 | Key | Action |
 |---|---|
 | `Super+P` | Draw lines. `LMB` draws, `RMB` erases the line under the cursor, `1`–`4` or `Tab` pick steel/glue/trampoline/rope, `Delete` erases all lines, `Esc` exits |
-| `Super+X` | Knife: swipe `LMB` across a window. A horizontal stroke cuts horizontally, a vertical one vertically |
+| `Super+X` | Knife: swipe `LMB` across a window — the cut follows the stroke at any angle (a nearly horizontal/vertical one snaps to the axis). Pieces can be cut again, however small |
 | `Super+E` / `Super+S` / `Super+R` | Weld / spring / rope: click the first window, then the second (click points are the anchors) |
 | `Super+U` | Remove joints, glue and rope hooks from the focused window |
-| `Super+J` | Toggle the focused window between soft and rigid |
-| `Super+Shift+LMB` + drag | Pull a window by its edge to stretch or squash it (it becomes soft) |
+| `Super+J` | Cycle the focused window's body: rigid → soft (crumples and stays crumpled) → jelly (wobbles and springs back) |
+| `Super+Shift+LMB` + drag | Pull a soft or jelly window by its edge to stretch or squash it (a rigid window does not deform and is just dragged) |
 | `Super+Z` | Restore the shape and re-join a sliced window |
 
 ## Build and run
@@ -102,7 +102,7 @@ The first directory found is used: `$SANDBOXWM_CONFIG`, `$XDG_CONFIG_HOME/sandbo
 | `gravity.conf` | `[gravity_modes]`: transition duration, zero gravity |
 | `drawing.conf` | `[drawing]`, `[materials.steel/glue/trampoline/rope]` |
 | `joints.conf` | `[joints.weld/spring/rope]` |
-| `softbody.conf` | `[soft_body]`: softness, squash, plasticity, mesh, inverse projection |
+| `softbody.conf` | `[soft_body]`: softness, squash, plasticity, jelly, mesh, inverse projection |
 | `slicing.conf` | `[slicing]` |
 | `session.conf` | `[session]`: autosave, path, TOML/JSON format, relaunching apps |
 | `window.conf` | `[window_props]` and per-app overrides: `[window_props.apps."org.gnome.Nautilus"] weight = 2.0, softness = 0.3, floating = true` |
@@ -168,7 +168,7 @@ If the picture freezes or the cursor is missing:
 
 Differences from the concept's original technical plan:
 - Rendering uses GLES (Smithay) with custom shaders for the mesh and the overlay, not a separate wgpu/glow renderer.
-- Slicing cuts along the window's axes: each part is a rectangular crop of the same buffer, like `wp_viewporter`. The `wp_viewporter` protocol itself is also supported for clients.
+- Slicing cuts along any line: each part is a convex polygon of the same buffer. Straight pieces are drawn as a crop of the buffer, like `wp_viewporter`, slanted ones as a mesh over a snapshot of the window; only straight pieces can become soft. The `wp_viewporter` protocol itself is also supported for clients.
 - X11 windows don't rotate in physics mode: XWayland can't express rotated geometry, so Steam/CEF clicks would drift.
 
 ## Known limitations

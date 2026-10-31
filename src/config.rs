@@ -173,6 +173,7 @@ impl Config {
         let mut out = WindowOverride {
             weight: Some(props.default_weight),
             softness: Some(props.default_softness),
+            body: None,
             floating: Some(false),
         };
         if props.allow_overrides && !app_id.is_empty() {
@@ -185,6 +186,7 @@ impl Config {
             {
                 out.weight = o.weight.or(out.weight);
                 out.softness = o.softness.or(out.softness);
+                out.body = o.body.or(out.body);
                 out.floating = o.floating.or(out.floating);
             }
         }
@@ -755,13 +757,17 @@ impl Default for RopeJointConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoftBodyConfig {
-    /// Мягкость окна, которое сделали мягким (`toggle_soft` или захват
-    /// за край): `0.0` — жёсткое, `1.0` — желе.
+    /// Мягкость мягкого окна (`toggle_soft`): `0.0` — жёсткое, `1.0` —
+    /// совсем податливое.
     pub softness: f32,
-    /// Насколько сильно окно сплющивается при ударе.
+    /// Насколько сильно мягкое окно сплющивается при ударе.
     pub impact_squash: f32,
-    /// Насколько вытягивание мышью остаётся навсегда (0..1).
+    /// Насколько вытягивание мягкого окна мышью остаётся навсегда (0..1).
     pub plasticity: f32,
+    /// Мягкость желейного окна: оно колышется и всегда возвращает форму.
+    pub jelly_softness: f32,
+    /// Насколько сильно желейное окно сплющивается при ударе.
+    pub jelly_impact_squash: f32,
     /// Число сегментов сетки по каждой стороне окна.
     pub mesh_resolution: u32,
     /// Обратное проецирование курсора через искривлённую сетку (концепт §6).
@@ -774,6 +780,8 @@ impl Default for SoftBodyConfig {
             softness: 0.5,
             impact_squash: 0.5,
             plasticity: 0.7,
+            jelly_softness: 0.9,
+            jelly_impact_squash: 0.9,
             mesh_resolution: 10,
             text_reprojection: true,
         }
@@ -786,7 +794,8 @@ impl Default for SoftBodyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SlicingConfig {
-    /// Минимальный размер получившегося кусочка (px).
+    /// Минимальная толщина кусочка от линии разреза (px). 0 — без
+    /// ограничения: отбрасываются только вырожденные (меньше 1 px²).
     pub min_piece_size: f32,
     /// Расстояние, на которое части расходятся после разреза (px).
     pub cut_gap: f32,
@@ -795,7 +804,7 @@ pub struct SlicingConfig {
 impl Default for SlicingConfig {
     fn default() -> Self {
         Self {
-            min_piece_size: 80.0,
+            min_piece_size: 0.0,
             cut_gap: 4.0,
         }
     }
@@ -860,14 +869,41 @@ impl Default for WindowPropsConfig {
     }
 }
 
+/// Тело окна в физике (концепт §5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BodyKind {
+    /// Жёсткое: не мнётся.
+    #[default]
+    Rigid,
+    /// Мягкое: мнётся и вытягивается, деформация частично остаётся.
+    Soft,
+    /// Желе: колышется от ударов и рывков, всегда возвращает форму.
+    Jelly,
+}
+
 /// Override свойств окна. Незаданное поле берётся из дефолтов.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowOverride {
     pub weight: Option<f32>,
+    /// Мягкость: больше 0 — окно мягкое (если не задано `body`).
     pub softness: Option<f32>,
+    /// Тело окна: `"rigid"`, `"soft"` или `"jelly"`.
+    pub body: Option<BodyKind>,
     /// Окно стартует в невесомости (режим 3).
     pub floating: Option<bool>,
+}
+
+impl WindowOverride {
+    /// Тело нового окна: `body`, иначе мягкое при `softness > 0`.
+    pub fn body_kind(&self) -> BodyKind {
+        self.body.unwrap_or(if self.softness.unwrap_or(0.0) > 0.0 {
+            BodyKind::Soft
+        } else {
+            BodyKind::Rigid
+        })
+    }
 }
 
 // ── Рендер ─────────────────────────────────────────────────────────

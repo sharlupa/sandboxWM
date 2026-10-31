@@ -38,15 +38,22 @@ impl AppState {
         self.needs_render = true;
     }
 
-    /// Удержание Super+A/D: крутить активное окно.
+    /// Удержание Super+A/D: крутить кусок, который держат мышью (Super+ЛКМ),
+    /// иначе кусок под курсором, иначе основной кусок активного окна.
     pub fn physics_spin_hold(&mut self, dir: f32) {
         if self.layout_mode != LayoutMode::Physics || self.transition.is_some() {
             return;
         }
-        let Some(window) = self.get_focused_window() else {
-            return;
+        let held = self.physics.as_ref().and_then(|p| p.drag_piece());
+        let hovered = || {
+            let pos = self.pointer_location;
+            self.piece_at(pos.x, pos.y).map(|(id, _)| id)
         };
-        let Some(piece) = self.main_piece(&window).map(|p| p.id) else {
+        let focused = || {
+            let window = self.get_focused_window()?;
+            self.main_piece(&window).map(|p| p.id)
+        };
+        let Some(piece) = held.or_else(hovered).or_else(focused) else {
             return;
         };
         self.spin_dir = dir.signum();

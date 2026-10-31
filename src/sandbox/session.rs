@@ -7,6 +7,7 @@ use rapier2d::math::Vector;
 use smithay::desktop::Window;
 use smithay::utils::Rectangle;
 
+use crate::config::BodyKind;
 use crate::physics::{Anchor, LinkKind, Material, WindowPhysics};
 use crate::state::{AppState, LayoutMode};
 
@@ -106,6 +107,7 @@ impl AppState {
                     .iter()
                     .find_map(|p| self.soft.get(&p.id))
                     .map_or(0.0, |s| s.params.softness.max(0.01)),
+                body: self.window_body(window),
                 ..Default::default()
             };
             for (i, p) in pieces.iter().enumerate() {
@@ -115,6 +117,7 @@ impl AppState {
                 piece_index.insert(p.id, (data.windows.len(), i));
                 saved.pieces.push(SavedPiece {
                     rect: [p.rect.loc.x, p.rect.loc.y, p.rect.size.w, p.rect.size.h],
+                    shape: p.shape.clone(),
                     center: [c.x, c.y],
                     angle,
                     floating: phys.is_floating(p.id),
@@ -422,9 +425,14 @@ impl AppState {
                 (p.rect[0] * sx, p.rect[1] * sy).into(),
                 ((p.rect[2] * sx).max(1.0), (p.rect[3] * sy).max(1.0)).into(),
             );
+            let shape = p
+                .shape
+                .as_ref()
+                .map(|poly| poly.iter().map(|v| [v[0] * sx, v[1] * sy]).collect());
             let id = self.spawn_piece(
                 window,
                 rect,
+                shape,
                 Vector::new(p.center[0], p.center[1]),
                 p.angle,
                 saved.weight,
@@ -441,11 +449,18 @@ impl AppState {
             }
             ids.push(id);
         }
-        if saved.softness > 0.0 {
-            let mut params = self.soft_params(window);
-            params.softness = saved.softness;
+        // Старые сессии знают только мягкость: больше 0 — мягкое окно.
+        let body = match saved.body {
+            BodyKind::Rigid if saved.softness > 0.0 => BodyKind::Soft,
+            body => body,
+        };
+        if body != BodyKind::Rigid {
+            let mut params = self.soft_params(window, body);
+            if body == BodyKind::Soft && saved.softness > 0.0 {
+                params.softness = saved.softness;
+            }
             for &id in &ids {
-                self.make_soft(id, params);
+                self.make_soft(id, body, params);
             }
         }
         ids

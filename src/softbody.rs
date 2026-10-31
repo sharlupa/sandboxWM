@@ -12,8 +12,9 @@
 //!   пружина, жёсткость из `softness`); при `softness == 0` сетка каждый шаг
 //!   в точности равна целевой форме — окно жёсткое;
 //! - ограничения длины по сторонам ячеек (структурные) и диагоналям (сдвиг)
-//!   плюс сохранение площади ячеек: связывают соседей, дают «желейные» волны
-//!   и выпячивание вбок при сплющивании;
+//!   плюс сохранение площади ячеек: связывают соседей, дают «желейные» волны;
+//! - сетка не выходит за выпуклую оболочку целевой формы — это и коллайдер
+//!   окна, так что колышущееся окно не налезает на соседей и пол;
 //! - инерционная псевдосила `−a` (ускорение жёсткой системы отсчёта, то есть
 //!   rapier-тела окна). Она приложена с весом от «опорной» грани: грань, в
 //!   которую давит сила, удерживается (её держит пол или препятствие), дальняя
@@ -133,6 +134,30 @@ pub struct SoftMesh {
     rest_generation: u64,
 }
 
+/// Нагрузка на окно без её постоянной части: сетку деформируют удары,
+/// рывки и отрыв от пола, а постоянная нагрузка — вес на полу, прижатие
+/// соседом — забывается за [`LOAD_RELAX`] с. Иначе мягкое окно навсегда
+/// оставалось сплющенным под собственным весом.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoadFilter {
+    base: Option<[f32; 2]>,
+}
+
+/// За сколько секунд (постоянная времени) забывается постоянная нагрузка.
+const LOAD_RELAX: f32 = 0.25;
+
+impl LoadFilter {
+    /// Изменение нагрузки `load` (собственное ускорение тела) за шаг `dt`.
+    pub fn apply(&mut self, load: [f32; 2], dt: f32) -> [f32; 2] {
+        let load = sanitize2(load);
+        let base = self.base.get_or_insert(load);
+        let out = sub(load, *base);
+        let k = 1.0 - (-sanitize(dt).max(0.0) / LOAD_RELAX).exp();
+        *base = add(*base, scale(out, k));
+        out
+    }
+}
+
 // --- Настройки модели (на шаг 1/60 с) ---
 
 /// Минимальная жёсткость якорной пружины (softness = 1): ~1.5 Гц колебаний.
@@ -210,6 +235,58 @@ fn clamp_len(a: [f32; 2], max: f32) -> [f32; 2] {
     } else {
         a
     }
+}
+
+/// Выпуклая оболочка точек (монотонная цепь), обход против часовой стрелки
+/// в координатах с осью y вниз — по часовой на экране.
+fn convex_hull(points: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    let mut pts: Vec<[f32; 2]> = points.iter().copied().filter(|p| finite2(*p)).collect();
+    pts.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    let turn = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| cross(sub(a, o), sub(b, o));
+    let mut hull: Vec<[f32; 2]> = Vec::with_capacity(pts.len() * 2);
+    for pass in 0..2 {
+        let start = hull.len();
+        let iter: Box<dyn Iterator<Item = &[f32; 2]>> = if pass == 0 {
+            Box::new(pts.iter())
+        } else {
+            Box::new(pts.iter().rev())
+        };
+        for &p in iter {
+            while hull.len() >= start + 2
+                && turn(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+            {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull
+}
+
+/// Точка `p`, возвращённая внутрь выпуклого многоугольника `hull` (обход
+/// как у [`convex_hull`]); `None` — она и так внутри.
+fn project_inside(hull: &[[f32; 2]], p: [f32; 2]) -> Option<[f32; 2]> {
+    let n = hull.len();
+    if n < 3 {
+        return None;
+    }
+    let outside = (0..n).any(|i| cross(sub(hull[(i + 1) % n], hull[i]), sub(p, hull[i])) < 0.0);
+    if !outside {
+        return None;
+    }
+    (0..n)
+        .map(|i| {
+            let (a, b) = (hull[i], hull[(i + 1) % n]);
+            let (t, d2) = closest_on_segment(p, a, b);
+            (add(a, scale(sub(b, a), t)), d2)
+        })
+        .min_by(|x, y| x.1.total_cmp(&y.1))
+        .map(|(q, _)| q)
 }
 
 /// Ближайшая к `p` точка отрезка `a..b`: (параметр t, расстояние²).
@@ -625,6 +702,9 @@ impl SoftMesh {
             let (_, s_max) = Self::extent_along(&self.goal, self.support_dir);
             (self.support_dir, s_max)
         });
+        // Сетка не выходит за свою целевую форму: без захвата это форма
+        // покоя, по которой построен коллайдер окна.
+        let hull = convex_hull(&self.goal);
         let mut touched = false;
         let dv = clamp_len(scale(accel, h), max_dv);
         let lin_disp = scale(dv, h);
@@ -666,6 +746,11 @@ impl SoftMesh {
                             *p = sub(*p, scale(dir, s - s_max));
                             touched = true;
                         }
+                    }
+                }
+                for p in self.pos.iter_mut() {
+                    if let Some(q) = project_inside(&hull, *p) {
+                        *p = q;
                     }
                 }
             }
@@ -754,8 +839,8 @@ impl SoftMesh {
         }
     }
 
-    /// Проекция ограничений площади ячеек: сохраняет «объём» желе, поэтому
-    /// сплющенное окно раздаётся вбок.
+    /// Проекция ограничений площади ячеек: сохраняет «объём» желе —
+    /// сплющенное окно раздаётся вбок, насколько позволяет его форма.
     #[inline]
     fn solve_cells(pos: &mut [[f32; 2]], inv: &[f32], cells: &[Cell], k: f32) {
         for c in cells {
@@ -1290,13 +1375,55 @@ mod tests {
             "низ (опора) почти на месте: {max_bottom_drop} vs {max_top_drop}"
         );
         assert!(
-            max_width > 401.0,
-            "при сплющивании окно раздаётся вбок: {max_width}"
+            max_width <= 400.01,
+            "окно не выходит за свою форму (коллайдер): {max_width}"
         );
         let settled_at = settled_at.expect("сетка должна успокоиться");
         assert!(settled_at < 4.0, "успокоилась за {settled_at} с");
         assert!(max_dev_from_rect(&m) < 0.5);
         assert!(!m.is_deformed());
+    }
+
+    #[test]
+    fn mesh_stays_inside_its_shape() {
+        // Удары во все стороны и вращение: желе колышется, но не вылезает
+        // за прямоугольник 400×300 — за коллайдер окна.
+        let mut m = SoftMesh::new(400.0, 300.0, 10);
+        let params = jelly();
+        let hits = [[0.0, -9e4], [9e4, 0.0], [-6e4, 6e4], [0.0, 9e4]];
+        for (k, hit) in hits.iter().enumerate() {
+            m.step(DT, *hit, if k % 2 == 0 { 12.0 } else { -12.0 }, &params);
+            for _ in 0..20 {
+                m.step(DT, [0.0, 0.0], 3.0, &params);
+                for p in m.positions() {
+                    assert!(
+                        p[0].abs() <= 200.01 && p[1].abs() <= 150.01,
+                        "частица {p:?} за формой окна"
+                    );
+                }
+            }
+        }
+        assert_finite(&m);
+    }
+
+    #[test]
+    fn load_filter_forgets_constant_load() {
+        let mut f = LoadFilter::default();
+        // Первое значение — опорное: рывка нет.
+        assert_eq!(f.apply([0.0, -1500.0], DT), [0.0, 0.0]);
+        // Лежит на полу: вес не сминает окно.
+        for _ in 0..120 {
+            let out = f.apply([0.0, -1500.0], DT);
+            assert!(out[1].abs() < 1e-3);
+        }
+        // Удар — сразу целиком, потом забывается.
+        let hit = f.apply([0.0, -90_000.0], DT);
+        assert!((hit[1] + 88_500.0).abs() < 1.0, "{hit:?}");
+        let mut out = hit;
+        for _ in 0..60 {
+            out = f.apply([0.0, -90_000.0], DT);
+        }
+        assert!(out[1].abs() < 0.05 * 88_500.0, "{out:?}");
     }
 
     #[test]

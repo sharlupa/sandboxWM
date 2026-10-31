@@ -185,10 +185,22 @@ impl PhysicsHooks for Hooks {
     }
 }
 
+/// Форма коллайдера куска: выпуклая оболочка `outline` или прямоугольник.
+/// Тонкие куски не тоньше 2 px, чтобы не проваливаться сквозь пол.
+fn piece_shape(half: Vector, outline: Option<&[Vector]>) -> SharedShape {
+    outline
+        .filter(|pts| pts.len() >= 3)
+        .and_then(SharedShape::convex_hull)
+        .unwrap_or_else(|| SharedShape::cuboid(half.x.max(1.0), half.y.max(1.0)))
+}
+
 struct PieceBody {
     body: RigidBodyHandle,
     collider: ColliderHandle,
     half: Vector,
+    /// Форма куска после косого разреза — относительно центра тела.
+    /// `None` — прямоугольник `half`.
+    outline: Option<Vec<Vector>>,
     floating: bool,
     /// Окно-кусок держит верёвка/клей и т.п. — для отрисовки не нужно, но
     /// нужно, чтобы корректно чистить связи при удалении.
@@ -487,14 +499,17 @@ impl WindowPhysics {
 
     // ── Куски окон ─────────────────────────────────────────────────
 
-    /// Создаёт динамическое тело куска окна `w`×`h` с центром в `center`.
-    /// Масса ∝ площади × `weight`.
+    /// Создаёт динамическое тело куска окна `w`×`h` с центром в `center`;
+    /// `outline` — форма косо разрезанного куска относительно центра.
+    /// Масса ∝ площади × `weight` (центр масс — по форме).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_piece(
         &mut self,
         center: Vector,
         angle: f32,
         w: f32,
         h: f32,
+        outline: Option<Vec<Vector>>,
         weight: f32,
         lock_rotation: bool,
     ) -> u32 {
@@ -514,9 +529,10 @@ impl WindowPhysics {
         } else {
             1.0
         };
+        let half = Vector::new(w * 0.5, h * 0.5);
         let (body, collider) = self.world.insert(
             builder,
-            ColliderBuilder::cuboid((w * 0.5).max(1.0), (h * 0.5).max(1.0))
+            ColliderBuilder::new(piece_shape(half, outline.as_deref()))
                 .density(self.cfg.density * weight)
                 .friction(self.cfg.friction)
                 .restitution(self.cfg.restitution)
@@ -527,7 +543,8 @@ impl WindowPhysics {
             PieceBody {
                 body,
                 collider,
-                half: Vector::new(w * 0.5, h * 0.5),
+                half,
+                outline,
                 floating: false,
                 weight,
             },
@@ -609,26 +626,53 @@ impl WindowPhysics {
         self.pieces.get(&piece).map(|p| p.half)
     }
 
-    /// Клиент поменял размер окна — коллайдер следует за ним.
-    pub fn set_piece_size(&mut self, piece: u32, w: f32, h: f32) {
+    /// Клиент поменял размер окна — коллайдер следует за ним (`outline` —
+    /// новая форма косо разрезанного куска).
+    pub fn set_piece_shape(&mut self, piece: u32, w: f32, h: f32, outline: Option<Vec<Vector>>) {
         let Some(p) = self.pieces.get_mut(&piece) else {
             return;
         };
-        let half = Vector::new((w * 0.5).max(1.0), (h * 0.5).max(1.0));
-        if (half - p.half).abs().max_element() < 0.25 {
+        let half = Vector::new(w * 0.5, h * 0.5);
+        if (half - p.half).abs().max_element() < 0.25 && outline == p.outline {
             return;
         }
         p.half = half;
+        p.outline = outline;
         if let Some(collider) = self.world.colliders.get_mut(p.collider) {
-            collider.set_shape(SharedShape::cuboid(half.x, half.y));
+            collider.set_shape(piece_shape(p.half, p.outline.as_deref()));
         }
         if let Some(body) = self.world.bodies.get_mut(p.body) {
             body.wake_up(true);
         }
     }
 
+    /// Точка `p` (мир), вытолкнутая из пола и чужих тел на их поверхность:
+    /// край мягкого окна, которое тянут за курсором, не продавливает их.
+    /// Тело самого куска `piece` и сенсоры не мешают.
+    pub fn push_out_of_obstacles(&self, piece: u32, mut p: Vector) -> Vector {
+        let Some(own) = self.pieces.get(&piece).map(|b| b.body) else {
+            return p;
+        };
+        let filter = QueryFilter::default()
+            .exclude_sensors()
+            .exclude_rigid_body(own);
+        // Вытолкнули из одного тела в соседнее — ещё пара попыток.
+        for _ in 0..3 {
+            let Some(q) = self
+                .world
+                .intersect_point(p, filter)
+                .next()
+                .map(|(_, co)| co.shape().project_point(co.position(), p, false).point)
+            else {
+                break;
+            };
+            p = q;
+        }
+        p
+    }
+
     /// Форма коллайдера по выпуклой оболочке (деформированное мягкое окно).
-    /// `None`/вырожденная оболочка → обратно к прямоугольнику.
+    /// `None`/вырожденная оболочка → обратно к форме куска.
     pub fn set_piece_hull(&mut self, piece: u32, hull: Option<&[Vector]>) {
         let Some(p) = self.pieces.get(&piece) else {
             return;
@@ -636,7 +680,7 @@ impl WindowPhysics {
         let shape = hull
             .filter(|pts| pts.len() >= 3)
             .and_then(SharedShape::convex_hull)
-            .unwrap_or_else(|| SharedShape::cuboid(p.half.x, p.half.y));
+            .unwrap_or_else(|| piece_shape(p.half, p.outline.as_deref()));
         if let Some(collider) = self.world.colliders.get_mut(p.collider) {
             collider.set_shape(shape);
         }
@@ -1660,10 +1704,29 @@ mod tests {
     #[test]
     fn piece_lands_on_floor() {
         let mut p = world();
-        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 400.0, 300.0, 1.0, false);
+        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 400.0, 300.0, None, 1.0, false);
         run(&mut p, 4.0);
         let (c, _) = p.piece_transform(id).unwrap();
         assert!((c.y - (1000.0 - 150.0)).abs() < 6.0, "center {c:?}");
+    }
+
+    #[test]
+    fn grab_point_is_pushed_out_of_floor_and_windows() {
+        let mut p = world();
+        let floor = p.floor_y();
+        let a = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 200.0, 100.0, None, 1.0, false);
+        let b = p.spawn_piece(Vector::new(400.0, 0.0), 0.0, 200.0, 100.0, None, 1.0, false);
+        p.step_once();
+        // Под полом — на его поверхность.
+        let q = p.push_out_of_obstacles(a, Vector::new(0.0, floor + 30.0));
+        assert!((q.y - floor).abs() < 0.5, "{q:?}");
+        // Внутри соседнего окна — на его ближайший край (левый, x = 300).
+        let (cb, _) = p.piece_transform(b).unwrap();
+        let q = p.push_out_of_obstacles(a, Vector::new(cb.x - 90.0, cb.y));
+        assert!((q.x - (cb.x - 100.0)).abs() < 0.5, "{q:?}");
+        // Своё тело не мешает, свободная точка не двигается.
+        let (ca, _) = p.piece_transform(a).unwrap();
+        assert_eq!(p.push_out_of_obstacles(a, ca), ca);
     }
 
     #[test]
@@ -1675,7 +1738,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let id = p.spawn_piece(Vector::new(0.0, 200.0), 0.0, 200.0, 100.0, 1.0, false);
+        let id = p.spawn_piece(Vector::new(0.0, 200.0), 0.0, 200.0, 100.0, None, 1.0, false);
         run(&mut p, 3.0);
         let (c, _) = p.piece_transform(id).unwrap();
         assert!(c.y < 500.0, "fell through shelf: {c:?}");
@@ -1690,7 +1753,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let id = p.spawn_piece(Vector::new(0.0, 380.0), 0.0, 200.0, 100.0, 1.0, false);
+        let id = p.spawn_piece(Vector::new(0.0, 380.0), 0.0, 200.0, 100.0, None, 1.0, false);
         run(&mut p, 2.0);
         assert_eq!(p.glue.len(), 1, "should be glued");
         // Слабо потянуть — держит.
@@ -1709,7 +1772,7 @@ mod tests {
     #[test]
     fn floating_window_stays() {
         let mut p = world();
-        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 200.0, 100.0, 1.0, false);
+        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 200.0, 100.0, None, 1.0, false);
         p.set_floating(id, true);
         run(&mut p, 2.0);
         let (c, _) = p.piece_transform(id).unwrap();
@@ -1719,7 +1782,7 @@ mod tests {
     #[test]
     fn floating_window_spins_in_place() {
         let mut p = world();
-        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 200.0, 100.0, 1.0, false);
+        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 200.0, 100.0, None, 1.0, false);
         p.set_floating(id, true);
         p.set_spin(Some((id, 2.0)));
         run(&mut p, 0.5);
@@ -1733,7 +1796,7 @@ mod tests {
     fn zero_gravity_floats() {
         let mut p = world();
         p.set_zero_gravity(true);
-        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 200.0, 100.0, 1.0, false);
+        let id = p.spawn_piece(Vector::new(0.0, 0.0), 0.0, 200.0, 100.0, None, 1.0, false);
         run(&mut p, 2.0);
         assert!(p.piece_transform(id).unwrap().0.y.abs() < 1.0);
         p.set_zero_gravity(false);
@@ -1762,8 +1825,16 @@ mod tests {
     #[test]
     fn weld_spring_rope_links() {
         let mut p = world();
-        let a = p.spawn_piece(Vector::new(-200.0, 0.0), 0.0, 200.0, 100.0, 1.0, false);
-        let b = p.spawn_piece(Vector::new(200.0, 0.0), 0.0, 200.0, 100.0, 1.0, false);
+        let a = p.spawn_piece(
+            Vector::new(-200.0, 0.0),
+            0.0,
+            200.0,
+            100.0,
+            None,
+            1.0,
+            false,
+        );
+        let b = p.spawn_piece(Vector::new(200.0, 0.0), 0.0, 200.0, 100.0, None, 1.0, false);
         p.set_floating(a, true);
         let weld = p
             .add_link(
@@ -1814,8 +1885,16 @@ mod tests {
     #[test]
     fn remove_piece_cleans_up() {
         let mut p = world();
-        let a = p.spawn_piece(Vector::new(-200.0, 0.0), 0.0, 200.0, 100.0, 1.0, false);
-        let b = p.spawn_piece(Vector::new(200.0, 0.0), 0.0, 200.0, 100.0, 1.0, false);
+        let a = p.spawn_piece(
+            Vector::new(-200.0, 0.0),
+            0.0,
+            200.0,
+            100.0,
+            None,
+            1.0,
+            false,
+        );
+        let b = p.spawn_piece(Vector::new(200.0, 0.0), 0.0, 200.0, 100.0, None, 1.0, false);
         p.add_link(
             LinkKind::Spring,
             Anchor {

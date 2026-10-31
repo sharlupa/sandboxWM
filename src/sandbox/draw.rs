@@ -6,10 +6,10 @@ use rapier2d::math::Vector;
 
 use crate::overlay::{OverlayGeometry, to_screen};
 use crate::physics::{Anchor, LinkKind, Material};
-use crate::render::{Affine, PieceDraw};
+use crate::render::{Affine, MeshDraw, PieceDraw};
 use crate::state::{AppState, LayoutMode};
 
-use super::{Piece, Tool, ease};
+use super::{Piece, Tool, ease, shape};
 
 impl AppState {
     /// Что рисовать в физическом режиме, front-to-back.
@@ -25,13 +25,18 @@ impl AppState {
                         item.clip.loc.x + item.clip.size.w * 0.5,
                         item.clip.loc.y + item.clip.size.h * 0.5,
                     );
+                    let xf = Affine::piece((pose.cx, pose.cy), pose.angle, pose.scale, c);
                     out.push(PieceDraw {
                         window: item.window.clone(),
                         key: item.key,
                         clip: Some(item.clip),
-                        xf: Affine::piece((pose.cx, pose.cy), pose.angle, pose.scale, c),
+                        mesh: item
+                            .shape
+                            .as_ref()
+                            .map(|s| shape_mesh(&item.window, s, &xf)),
+                        shape: item.shape.clone(),
+                        xf,
                         popups: item.popups,
-                        mesh: None,
                     });
                 }
             }
@@ -45,6 +50,7 @@ impl AppState {
                         window: window.clone(),
                         key: 0,
                         clip: None,
+                        shape: None,
                         xf: Affine::translation(geo.loc.x as f64, geo.loc.y as f64),
                         popups: false,
                         mesh: None,
@@ -59,13 +65,18 @@ impl AppState {
             pieces.sort_by_key(|p| Some(p.id) != main);
             for piece in pieces {
                 if let Some(xf) = self.piece_xf(piece) {
+                    let mesh = self.mesh_draw(piece, &xf).or_else(|| {
+                        let shape = piece.shape.as_ref()?;
+                        Some(shape_mesh(window, shape, &xf))
+                    });
                     out.push(PieceDraw {
                         window: window.clone(),
                         key: piece.id,
                         clip: Some(piece.rect),
+                        shape: piece.shape.clone(),
                         xf,
                         popups: Some(piece.id) == main,
-                        mesh: self.mesh_draw(piece, &xf),
+                        mesh,
                     });
                 }
             }
@@ -268,5 +279,33 @@ impl AppState {
     fn anchor_world(&self, a: &Anchor) -> Option<Vector> {
         let (c, angle) = self.physics.as_ref()?.piece_transform(a.piece)?;
         Some(c + crate::physics::rotate(a.local, angle))
+    }
+}
+
+/// Сетка косо отрезанного куска: веер треугольников по его форме
+/// (координаты окна), текстура — снимок окна.
+fn shape_mesh(window: &smithay::desktop::Window, shape: &[shape::Pt], xf: &Affine) -> MeshDraw {
+    let size = window.geometry().size;
+    let (gw, gh) = (size.w.max(1) as f64, size.h.max(1) as f64);
+    let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+    let positions = shape
+        .iter()
+        .map(|p| {
+            let (x, y) = xf.apply(p[0], p[1]);
+            for v in [x as f32, y as f32] {
+                fingerprint ^= v.to_bits() as u64;
+                fingerprint = fingerprint.wrapping_mul(0x0100_0000_01b3);
+            }
+            [x as f32, y as f32]
+        })
+        .collect();
+    MeshDraw {
+        positions,
+        geometry_uv: shape
+            .iter()
+            .map(|p| [(p[0] / gw) as f32, (p[1] / gh) as f32])
+            .collect(),
+        indices: shape::fan_indices(shape.len()),
+        fingerprint,
     }
 }

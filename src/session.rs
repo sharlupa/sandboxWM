@@ -159,8 +159,11 @@ pub struct SavedWindow {
     pub size: [i32; 2],
     /// Множитель плотности.
     pub weight: f32,
-    /// Мягкость: `0.0` — жёсткое окно, `1.0` — желе.
+    /// Мягкость мягкого окна (`body = "soft"`); в старых сессиях `> 0` —
+    /// значит окно мягкое.
     pub softness: f32,
+    /// Тело окна: жёсткое, мягкое или желе.
+    pub body: crate::config::BodyKind,
     /// Хотя бы один кусок; больше одного — окно разрезано (концепт §7).
     pub pieces: Vec<SavedPiece>,
 }
@@ -177,6 +180,7 @@ impl Default for SavedWindow {
             size: [0, 0],
             weight: 1.0,
             softness: 0.0,
+            body: crate::config::BodyKind::Rigid,
             pieces: Vec::new(),
         }
     }
@@ -188,6 +192,10 @@ impl Default for SavedWindow {
 pub struct SavedPiece {
     /// Кадрирование в локальных координатах окна: x, y, w, h.
     pub rect: [f64; 4],
+    /// Форма после косого разреза: вершины выпуклого многоугольника в
+    /// координатах окна. Нет — кусок занимает весь `rect`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Vec<[f64; 2]>>,
     /// Центр тела в мировых координатах.
     pub center: [f32; 2],
     /// Угол, радианы.
@@ -733,6 +741,17 @@ fn sanitize_piece(p: &mut SavedPiece, r: &mut ValidationReport) -> bool {
         p.center = center;
         r.fixed_values += 1;
     }
+    // Форма: числа, хотя бы треугольник — иначе кусок просто прямоугольный.
+    if p.shape.as_ref().is_some_and(|poly| {
+        poly.len() < 3
+            || !poly
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite() && v.abs() <= max)
+    }) {
+        p.shape = None;
+        r.fixed_values += 1;
+    }
     if !p.angle.is_finite() {
         p.angle = 0.0;
         r.fixed_values += 1;
@@ -1269,6 +1288,7 @@ mod tests {
     fn piece(x: f32, y: f32) -> SavedPiece {
         SavedPiece {
             rect: [0.0, 0.0, 800.0, 600.0],
+            shape: None,
             center: [x, y],
             angle: 0.25,
             floating: false,
@@ -1305,15 +1325,19 @@ mod tests {
                     size: [1280, 720],
                     weight: 2.5,
                     softness: 0.3,
+                    body: crate::config::BodyKind::Soft,
                     pieces: vec![
                         SavedPiece {
                             rect: [0.0, 0.0, 400.0, 720.0],
+                            shape: None,
                             center: [100.0, -50.25],
                             angle: -0.5,
                             floating: true,
                         },
                         SavedPiece {
                             rect: [400.0, 0.0, 880.0, 720.0],
+                            // Косой разрез: треугольник в охвате куска.
+                            shape: Some(vec![[400.0, 0.0], [1280.0, 0.0], [400.0, 720.0]]),
                             center: [900.0, 10.0],
                             angle: 3.0,
                             floating: false,
@@ -1330,6 +1354,7 @@ mod tests {
                     size: [1024, 768],
                     weight: 1.0,
                     softness: 0.0,
+                    body: crate::config::BodyKind::Jelly,
                     pieces: vec![piece(-300.0, 0.0)],
                 },
             ],

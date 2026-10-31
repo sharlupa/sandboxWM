@@ -8,7 +8,7 @@ use crate::overlay::to_screen;
 use crate::render::Affine;
 use crate::state::{AppState, LayoutMode};
 
-use super::{Piece, ScreenPose, Tool, v2, window_app_id};
+use super::{Piece, ScreenPose, Tool, shape, v2, window_app_id};
 
 impl AppState {
     pub fn pieces_of(&self, window: &Window) -> impl Iterator<Item = &Piece> + '_ {
@@ -22,9 +22,8 @@ impl AppState {
 
     /// Основной кусок окна (самый большой) — с ним рисуются попапы.
     pub(super) fn main_piece(&self, window: &Window) -> Option<&Piece> {
-        self.pieces_of(window).max_by(|a, b| {
-            (a.rect.size.w * a.rect.size.h).total_cmp(&(b.rect.size.w * b.rect.size.h))
-        })
+        self.pieces_of(window)
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
     }
 
     /// Координаты окна → экран для куска.
@@ -85,21 +84,31 @@ impl AppState {
         let y = self.camera_offset.1 - size.h as f64 * 0.5 - 40.0 / self.camera_zoom;
         let rect = Rectangle::new((0.0, 0.0).into(), (size.w as f64, size.h as f64).into());
         let props = self.window_override(window);
-        let id = self.spawn_piece(window, rect, v2(x, y), 0.0, props.weight.unwrap_or(1.0));
+        self.spawn_piece(
+            window,
+            rect,
+            None,
+            v2(x, y),
+            0.0,
+            props.weight.unwrap_or(1.0),
+        );
         if props.floating.unwrap_or(false) {
             self.set_window_floating(window, true);
         }
-        if props.softness.unwrap_or(0.0) > 0.0 {
-            let params = self.soft_params(window);
-            self.make_soft(id, params);
+        let body = props.body_kind();
+        if body != crate::config::BodyKind::Rigid {
+            self.set_window_body(window, body);
         }
         self.sync_space_positions();
     }
 
+    /// Тело куска окна: охват `rect` (координаты окна) с центром в мировой
+    /// точке `center`; `shape` — форма косо разрезанного куска.
     pub(super) fn spawn_piece(
         &mut self,
         window: &Window,
         rect: Rectangle<f64, Logical>,
+        shape: Option<Vec<shape::Pt>>,
         center: Vector,
         angle: f32,
         weight: f32,
@@ -107,11 +116,13 @@ impl AppState {
         // X11 не умеет повёрнутые окна: глобальные координаты кликов
         // (Steam/CEF) съезжают. Блокируем вращение.
         let lock = window.x11_surface().is_some();
+        let outline = body_outline(rect, shape.as_deref());
         let id = self.ensure_physics().spawn_piece(
             center,
             angle,
             rect.size.w as f32,
             rect.size.h as f32,
+            outline,
             weight,
             lock,
         );
@@ -119,6 +130,7 @@ impl AppState {
             id,
             window: window.clone(),
             rect,
+            shape,
         });
         id
     }
@@ -182,14 +194,16 @@ impl AppState {
         if size.w <= 1 || size.h <= 1 {
             return;
         }
-        let pieces: Vec<(u32, Rectangle<f64, Logical>)> =
-            self.pieces_of(window).map(|p| (p.id, p.rect)).collect();
+        let pieces: Vec<(u32, Rectangle<f64, Logical>, Option<Vec<shape::Pt>>)> = self
+            .pieces_of(window)
+            .map(|p| (p.id, p.rect, p.shape.clone()))
+            .collect();
         if pieces.is_empty() {
             return;
         }
         let bounds = pieces
             .iter()
-            .map(|(_, r)| *r)
+            .map(|(_, r, _)| *r)
             .reduce(|a, b| a.merge(b))
             .unwrap_or_default();
         let (w, h) = (size.w as f64, size.h as f64);
@@ -198,24 +212,40 @@ impl AppState {
         }
         let sx = w / bounds.size.w.max(1.0);
         let sy = h / bounds.size.h.max(1.0);
-        for (id, r) in pieces {
-            let rect = if self.pieces_of(window).count() == 1 {
-                Rectangle::new((0.0, 0.0).into(), (w, h).into())
+        let single = pieces.len() == 1;
+        for (id, r, shape) in pieces {
+            let scale = |p: shape::Pt| [(p[0] - bounds.loc.x) * sx, (p[1] - bounds.loc.y) * sy];
+            let (rect, shape) = if single && shape.is_none() {
+                (Rectangle::new((0.0, 0.0).into(), (w, h).into()), None)
             } else {
-                Rectangle::new(
-                    ((r.loc.x - bounds.loc.x) * sx, (r.loc.y - bounds.loc.y) * sy).into(),
-                    (r.size.w * sx, r.size.h * sy).into(),
+                (
+                    Rectangle::new(
+                        ((r.loc.x - bounds.loc.x) * sx, (r.loc.y - bounds.loc.y) * sy).into(),
+                        (r.size.w * sx, r.size.h * sy).into(),
+                    ),
+                    shape.map(|poly| poly.into_iter().map(scale).collect::<Vec<_>>()),
                 )
             };
+            let outline = body_outline(rect, shape.as_deref());
             if let Some(p) = self.pieces.iter_mut().find(|p| p.id == id) {
                 p.rect = rect;
+                p.shape = shape;
             }
             if let Some(phys) = self.physics.as_mut() {
-                phys.set_piece_size(id, rect.size.w as f32, rect.size.h as f32);
+                phys.set_piece_shape(id, rect.size.w as f32, rect.size.h as f32, outline);
             }
             if let Some(soft) = self.soft.get_mut(&id) {
                 soft.mesh.resize(rect.size.w as f32, rect.size.h as f32);
             }
         }
     }
+}
+
+/// Форма куска для физики: вершины относительно центра охвата.
+fn body_outline(rect: Rectangle<f64, Logical>, shape: Option<&[shape::Pt]>) -> Option<Vec<Vector>> {
+    let (cx, cy) = (
+        rect.loc.x + rect.size.w * 0.5,
+        rect.loc.y + rect.size.h * 0.5,
+    );
+    shape.map(|poly| poly.iter().map(|p| v2(p[0] - cx, p[1] - cy)).collect())
 }

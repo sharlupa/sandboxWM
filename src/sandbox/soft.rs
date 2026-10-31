@@ -6,33 +6,51 @@ use std::time::Instant;
 use rapier2d::math::Vector;
 use smithay::desktop::Window;
 
+use crate::config::BodyKind;
 use crate::render::Affine;
+use crate::softbody::SoftParams;
 use crate::state::{AppState, LayoutMode};
 
 use super::{Piece, SoftPiece, window_app_id};
 
 impl AppState {
-    /// Параметры мягкости для окна: конфиг + override по app_id.
-    pub(super) fn soft_params(&self, window: &Window) -> crate::softbody::SoftParams {
+    /// Параметры тела `kind` для окна: конфиг + override по app_id. Желе
+    /// не пластично — всегда возвращает форму.
+    pub(super) fn soft_params(&self, window: &Window, kind: BodyKind) -> SoftParams {
         let cfg = &self.config.soft_body;
+        if kind == BodyKind::Jelly {
+            return SoftParams {
+                softness: cfg.jelly_softness.clamp(0.0, 1.0),
+                impact_squash: cfg.jelly_impact_squash.clamp(0.0, 1.0),
+                plasticity: 0.0,
+            };
+        }
         let softness = self
             .window_override(window)
             .softness
             .filter(|s| *s > 0.0)
             .unwrap_or(cfg.softness);
-        crate::softbody::SoftParams {
+        SoftParams {
             softness: softness.clamp(0.0, 1.0),
             impact_squash: cfg.impact_squash.clamp(0.0, 1.0),
             plasticity: cfg.plasticity.clamp(0.0, 1.0),
         }
     }
 
-    /// Делает кусок мягким (если ещё не).
-    pub(super) fn make_soft(&mut self, piece: u32, params: crate::softbody::SoftParams) {
-        if self.soft.contains_key(&piece) {
+    /// Делает кусок мягким или желейным (`kind`, параметры `params`); у уже
+    /// мягкого меняет материал, сохраняя форму. Сетка мягкого тела
+    /// прямоугольная, поэтому косо отрезанные куски остаются жёсткими.
+    pub(super) fn make_soft(&mut self, piece: u32, kind: BodyKind, params: SoftParams) {
+        if let Some(soft) = self.soft.get_mut(&piece) {
+            soft.kind = kind;
+            soft.params = params;
             return;
         }
-        let Some(rect) = self.piece_by_id(piece).map(|p| p.rect) else {
+        let Some(rect) = self
+            .piece_by_id(piece)
+            .filter(|p| p.shape.is_none())
+            .map(|p| p.rect)
+        else {
             return;
         };
         let mesh = crate::softbody::SoftMesh::new(
@@ -46,10 +64,31 @@ impl AppState {
             SoftPiece {
                 mesh,
                 params,
+                kind,
                 prev_vel: None,
+                load: Default::default(),
                 rest_generation,
             },
         );
+    }
+
+    /// Тело окна: материал его мягких кусков, иначе жёсткое.
+    pub(super) fn window_body(&self, window: &Window) -> BodyKind {
+        self.pieces_of(window)
+            .find_map(|p| self.soft.get(&p.id))
+            .map_or(BodyKind::Rigid, |s| s.kind)
+    }
+
+    /// Тело всех кусков окна.
+    pub(super) fn set_window_body(&mut self, window: &Window, kind: BodyKind) {
+        let ids: Vec<u32> = self.pieces_of(window).map(|p| p.id).collect();
+        let params = self.soft_params(window, kind);
+        for id in ids {
+            match kind {
+                BodyKind::Rigid => self.drop_soft(id),
+                _ => self.make_soft(id, kind, params),
+            }
+        }
     }
 
     pub(super) fn drop_soft(&mut self, piece: u32) {
@@ -64,6 +103,7 @@ impl AppState {
     }
 
     /// Super+J: мягкое ↔ жёсткое окно.
+    /// Super+J: тело активного окна по кругу — жёсткое → мягкое → желе.
     pub fn toggle_soft_focused(&mut self) {
         if self.layout_mode == LayoutMode::Tiling {
             self.enter_physics_mode();
@@ -71,37 +111,32 @@ impl AppState {
         let Some(window) = self.get_focused_window() else {
             return;
         };
-        let ids: Vec<u32> = self.pieces_of(&window).map(|p| p.id).collect();
-        let soft = ids.iter().any(|id| self.soft.contains_key(id));
-        let params = self.soft_params(&window);
-        for id in ids {
-            if soft {
-                self.drop_soft(id);
-            } else {
-                self.make_soft(id, params);
-            }
-        }
-        println!(
-            "[soft] окно {:?}: {}",
-            window_app_id(&window),
-            if soft {
-                "жёсткое"
-            } else {
-                "мягкое"
-            }
-        );
+        let next = match self.window_body(&window) {
+            BodyKind::Rigid => BodyKind::Soft,
+            BodyKind::Soft => BodyKind::Jelly,
+            BodyKind::Jelly => BodyKind::Rigid,
+        };
+        self.set_window_body(&window, next);
+        let name = match next {
+            BodyKind::Rigid => "жёсткое",
+            BodyKind::Soft => "мягкое",
+            BodyKind::Jelly => "желе",
+        };
+        println!("[soft] окно {:?}: {name}", window_app_id(&window));
         self.needs_render = true;
     }
 
-    /// Super+Shift+ЛКМ: схватить окно за точку и тянуть (деформация).
+    /// Super+Shift+ЛКМ: схватить мягкое окно за точку и тянуть (деформация).
     pub fn soft_grab_begin(&mut self, sx: f64, sy: f64) -> Option<Window> {
         if self.layout_mode != LayoutMode::Physics || self.transition.is_some() {
             return None;
         }
         let (piece_id, _) = self.piece_at(sx, sy)?;
+        // Жёсткое окно не мнётся (Super+Shift+ЛКМ его просто тащит).
+        if !self.soft.contains_key(&piece_id) {
+            return None;
+        }
         let piece = self.piece_by_id(piece_id)?.clone();
-        let params = self.soft_params(&piece.window);
-        self.make_soft(piece_id, params);
         let local = self.rigid_local(&piece, sx, sy)?;
         let radius = (piece.rect.size.w.max(piece.rect.size.h)) as f32;
         let soft = self.soft.get_mut(&piece_id)?;
@@ -124,6 +159,7 @@ impl AppState {
         let Some(target) = self.rigid_local(&piece, sx, sy) else {
             return;
         };
+        let target = self.push_grab_out(piece_id, target);
         if let (Some((_, grab)), Some(soft)) =
             (self.soft_grab.as_ref(), self.soft.get_mut(&piece_id))
         {
@@ -147,6 +183,21 @@ impl AppState {
     }
 
     /// Экран → локальные координаты куска (от центра) без учёта сетки.
+    /// Точка захвата (локальные координаты куска), вытолкнутая из пола и
+    /// соседних окон: тянущийся край упирается в них, а не проходит насквозь.
+    fn push_grab_out(&self, piece: u32, local: [f32; 2]) -> [f32; 2] {
+        let Some(phys) = self.physics.as_ref() else {
+            return local;
+        };
+        let Some((c, angle)) = phys.piece_transform(piece) else {
+            return local;
+        };
+        let world = c + crate::physics::rotate(Vector::new(local[0], local[1]), angle);
+        let pushed = phys.push_out_of_obstacles(piece, world);
+        let back = crate::physics::rotate(pushed - c, -angle);
+        [back.x, back.y]
+    }
+
     fn rigid_local(&self, piece: &Piece, sx: f64, sy: f64) -> Option<[f32; 2]> {
         let inv = self.piece_xf(piece)?.inverse()?;
         let (x, y) = inv.apply(sx, sy);
@@ -172,12 +223,13 @@ impl AppState {
                 continue;
             };
             // Собственное ускорение (a − g): в свободном падении сетка не
-            // деформируется, при ударе об пол — сплющивается, в покое — оседает.
+            // деформируется, при ударе об пол — сплющивается. Деформирует
+            // только его изменение: лёжа на полу, окно не оседает навсегда.
             let accel = soft.prev_vel.map_or(Vector::ZERO, |prev| (vel - prev) / dt);
             soft.prev_vel = Some(vel);
-            let proper = accel - phys.piece_gravity(id);
-            let local = crate::physics::rotate(proper, -angle);
-            soft.mesh.step(dt, [local.x, local.y], angvel, &soft.params);
+            let proper = crate::physics::rotate(accel - phys.piece_gravity(id), -angle);
+            let load = soft.load.apply([proper.x, proper.y], dt);
+            soft.mesh.step(dt, load, angvel, &soft.params);
             active |= soft.mesh.is_active();
             let generation = soft.mesh.rest_generation();
             if generation != soft.rest_generation {
