@@ -246,6 +246,10 @@ impl AppState {
             smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<Self>(&display_handle);
         // Без этих глобалов XWayland работает с абсолютным курсором (как до
         // рабочих столов) — см. `[input] pointer_lock`.
+        XWAYLAND_POINTER_LOCK.store(
+            config.input.xwayland_pointer_lock,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let (relative_pointer_state, pointer_constraints_state) = if config.input.pointer_lock {
             (
                 Some(RelativePointerManagerState::new::<Self>(&display_handle)),
@@ -1320,7 +1324,52 @@ impl PointerConstraintsHandler for AppState {
         }
     }
 }
-smithay::delegate_pointer_constraints!(AppState);
+// Вместо smithay::delegate_pointer_constraints!: глобал захвата указателя
+// по умолчанию не виден XWayland (см. `[input] xwayland_pointer_lock`).
+//
+// С захватом XWayland эмулирует «вернуть курсор в центр» у X11-игр, и в
+// XWayland 24.1 это даёт обратный рывок: камера в TF2 возвращалась назад,
+// стоило отпустить мышь. Без захвата XWayland берёт «сырые» движения мыши
+// из zwp_relative_pointer (поворот без упора в край экрана), а
+// Wayland-игры по-прежнему получают захват.
+pub static XWAYLAND_POINTER_LOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+impl
+    smithay::reexports::wayland_server::GlobalDispatch<
+        smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+        (),
+    > for AppState
+{
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: smithay::reexports::wayland_server::New<
+            smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+        >,
+        _global_data: &(),
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+
+    fn can_view(client: Client, _global_data: &()) -> bool {
+        client
+            .get_data::<smithay::xwayland::XWaylandClientData>()
+            .is_none()
+            || XWAYLAND_POINTER_LOCK.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+smithay::reexports::wayland_server::delegate_dispatch!(AppState: [
+    smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1: ()
+] => PointerConstraintsState);
+smithay::reexports::wayland_server::delegate_dispatch!(AppState: [
+    smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_confined_pointer_v1::ZwpConfinedPointerV1: smithay::wayland::pointer_constraints::PointerConstraintUserData<AppState>
+] => PointerConstraintsState);
+smithay::reexports::wayland_server::delegate_dispatch!(AppState: [
+    smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_locked_pointer_v1::ZwpLockedPointerV1: smithay::wayland::pointer_constraints::PointerConstraintUserData<AppState>
+] => PointerConstraintsState);
 smithay::delegate_relative_pointer!(AppState);
 
 impl AppState {

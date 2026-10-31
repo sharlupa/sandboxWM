@@ -501,11 +501,21 @@ pub struct InputConfig {
     /// центр не работает и камеру тянет к курсору композитора (для
     /// диагностики). Применяется при запуске WM.
     pub pointer_lock: bool,
+    /// Показывать ли захват указателя XWayland. По умолчанию нет: XWayland
+    /// 24.1 эмулирует под захватом «вернуть курсор в центр» так, что камера
+    /// в X11-играх (TF2) возвращается назад, стоило отпустить мышь. Без
+    /// захвата X11-игры берут «сырые» движения мыши (в TF2 — `m_rawinput 1`)
+    /// и крутятся без упора в край экрана. Wayland-игры захват получают
+    /// всегда (если `pointer_lock = true`).
+    pub xwayland_pointer_lock: bool,
 }
 
 impl Default for InputConfig {
     fn default() -> Self {
-        Self { pointer_lock: true }
+        Self {
+            pointer_lock: true,
+            xwayland_pointer_lock: false,
+        }
     }
 }
 
