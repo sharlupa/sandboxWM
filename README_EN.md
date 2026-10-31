@@ -151,8 +151,11 @@ If the picture freezes or the cursor is missing:
 
 - `src/main.rs` — startup, backend selection, the Winit loop.
 - `src/backend_drm.rs` — DRM/KMS, EGL/GBM, libinput, cursor, screencopy.
-- `src/state.rs` — compositor state, tiling, focus, Wayland handlers (xdg-shell, popups with grabs, clipboard, viewporter…).
-- `src/sandbox.rs` — the physics sandbox on top of the state: window pieces, tools, gravity modes, transitions, inverse projection, overlay, session.
+- `src/state.rs` — the compositor state (`AppState`) and common window cleanup.
+- `src/handlers/` — Wayland protocol handlers: commits and buffers, xdg-shell (popups with grabs), seat and clipboard, outputs and screencopy.
+- `src/input/` — input: `keyboard.rs` (key bindings), `pointer.rs` (motion, buttons, pointer focus), `constraints.rs` (pointer lock and relative motion for games).
+- `src/layout.rs` — the tiling layout from the BSP tree; `src/focus.rs` — keyboard focus for Wayland and X11 windows.
+- `src/sandbox/` — the physics sandbox on top of the state (one file per topic): window pieces, tools, gravity modes, transitions, inverse projection, overlay, session.
 - `src/physics.rs` — the rapier2d world: window pieces, lines and materials, ropes, joints, glue, dragging, contact hooks.
 - `src/softbody.rs` — a window's soft body (PBD mesh with plasticity and inertial pseudo-forces).
 - `src/render.rs` — render elements: rotated/cropped window pieces, frame assembly for both backends.

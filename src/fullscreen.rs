@@ -101,7 +101,7 @@ impl AppState {
             if visible {
                 self.place_fullscreen_window();
                 self.focus_window(window);
-                crate::input::refresh_pointer_focus(self);
+                self.queue_pointer_refresh();
             }
             println!(
                 "[fullscreen] {:?}: на весь экран",
@@ -137,7 +137,7 @@ impl AppState {
                         self.sync_space_positions();
                     }
                 }
-                crate::input::refresh_pointer_focus(self);
+                self.queue_pointer_refresh();
             }
             println!(
                 "[fullscreen] {:?}: обычный размер",

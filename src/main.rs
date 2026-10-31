@@ -4,8 +4,10 @@ pub mod cursor;
 pub mod ext_workspace;
 pub mod focus;
 pub mod fullscreen;
+pub mod handlers;
 pub mod input;
 pub mod layer_shell;
+pub mod layout;
 pub mod mesh_render;
 pub mod output_manager;
 pub mod overlay;
@@ -23,7 +25,7 @@ pub mod xwm;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::calloop::{EventLoop, Interest, PostAction, generic::Generic};
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::Transform;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -40,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop: EventLoop<AppState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
-    let display: Display<AppState> = Display::new()?;
+    let mut display: Display<AppState> = Display::new()?;
     let display_handle = display.handle();
 
     let mut state = AppState::new(display_handle.clone());
@@ -131,6 +133,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .insert_client(client_stream, Arc::new(ClientState::default()))
             .unwrap();
     })?;
+    // Цикл просыпается, как только клиенты прислали запросы (сами запросы
+    // разбирает dispatch_clients после dispatch). Без этого источника
+    // event_loop.dispatch спал до 16 мс, пока его не будил ввод или таймер, и
+    // столько же ждал каждый запрос: кадры клиентов, связь X11-окна с его
+    // поверхностью, захват мыши и подсказки курсора XWayland.
+    let client_fd = display.backend().poll_fd().try_clone_to_owned()?;
+    loop_handle.insert_source(
+        Generic::new(
+            client_fd,
+            Interest::READ,
+            smithay::reexports::calloop::Mode::Level,
+        ),
+        |_, _, _| Ok(PostAction::Continue),
+    )?;
 
     // XWayland: встроенный X-сервер для X11-приложений (Steam, старые игры).
     // Steam — X11-клиент: без X-сервера он падает с "XOpenDisplay failed".
@@ -308,7 +324,7 @@ fn run_winit(
                 backend.window().request_redraw();
             }
             WinitEvent::Input(input_event) => {
-                input::process_input_event(state, input_event);
+                input::process_event(state, input_event);
                 // If input set needs_render (resize, etc.), schedule a
                 // Redraw so the render loop picks it up.
                 if state.needs_render {
@@ -416,6 +432,7 @@ fn run_winit(
     while state.running {
         event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)?;
         display.dispatch_clients(&mut state)?;
+        state.flush_pointer_refresh();
         display.flush_clients()?;
         // Redraw в winit приходит только при изменениях — автосохранение
         // проверяем и в простое.

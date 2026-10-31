@@ -4,7 +4,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::cursor::CursorRenderer;
-use crate::input::process_libinput_event;
 use crate::render::CustomRenderElements;
 use crate::screencopy::ScreencopyRenderer;
 use crate::state::AppState;
@@ -228,7 +227,7 @@ pub fn run_tty(
         .map_err(|()| format!("libinput: не удалось назначить seat {seat_name}"))?;
     let libinput_backend = LibinputInputBackend::new(libinput_ctx.clone());
     loop_handle.insert_source(libinput_backend, |event, _, state| {
-        process_libinput_event(state, event);
+        crate::input::process_event(state, event);
     })?;
 
     // 7.5. Обработка событий сессии (VT-переключения)
@@ -400,6 +399,7 @@ pub fn run_tty(
     while state.running {
         event_loop.dispatch(Duration::from_millis(16), state)?;
         display.dispatch_clients(state)?;
+        state.flush_pointer_refresh();
         display.flush_clients()?;
     }
 

@@ -213,7 +213,7 @@ impl AppState {
             }
         }
         // Под курсором теперь другие окна.
-        crate::input::refresh_pointer_focus(self);
+        self.queue_pointer_refresh();
         self.ext_workspace_changed();
         println!("[workspace] рабочий стол {}", target + 1);
     }
@@ -325,7 +325,7 @@ impl AppState {
                 }
             }
         }
-        crate::input::refresh_pointer_focus(self);
+        self.queue_pointer_refresh();
         self.needs_render = true;
         println!(
             "[workspace] окно {:?} → рабочий стол {}",

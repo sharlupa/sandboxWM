@@ -13,8 +13,9 @@ use smithay::backend::input::KeyState;
 use smithay::desktop::{PopupKind, Window};
 use smithay::input::Seat;
 use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{IsAlive, Serial};
+use smithay::utils::{IsAlive, Logical, Rectangle, Serial};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::xwayland::X11Surface;
 
@@ -143,5 +144,164 @@ impl KeyboardTarget<AppState> for KeyboardFocusTarget {
             }
             Self::X11(x11) => KeyboardTarget::modifiers(x11, seat, data, modifiers, serial),
         }
+    }
+}
+
+impl AppState {
+    /// Set keyboard focus to a specific normal toplevel window.
+    pub fn focus_window(&mut self, window: &Window) {
+        // X11 override-redirect windows (Steam/CEF menus, tooltips and
+        // notifications) manage their own focus/grabs. Treating them as normal
+        // toplevels generates FocusOut before ButtonPress and makes clicks pass
+        // through the popup.
+        if window
+            .x11_surface()
+            .map_or(false, |x| x.is_override_redirect())
+        {
+            return;
+        }
+        // Фокус ушёл на другое окно (Super+стрелки, перенос) — полноэкранное
+        // окно возвращается в обычный размер, иначе фокус был бы невидим.
+        if let Some(fs) = self.fullscreen_window() {
+            if &fs != window {
+                self.set_fullscreen(&fs, false);
+            }
+        }
+
+        let already_focused = self
+            .get_focused_window()
+            .as_ref()
+            .map_or(false, |focused| focused == window);
+
+        // Raise visually first, then mirror the complete order to X11. Raising
+        // just the target with X11Wm::raise_window loses CEF popup ordering.
+        self.space.raise_element(window, true);
+        if already_focused {
+            self.sync_x11_stacking();
+            self.needs_render = true;
+            return;
+        }
+
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let windows: Vec<Window> = self.space.elements().cloned().collect();
+        for w in &windows {
+            let is_target = w == window;
+            if let Some(toplevel) = w.toplevel() {
+                let mut changed = false;
+                toplevel.with_pending_state(|state| {
+                    let already = state.states.contains(xdg_toplevel::State::Activated);
+                    if is_target && !already {
+                        state.states.set(xdg_toplevel::State::Activated);
+                        changed = true;
+                    } else if !is_target && already {
+                        state.states.unset(xdg_toplevel::State::Activated);
+                        changed = true;
+                    }
+                });
+                w.set_activated(is_target);
+                if changed && toplevel.is_initial_configure_sent() {
+                    toplevel.send_configure();
+                }
+            } else if let Some(x11) = w.x11_surface() {
+                // Never deactivate OR popups. Steam's locally-active focus
+                // model closes or defocuses them before the pending click.
+                if x11.is_override_redirect() {
+                    continue;
+                }
+                let _ = x11.set_activated(is_target);
+                w.set_activated(is_target);
+            }
+        }
+
+        // X11-окну фокус ставится и в X-сервере (SetInputFocus/WM_TAKE_FOCUS
+        // по его ICCCM-модели), см. focus.rs; Wayland-окну — его поверхности.
+        if let Some(target) = crate::focus::KeyboardFocusTarget::for_window(window) {
+            if let Some(kbd) = self.seat.get_keyboard() {
+                kbd.set_focus(self, Some(target), serial);
+            }
+        }
+
+        self.sync_x11_stacking();
+        self.needs_render = true;
+    }
+
+    /// Move focus to the next or previous window in the stack.
+    pub fn focus_next(&mut self, forward: bool) {
+        let windows: Vec<Window> = self
+            .space
+            .elements()
+            .filter(|w| !w.x11_surface().map_or(false, |x| x.is_override_redirect()))
+            .cloned()
+            .collect();
+        if windows.is_empty() {
+            return;
+        }
+        // Порядок по дереву тайлов стабилен (стек Space меняется при фокусе).
+        let ordered: Vec<Window> = match &self.tile_tree {
+            Some(tree) => {
+                let mut v: Vec<Window> = tree
+                    .windows()
+                    .into_iter()
+                    .filter(|w| windows.contains(w))
+                    .collect();
+                let rest: Vec<Window> =
+                    windows.iter().filter(|w| !v.contains(w)).cloned().collect();
+                v.extend(rest);
+                v
+            }
+            None => windows,
+        };
+        let current = self.get_focused_window();
+        let next_idx = match current.and_then(|c| ordered.iter().position(|w| *w == c)) {
+            Some(idx) if forward => (idx + 1) % ordered.len(),
+            Some(idx) => (idx + ordered.len() - 1) % ordered.len(),
+            None => 0,
+        };
+        let target = ordered[next_idx].clone();
+        self.focus_window(&target);
+    }
+
+    /// Фокус на ближайшее окно в направлении `(dx, dy)` (тайлинг, Super+стрелки).
+    /// Если в ту сторону окон нет — по кругу, как раньше.
+    pub fn focus_direction(&mut self, dx: f64, dy: f64) {
+        let Some(current) = self.get_focused_window() else {
+            self.focus_next(true);
+            return;
+        };
+        let Some(cur) = self.space.element_geometry(&current) else {
+            return;
+        };
+        let center = |r: Rectangle<i32, Logical>| {
+            (
+                r.loc.x as f64 + r.size.w as f64 * 0.5,
+                r.loc.y as f64 + r.size.h as f64 * 0.5,
+            )
+        };
+        let (cx, cy) = center(cur);
+        let best = self
+            .space
+            .elements()
+            .filter(|w| **w != current)
+            .filter(|w| !w.x11_surface().map_or(false, |x| x.is_override_redirect()))
+            .filter_map(|w| {
+                let (x, y) = center(self.space.element_geometry(w)?);
+                let along = (x - cx) * dx + (y - cy) * dy;
+                let across = ((x - cx) * dy - (y - cy) * dx).abs();
+                // Окна «впереди»; боковое смещение штрафуется сильнее.
+                (along > 1.0).then(|| (w.clone(), along + across * 2.0))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(w, _)| w);
+        match best {
+            Some(w) => self.focus_window(&w),
+            None => self.focus_next(dx + dy > 0.0),
+        }
+    }
+
+    /// Get currently focused window
+    pub fn get_focused_window(&self) -> Option<Window> {
+        let kbd = self.seat.get_keyboard()?;
+        let focus = kbd.current_focus()?;
+        self.space.elements().find(|w| focus.is_window(w)).cloned()
     }
 }

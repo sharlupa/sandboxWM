@@ -5,6 +5,7 @@
 use std::process::Stdio;
 
 use smithay::desktop::Window;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Rectangle};
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::{
@@ -17,6 +18,13 @@ use crate::state::{AppState, LayoutMode};
 impl XWaylandShellHandler for AppState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
+    }
+
+    /// X11-окно связано со своей wl_surface: только теперь указатель может на
+    /// него войти (вступает в силу на коммите — фокус пересчитается после
+    /// обработки клиентов).
+    fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, _surface: X11Surface) {
+        self.queue_pointer_refresh();
     }
 }
 smithay::delegate_xwayland_shell!(AppState);
@@ -188,6 +196,38 @@ impl XwmHandler for AppState {
 }
 
 impl AppState {
+    /// Synchronize Smithay's visual Space order with XWayland's internal
+    /// X11 stacking order. Steam/CEF uses many override-redirect popup windows;
+    /// if the two stacks diverge, a popup may be visible on top while X11 sends
+    /// the click to the main window underneath it.
+    ///
+    /// X11-окна скрытых рабочих столов в X-сервере остаются отображёнными —
+    /// они уходят в самый низ стека. Иначе XWayland, выбирающий окно для
+    /// клика по X-стеку, отдавал клик окну с другого стола (или окну под
+    /// полноэкранной игрой).
+    ///
+    /// Порядок для `update_stacking_order_downwards` — СВЕРХУ ВНИЗ: так
+    /// работает его код (документация Smithay утверждает обратное). Раньше
+    /// сюда шёл порядок Space снизу вверх, и X-стек получался перевёрнутым:
+    /// окно в фокусе (и полноэкранная игра) оказывалось в X внизу, а клики
+    /// уходили окнам, лежащим под ним.
+    pub fn sync_x11_stacking(&mut self) {
+        let visible = self
+            .space
+            .elements()
+            .rev()
+            .filter_map(|w| w.x11_surface().cloned());
+        let hidden = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.windows.iter())
+            .filter_map(|w| w.x11_surface().cloned());
+        let order: Vec<smithay::xwayland::X11Surface> = visible.chain(hidden).collect();
+        if let Some(xwm) = self.xwm.as_mut() {
+            let _ = xwm.update_stacking_order_downwards(order.iter());
+        }
+    }
+
     /// Окно X11-поверхности на любом рабочем столе.
     fn x11_window(&self, surface: &X11Surface) -> Option<Window> {
         let is_it = |w: &Window| w.x11_surface() == Some(surface);
