@@ -8,6 +8,7 @@ use smithay::{
     backend::session::libseat::LibSeatSession,
     desktop::{PopupManager, Space, Window},
     input::{Seat, SeatState, pointer::CursorImageStatus},
+    reexports::calloop::LoopHandle,
     reexports::wayland_server::{
         DisplayHandle,
         backend::{ClientData, ClientId, DisconnectReason, GlobalId},
@@ -16,6 +17,7 @@ use smithay::{
     utils::{Clock, Logical, Monotonic, Rectangle, Size},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        drm_syncobj::DrmSyncobjState,
         output::OutputManagerState,
         relative_pointer::RelativePointerManagerState,
         seat::WaylandFocus,
@@ -53,6 +55,7 @@ impl ClientData for ClientState {
 
 pub struct AppState {
     pub display_handle: DisplayHandle,
+    pub loop_handle: LoopHandle<'static, AppState>,
     pub clock: Clock<Monotonic>,
 
     /// Загруженный при старте конфиг (см. `config.rs`).
@@ -79,6 +82,9 @@ pub struct AppState {
     pub pointer_constraints_global: Option<GlobalId>,
     /// ext-workspace-v1: рабочие столы для панелей.
     pub ext_workspace_state: crate::ext_workspace::ExtWorkspaceState,
+    /// linux-drm-syncobj-v1 (явная синхронизация, см. `handlers::sync`).
+    /// Включает бэкенд, когда знает DRM-устройство.
+    pub syncobj_state: Option<DrmSyncobjState>,
 
     // XWayland: shell-state, оконный менеджер X11 и номер X-дисплея
     pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
@@ -205,7 +211,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(display_handle: DisplayHandle) -> Self {
+    pub fn new(display_handle: DisplayHandle, loop_handle: LoopHandle<'static, AppState>) -> Self {
         let config = crate::config::Config::load();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -251,6 +257,7 @@ impl AppState {
 
         Self {
             display_handle,
+            loop_handle,
             clock: Clock::new(),
             config,
             compositor_state,
@@ -264,6 +271,7 @@ impl AppState {
             relative_pointer_state,
             pointer_constraints_global,
             ext_workspace_state,
+            syncobj_state: None,
             xwayland_shell_state,
             xwm: None,
             x11_stacking_dirty: false,

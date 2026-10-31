@@ -8,4 +8,5 @@
 mod compositor;
 mod output;
 mod seat;
+mod sync;
 mod xdg_shell;

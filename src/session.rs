@@ -334,16 +334,23 @@ pub fn backup_path(path: &Path) -> PathBuf {
 /// Счётчик для уникальных имён временных файлов внутри процесса.
 static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Сохраняет сессию атомарно: временный файл в той же директории → `fsync` →
-/// `rename`. Предыдущий файл (если он читается) копируется в `.bak`.
-/// Данные перед записью проходят [`validate`] (на копии), поэтому NaN не
-/// превратится в `null` в JSON и не сломает следующий запуск.
+/// Сохраняет сессию: [`encode`] + [`write`].
 pub fn save(path: &Path, format: SessionFormat, data: &SessionData) -> io::Result<()> {
+    write(path, format, &encode(data, format)?)
+}
+
+/// Текст сессии для записи. Данные проходят [`validate`] (на копии), поэтому
+/// NaN не превратится в `null` в JSON и не сломает следующий запуск.
+pub fn encode(data: &SessionData, format: SessionFormat) -> io::Result<String> {
     let mut clean = data.clone();
     clean.version = SESSION_VERSION;
     validate(&mut clean);
-    let text = serialize(&clean, format)?;
+    serialize(&clean, format)
+}
 
+/// Записывает текст сессии атомарно: временный файл в той же директории →
+/// `fsync` → `rename`. Предыдущий файл (если он читается) копируется в `.bak`.
+pub fn write(path: &Path, format: SessionFormat, text: &str) -> io::Result<()> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "путь сессии без имени файла")
     })?;
@@ -1152,10 +1159,16 @@ pub fn spawn(argv: &[String], cwd: Option<&str>, wayland_display: &str) -> io::R
 // ── Автосохранение ─────────────────────────────────────────────────
 
 /// Таймер периодического сохранения. Нулевой интервал — выключено.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct Autosave {
     pub interval: Duration,
     pub last: Instant,
+    /// Текст последней записанной сессии: неизменившуюся не пишем.
+    written: Option<String>,
+    /// Фоновая запись. `fsync` на btrfs под нагрузкой (игра грузит ресурсы)
+    /// идёт десятки и сотни миллисекунд — в главном потоке кадры замирали
+    /// раз в минуту.
+    writer: Option<std::thread::JoinHandle<io::Result<()>>>,
 }
 
 impl Autosave {
@@ -1163,7 +1176,64 @@ impl Autosave {
         Self {
             interval,
             last: now,
+            written: None,
+            writer: None,
         }
+    }
+
+    /// Записать сессию в фоне. `false` — не пишем: она не изменилась с
+    /// прошлой записи или прошлая запись ещё идёт (повторим по таймеру).
+    pub fn write_in_background(
+        &mut self,
+        path: PathBuf,
+        format: SessionFormat,
+        text: String,
+    ) -> bool {
+        self.collect(false);
+        if self.writer.is_some() || self.written.as_deref() == Some(text.as_str()) {
+            return false;
+        }
+        let job = text.clone();
+        self.writer = std::thread::Builder::new()
+            .name("session-save".into())
+            .spawn(move || write(&path, format, &job))
+            .ok();
+        if self.writer.is_some() {
+            self.written = Some(text);
+        }
+        self.writer.is_some()
+    }
+
+    /// Дождаться фоновой записи — перед записью из главного потока, чтобы
+    /// две записи не делили временные файлы и `.bak`.
+    pub fn finish(&mut self) {
+        self.collect(true);
+    }
+
+    /// Сессию записали из главного потока (выход, горячая клавиша).
+    pub fn saved(&mut self, text: String, now: Instant) {
+        self.written = Some(text);
+        self.last = now;
+    }
+
+    /// Разобрать закончившуюся фоновую запись (`wait` — дождаться её).
+    /// Не удалась — следующая автозапись повторит её.
+    fn collect(&mut self, wait: bool) {
+        if !self
+            .writer
+            .as_ref()
+            .is_some_and(|w| wait || w.is_finished())
+        {
+            return;
+        }
+        let result = self.writer.take().map(|w| w.join());
+        let error = match result {
+            Some(Ok(Ok(()))) | None => return,
+            Some(Ok(Err(e))) => e.to_string(),
+            Some(Err(_)) => "поток записи упал".to_string(),
+        };
+        eprintln!("[session] автосохранение не удалось: {error}");
+        self.written = None;
     }
 
     /// Пора сохранять? При `true` отсчёт начинается заново от `now` (без
@@ -1811,6 +1881,34 @@ mod tests {
 
         let mut off = Autosave::new(Duration::ZERO, now);
         assert!(!off.due(now + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn autosave_writes_in_background_only_changes() {
+        let tmp = TempDir::new("autosave");
+        let path = tmp.0.join("session.toml");
+        let format = SessionFormat::Toml;
+        let mut a = Autosave::new(Duration::from_secs(60), Instant::now());
+        let text = encode(&sample(), format).unwrap();
+
+        assert!(a.write_in_background(path.clone(), format, text.clone()));
+        a.finish();
+        assert_eq!(load(&path, format).unwrap().camera, sample().camera);
+        // Без изменений на диск не пишем.
+        assert!(!a.write_in_background(path.clone(), format, text));
+
+        // Запись не удалась (вместо каталога — файл) — та же сессия
+        // запишется следующей автозаписью.
+        let mut changed = sample();
+        changed.camera = [1.0, 2.0, 1.0];
+        let changed = encode(&changed, format).unwrap();
+        std::fs::write(tmp.0.join("not-a-dir"), b"file").unwrap();
+        let bad = tmp.0.join("not-a-dir").join("session.toml");
+        assert!(a.write_in_background(bad, format, changed.clone()));
+        a.finish();
+        assert!(a.write_in_background(path.clone(), format, changed));
+        a.finish();
+        assert_eq!(load(&path, format).unwrap().camera, [1.0, 2.0, 1.0]);
     }
 
     #[test]

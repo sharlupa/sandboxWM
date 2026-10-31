@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<AppState> = Display::new()?;
     let display_handle = display.handle();
 
-    let mut state = AppState::new(display_handle.clone());
+    let mut state = AppState::new(display_handle.clone(), loop_handle.clone());
 
     // Winit-бэкенд инициализируем ДО подмены WAYLAND_DISPLAY: иначе winit
     // подключается как клиент к нашему же (ещё не обслуживаемому) сокету и
@@ -282,6 +282,19 @@ fn run_winit(
     use smithay::backend::egl::EGLDevice;
     let render_node = EGLDevice::device_for_display(backend_ref.renderer().egl_context().display())
         .and_then(|device| device.try_get_render_node());
+    // Явная синхронизация и во вложенном режиме — на render node той же GPU.
+    if let Ok(Some(node)) = &render_node {
+        if let Some(path) = node.dev_path() {
+            match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(file) => state.enable_explicit_sync(
+                    smithay::backend::drm::DrmDeviceFd::new(smithay::utils::DeviceFd::from(
+                        std::os::fd::OwnedFd::from(file),
+                    )),
+                ),
+                Err(e) => eprintln!("[sync] не открыть {}: {e}", path.display()),
+            }
+        }
+    }
     let dmabuf_state = &mut state.dmabuf_state;
     match render_node {
         Ok(Some(node)) => {

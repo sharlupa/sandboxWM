@@ -25,6 +25,10 @@ impl CompositorHandler for AppState {
         }
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
+    fn new_surface(&mut self, surface: &WlSurface) {
+        super::sync::wait_for_buffers(surface);
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         // Поверхность курсора: wl_surface.offset сдвигает hotspot.
         if let CursorImageStatus::Surface(cursor) = &self.cursor_status {

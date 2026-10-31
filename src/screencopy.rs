@@ -1198,21 +1198,21 @@ mod tests {
         let green = SolidColorBuffer::new((4, 4), [0.0, 1.0, 0.0, 1.0]);
         let elements = vec![
             // «Курсор» поверх всего.
-            CustomRenderElements::Cursor(SolidColorRenderElement::from_buffer(
+            CustomRenderElements::Solid(SolidColorRenderElement::from_buffer(
                 &green,
                 (12, 6),
                 1.0,
                 1.0,
                 Kind::Cursor,
             )),
-            CustomRenderElements::Cursor(SolidColorRenderElement::from_buffer(
+            CustomRenderElements::Solid(SolidColorRenderElement::from_buffer(
                 &red,
                 (10, 5),
                 1.0,
                 1.0,
                 Kind::Unspecified,
             )),
-            CustomRenderElements::Cursor(SolidColorRenderElement::from_buffer(
+            CustomRenderElements::Solid(SolidColorRenderElement::from_buffer(
                 &blue,
                 (0, 40),
                 1.0,

@@ -178,33 +178,53 @@ impl AppState {
     }
 
     /// Сохраняет сессию (выход, автосохранение, Super+F5).
+    /// Сохранить сессию сейчас (выход, горячая клавиша) — из главного потока.
     pub fn save_session(&mut self) {
         if !self.config.session.enabled {
             return;
         }
         let data = self.session_snapshot();
         let (path, format) = self.session_file();
-        let all = || std::iter::once(&data).chain(data.workspaces.iter());
-        match crate::session::save(&path, format, &data) {
-            Ok(()) => println!(
-                "[session] сохранено: {} ({} окон, {} линий, {} связей, {} рабочих столов)",
-                path.display(),
-                all().map(|d| d.windows.len()).sum::<usize>(),
-                all().map(|d| d.lines.len()).sum::<usize>(),
-                all().map(|d| d.joints.len()).sum::<usize>(),
-                all().count()
-            ),
+        if let Some(a) = self.autosave.as_mut() {
+            a.finish();
+        }
+        let written = crate::session::encode(&data, format)
+            .and_then(|text| crate::session::write(&path, format, &text).map(|()| text));
+        match written {
+            Ok(text) => {
+                log_saved(&path, &data);
+                if let Some(a) = self.autosave.as_mut() {
+                    a.saved(text, Instant::now());
+                }
+            }
             Err(e) => eprintln!("[session] не удалось сохранить {}: {e}", path.display()),
         }
-        if let Some(a) = self.autosave.as_mut() {
-            a.reset(Instant::now());
+    }
+
+    /// Автосохранение по таймеру: снимок и текст — здесь, запись на диск — в
+    /// фоне и только если сессия изменилась.
+    fn autosave_session(&mut self) {
+        let data = self.session_snapshot();
+        let (path, format) = self.session_file();
+        let text = match crate::session::encode(&data, format) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("[session] не удалось сохранить {}: {e}", path.display());
+                return;
+            }
+        };
+        let Some(autosave) = self.autosave.as_mut() else {
+            return;
+        };
+        if autosave.write_in_background(path.clone(), format, text) {
+            log_saved(&path, &data);
         }
     }
 
     pub fn maybe_autosave(&mut self, now: Instant) {
         self.maybe_relaunch(now);
         if self.autosave.as_mut().map_or(false, |a| a.due(now)) {
-            self.save_session();
+            self.autosave_session();
         }
         if let Some(r) = self.restorer.as_mut() {
             r.expire(now);
@@ -477,4 +497,17 @@ impl AppState {
             self.try_restore_window(window);
         }
     }
+}
+
+/// Что сохранили — в лог.
+fn log_saved(path: &std::path::Path, data: &crate::session::SessionData) {
+    let all = || std::iter::once(data).chain(data.workspaces.iter());
+    println!(
+        "[session] сохранено: {} ({} окон, {} линий, {} связей, {} рабочих столов)",
+        path.display(),
+        all().map(|d| d.windows.len()).sum::<usize>(),
+        all().map(|d| d.lines.len()).sum::<usize>(),
+        all().map(|d| d.joints.len()).sum::<usize>(),
+        all().count()
+    );
 }

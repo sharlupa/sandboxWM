@@ -1,7 +1,7 @@
 /// DRM/KMS + libinput backend — запуск sandboxWM прямо из TTY.
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cursor::CursorRenderer;
 use crate::render::CustomRenderElements;
@@ -70,6 +70,10 @@ pub fn run_tty(
     let drm_fd = DrmDeviceFd::new(DeviceFd::from(drm_raw_fd));
     let (mut drm, drm_notifier) = DrmDevice::new(drm_fd.clone(), true)?;
     let gbm = GbmDevice::new(drm_fd.clone())?;
+    // Явная синхронизация буферов (NVIDIA: без неё XWayland копирует каждый
+    // кадр игры). До первой обработки клиентов — XWayland ещё не прочитал
+    // реестр.
+    state.enable_explicit_sync(drm_fd.clone());
 
     // 4. EGL + OpenGL
     let egl_display = unsafe { EGLDisplay::new(gbm.clone())? };
@@ -230,12 +234,31 @@ pub fn run_tty(
         crate::input::process_event(state, event);
     })?;
 
+    // Кадры на выходе. Рендерер, курсор и screencopy живут только в
+    // замыканиях event loop (vblank, таймер, сессия) — порядок освобождения
+    // при выходе прежний (см. комментарий в конце функции).
+    let frames = Rc::new(RefCell::new(OutputFrames {
+        renderer,
+        compositor: compositor.clone(),
+        output: output.clone(),
+        // Курсор: клиентская поверхность / xcursor-тема / встроенная стрелка.
+        // Элементы с Kind::Cursor DrmCompositor сам кладёт на аппаратную
+        // cursor-плоскость (DrmCompositor создан с cursor_size и gbm).
+        cursor_renderer: CursorRenderer::new(),
+        // Screencopy: кэш offscreen-текстуры и damage для copy_with_damage.
+        screencopy: ScreencopyRenderer::new(),
+        frame_interval,
+        pending_since: None,
+        stats: FrameStats::from_env(),
+    }));
+
     // 7.5. Обработка событий сессии (VT-переключения)
     // DrmDevice переезжает сюда: на паузе он отдаёт DRM master и помечает
     // поверхности неактивными, при возврате — забирает master обратно. Его
     // DrmDeviceInternal делят с ним поверхности компоновщика, так что порядок
     // освобождения при выходе не меняется (см. комментарий в конце функции).
     let compositor_session = compositor.clone();
+    let frames_session = frames.clone();
     let mut libinput_session = libinput_ctx;
     let mut drm_session = drm;
     loop_handle.insert_source(notifier, move |event, _, state| match event {
@@ -254,6 +277,8 @@ pub fn run_tty(
                     e
                 );
             }
+            // vblank кадра, отданного до паузы, уже не придёт.
+            frames_session.borrow_mut().pending_since = None;
             println!("[session] активна");
         }
         SessionEvent::PauseSession => {
@@ -264,11 +289,18 @@ pub fn run_tty(
         }
     })?;
 
-    // 8. VBlank — обязательно подтверждаем каждый кадр
-    let compositor_vb = compositor.clone();
-    loop_handle.insert_source(drm_notifier, move |event, _, _| {
+    // 8. VBlank: кадр показан — подтверждаем его и сразу рисуем следующий,
+    //    чтобы клиенты получили frame callback в начале периода обновления.
+    let frames_vb = frames.clone();
+    loop_handle.insert_source(drm_notifier, move |event, _, state| {
         if let DrmEvent::VBlank(_) = event {
-            compositor_vb.borrow_mut().frame_submitted().ok();
+            let mut frames = frames_vb.borrow_mut();
+            frames.compositor.borrow_mut().frame_submitted().ok();
+            frames.pending_since = None;
+            if let Some(stats) = frames.stats.as_mut() {
+                stats.vblank(Instant::now());
+            }
+            frames.render_if_needed(state);
         }
     })?;
 
@@ -280,120 +312,14 @@ pub fn run_tty(
         UdevEvent::Removed { device_id } => println!("[udev] GPU удалена: {device_id}"),
     })?;
 
-    // Курсор: клиентская поверхность / xcursor-тема / встроенная стрелка.
-    // Элементы с Kind::Cursor DrmCompositor сам кладёт на аппаратную
-    // cursor-плоскость (DrmCompositor создан с cursor_size и gbm).
-    let mut cursor_renderer = CursorRenderer::new();
-    // Screencopy: кэш offscreen-текстуры и damage для copy_with_damage.
-    let mut screencopy = ScreencopyRenderer::new();
-
-    // 11. Рендер-таймер с периодом обновления монитора. Renders only when
-    //     something changed (`state.needs_render`); an idle desktop costs ~0
-    //     GPU/CPU instead of a forced redraw loop.
-    let output_t = output.clone();
-    let compositor_t = compositor.clone();
-    loop_handle.insert_source(
-        Timer::from_duration(frame_interval),
-        move |_, _, state| {
-            // ── Физический режим: шаг симуляции ─────────────
-            // Выполняем шаг ДО проверки `needs_render`. Если тела движутся,
-            // `step_physics` сам выставит `needs_render = true`, разбудив рендер.
-            state.step_physics();
-
-            // Screencopy-клиент (OBS через portal-wlr) ждёт кадр — будим рендер,
-            // даже если сцена статична: иначе захват замирает/чернеет.
-            // copy_with_damage будит рендер, только когда в его регионе что-то
-            // изменилось.
-            if screencopy.wants_render(&state.screencopy_state, &output_t) {
-                state.needs_render = true;
-            }
-            // Указатель сдвинулся, клиент сменил курсор или анимированный
-            // курсор перешёл на следующий кадр.
-            if cursor_renderer.needs_redraw(&state.cursor_status, state.pointer_location) {
-                state.needs_render = true;
-            }
-            if state.session_paused || !state.needs_render {
-                return smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
-                    frame_interval,
-                );
-            }
-
-            // Process deferred layout (resize, etc.) once per frame.
-            if state.layout_dirty {
-                state.recalculate_layout();
-                state.layout_dirty = false;
-            }
-
-            // ── Смещение камеры (Tiling = (0,0), Physics = Lerp) ─────────────
-            // map_output смещает вид: world = screen + camera_offset.
-            state.space.map_output(
-                &output_t,
-                (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
-            );
-
-            // Окна + оверлей физики (линии, верёвки, связи, пол) — общий
-            // сборщик кадра для обоих бэкендов.
-            let mut elements: Vec<CustomRenderElements> =
-                crate::render::frame_elements(&mut renderer, state, &output_t);
-
-            // Курсор поверх окон. `render_frame` принимает элементы в порядке
-            // front-to-back: первый элемент в слайсе рисуется поверх всех
-            // остальных. Поэтому вставляем курсор в начало вектора.
-            let cursor_elements = cursor_renderer.elements(
-                &mut renderer,
-                &mut state.cursor_status,
-                state.pointer_location,
-                1.0,
-            );
-            let cursor_count = cursor_elements.len();
-            elements.splice(0..0, cursor_elements);
-
-            // Screencopy до DRM-рендера: offscreen-захват в своей текстуре, курсор
-            // (первые cursor_count элементов) — только для overlay_cursor.
-            // Вызывается на каждом рендере, чтобы copy_with_damage видел все изменения.
-            screencopy.fulfill_pending(
-                &mut renderer,
-                &state.screencopy_state,
-                &output_t,
-                &elements,
-                cursor_count,
-                state.background_color(),
-            );
-
-            let mut comp = compositor_t.borrow_mut();
-            let frame_flags = if state.layout_mode == crate::state::LayoutMode::Physics
-                && state.fullscreen_window().is_none()
-            {
-                // Без primary/overlay scanout: иначе DRM кладёт неповёрнутый буфер
-                // на плоскость рядом с GLES-поворотом → «копия» окна на кадр.
-                // Cursor-плоскость безопасна: на неё попадают только Kind::Cursor.
-                FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT
-            } else {
-                FrameFlags::DEFAULT
-            };
-            match comp.render_frame::<_, _>(
-                &mut renderer,
-                &elements,
-                state.background_color(),
-                frame_flags,
-            ) {
-                Ok(_result) => {
-                    comp.queue_frame(()).ok();
-                    state.space.refresh();
-                    let now = state.clock.now();
-                    crate::render::send_frames(state, &output_t, now);
-                    crate::cursor::send_frames(&state.cursor_status, &output_t, now);
-
-                    // Frame submitted successfully — clear the damage flag so we
-                    // don't render again until the next real change.
-                    state.needs_render = false;
-                }
-                Err(e) => eprintln!("[DRM] ошибка рендера: {e:?}"),
-            }
-
-            smithay::reexports::calloop::timer::TimeoutAction::ToDuration(frame_interval)
-        },
-    )?;
+    // 11. Таймер с периодом обновления монитора будит рендер, пока экран
+    //     простаивает (кадр не ждёт vblank); пока кадры идут, следующий
+    //     рисуется по vblank прошлого. Без изменений (`state.needs_render`)
+    //     кадр не рисуется: простой стол стоит ~0 GPU/CPU.
+    loop_handle.insert_source(Timer::from_duration(frame_interval), move |_, _, state| {
+        frames.borrow_mut().render_if_needed(state);
+        smithay::reexports::calloop::timer::TimeoutAction::ToDuration(frame_interval)
+    })?;
 
     // ── Main dispatch loop ──────────────────────────────────────────────────
     while state.running {
@@ -411,7 +337,8 @@ pub fn run_tty(
     // native driver (not a Rust panic — it's FFI).
     //
     // event_loop owns all calloop sources whose closures captured:
-    //   • `renderer` (GlesRenderer, moved into the render-timer closure)
+    //   • `renderer` (GlesRenderer, inside OutputFrames shared by the vblank,
+    //     render-timer and session closures)
     //   • `compositor_*` (Rc<RefCell<DrmCompositor>> clones)
     //   • libinput backend (holds a session clone)
     //
@@ -452,6 +379,235 @@ pub fn run_tty(
     // surface, so the device teardown still happens with the compositor.
 
     Ok(())
+}
+
+type GbmDrmCompositor = DrmCompositor<
+    GbmAllocator<DrmDeviceFd>,
+    GbmFramebufferExporter<DrmDeviceFd>,
+    (),
+    DrmDeviceFd,
+>;
+
+/// Кадры на выходе: рендер сразу после vblank прошлого кадра.
+///
+/// Раньше кадры рисовал таймер с периодом обновления монитора, перезаводимый
+/// после каждого рендера: настоящий период выходил длиннее на время рендера
+/// и не совпадал с vblank по фазе. Клиенты (и XWayland за игры) рисуют
+/// следующий кадр по нашему frame callback — игры получали меньше кадров,
+/// чем частота монитора, а биение таймера с vblank давало повторы кадров
+/// (заметные подёргивания).
+struct OutputFrames {
+    // Рендерер освобождается раньше компоновщика, как и раньше.
+    renderer: GlesRenderer,
+    compositor: Rc<RefCell<GbmDrmCompositor>>,
+    output: Output,
+    cursor_renderer: CursorRenderer,
+    screencopy: ScreencopyRenderer,
+    frame_interval: Duration,
+    /// Кадр отдан DRM и ждёт vblank — с этого момента.
+    pending_since: Option<Instant>,
+    /// `SANDBOXWM_DEBUG_FRAMES=1`: статистика кадров раз в секунду.
+    stats: Option<FrameStats>,
+}
+
+/// Статистика кадров за секунду (`SANDBOXWM_DEBUG_FRAMES=1`): сколько
+/// кадров показано и сколько из них — буфер клиента прямо на экране
+/// (scanout, без перерисовки), самый долгий рендер и промежуток между
+/// vblank. Диагностика FPS и подёргиваний в играх.
+#[derive(Default)]
+struct FrameStats {
+    since: Option<Instant>,
+    last_vblank: Option<Instant>,
+    vblanks: u32,
+    max_vblank_gap: Duration,
+    frames: u32,
+    scanout: u32,
+    max_render: Duration,
+    max_elements: usize,
+}
+
+impl FrameStats {
+    fn from_env() -> Option<Self> {
+        std::env::var_os("SANDBOXWM_DEBUG_FRAMES")
+            .is_some_and(|v| v != "0")
+            .then(Self::default)
+    }
+
+    fn vblank(&mut self, now: Instant) {
+        if let Some(last) = self.last_vblank.replace(now) {
+            self.max_vblank_gap = self.max_vblank_gap.max(now - last);
+        }
+        self.vblanks += 1;
+        let since = *self.since.get_or_insert(now);
+        if now - since >= Duration::from_secs(1) {
+            println!(
+                "[frames] vblank {} (макс. промежуток {:.1} мс), кадров {}, напрямую {}, \
+                 рендер до {:.1} мс, элементов до {}",
+                self.vblanks,
+                self.max_vblank_gap.as_secs_f64() * 1000.0,
+                self.frames,
+                self.scanout,
+                self.max_render.as_secs_f64() * 1000.0,
+                self.max_elements
+            );
+            *self = Self {
+                since: Some(now),
+                last_vblank: Some(now),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn frame(&mut self, scanout: bool, render: Duration, elements: usize) {
+        self.frames += 1;
+        self.scanout += u32::from(scanout);
+        self.max_render = self.max_render.max(render);
+        self.max_elements = self.max_elements.max(elements);
+    }
+}
+
+impl OutputFrames {
+    /// Нарисовать кадр, если что-то изменилось и экран не ждёт vblank
+    /// прошлого кадра.
+    fn render_if_needed(&mut self, state: &mut AppState) {
+        if let Some(since) = self.pending_since {
+            // vblank потерялся (выход выключен, флип не удался) — не ждём
+            // его вечно.
+            if since.elapsed() < self.frame_interval * 4 {
+                return;
+            }
+            self.pending_since = None;
+        }
+
+        // ── Физический режим: шаг симуляции ─────────────
+        // Выполняем шаг ДО проверки `needs_render`. Если тела движутся,
+        // `step_physics` сам выставит `needs_render = true`, разбудив рендер.
+        state.step_physics();
+
+        // Screencopy-клиент (OBS через portal-wlr) ждёт кадр — будим рендер,
+        // даже если сцена статична: иначе захват замирает/чернеет.
+        // copy_with_damage будит рендер, только когда в его регионе что-то
+        // изменилось.
+        if self
+            .screencopy
+            .wants_render(&state.screencopy_state, &self.output)
+        {
+            state.needs_render = true;
+        }
+        // Указатель сдвинулся, клиент сменил курсор или анимированный
+        // курсор перешёл на следующий кадр.
+        if self
+            .cursor_renderer
+            .needs_redraw(&state.cursor_status, state.pointer_location)
+        {
+            state.needs_render = true;
+        }
+        if state.session_paused || !state.needs_render {
+            return;
+        }
+
+        let Self {
+            renderer,
+            compositor,
+            output,
+            cursor_renderer,
+            screencopy,
+            pending_since,
+            stats,
+            ..
+        } = self;
+        let started = Instant::now();
+
+        // Process deferred layout (resize, etc.) once per frame.
+        if state.layout_dirty {
+            state.recalculate_layout();
+            state.layout_dirty = false;
+        }
+
+        // ── Смещение камеры (Tiling = (0,0), Physics = Lerp) ─────────────
+        // map_output смещает вид: world = screen + camera_offset.
+        state.space.map_output(
+            output,
+            (state.camera_offset.0 as i32, state.camera_offset.1 as i32),
+        );
+
+        // Окна + оверлей физики (линии, верёвки, связи, пол) — общий
+        // сборщик кадра для обоих бэкендов.
+        let mut elements: Vec<CustomRenderElements> =
+            crate::render::frame_elements(renderer, state, output);
+
+        // Курсор поверх окон. `render_frame` принимает элементы в порядке
+        // front-to-back: первый элемент в слайсе рисуется поверх всех
+        // остальных. Поэтому вставляем курсор в начало вектора.
+        let cursor_elements = cursor_renderer.elements(
+            renderer,
+            &mut state.cursor_status,
+            state.pointer_location,
+            1.0,
+        );
+        let cursor_count = cursor_elements.len();
+        elements.splice(0..0, cursor_elements);
+
+        // Screencopy до DRM-рендера: offscreen-захват в своей текстуре, курсор
+        // (первые cursor_count элементов) — только для overlay_cursor.
+        // Вызывается на каждом рендере, чтобы copy_with_damage видел все изменения.
+        screencopy.fulfill_pending(
+            renderer,
+            &state.screencopy_state,
+            output,
+            &elements,
+            cursor_count,
+            state.background_color(),
+        );
+
+        let mut comp = compositor.borrow_mut();
+        let frame_flags = if state.fullscreen_window().is_some() {
+            // Полноэкранное окно: его буфер — прямо на основную плоскость при
+            // любом формате swapchain (игры отдают XR24, swapchain — с
+            // альфой). Без overlay-плоскостей: на них дисплей сам смешивает
+            // альфу буфера с тем, что под ним, а у игр в альфе мусор.
+            FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+                | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT
+        } else if state.layout_mode == crate::state::LayoutMode::Physics {
+            // Без primary/overlay scanout: иначе DRM кладёт неповёрнутый буфер
+            // на плоскость рядом с GLES-поворотом → «копия» окна на кадр.
+            // Cursor-плоскость безопасна: на неё попадают только Kind::Cursor.
+            FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT
+        } else {
+            FrameFlags::DEFAULT
+        };
+        match comp.render_frame::<_, _>(
+            renderer,
+            &elements,
+            state.background_color(),
+            frame_flags,
+        ) {
+            Ok(result) => {
+                let scanout = matches!(
+                    result.primary_element,
+                    smithay::backend::drm::compositor::PrimaryPlaneElement::Element(_)
+                );
+                // Кадр без изменений DRM не показывает и vblank не пришлёт —
+                // следующий кадр разбудит таймер.
+                if !result.is_empty && comp.queue_frame(()).is_ok() {
+                    *pending_since = Some(Instant::now());
+                    if let Some(stats) = stats.as_mut() {
+                        stats.frame(scanout, started.elapsed(), elements.len());
+                    }
+                }
+                state.space.refresh();
+                let now = state.clock.now();
+                crate::render::send_frames(state, output, now);
+                crate::cursor::send_frames(&state.cursor_status, output, now);
+
+                // Frame rendered — clear the damage flag so we don't render
+                // again until the next real change.
+                state.needs_render = false;
+            }
+            Err(e) => eprintln!("[DRM] ошибка рендера: {e:?}"),
+        }
+    }
 }
 
 /// Период рендер-таймера по частоте режима (в мГц): 1/refresh, но не чаще

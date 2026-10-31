@@ -21,7 +21,7 @@ use cgmath::Matrix3;
 use smithay::backend::renderer::{
     element::{
         Element, Id, Kind, RenderElement, UnderlyingStorage, render_elements,
-        solid::SolidColorRenderElement,
+        solid::{SolidColorBuffer, SolidColorRenderElement},
         surface::{
             WaylandSurfaceRenderElement, WaylandSurfaceTexture, render_elements_from_surface_tree,
         },
@@ -44,7 +44,8 @@ render_elements! {
     Surface=WaylandSurfaceRenderElement<GlesRenderer>,
     /// Поверхность окна, обрезанная по тайлу.
     Cropped=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
-    Cursor=SolidColorRenderElement,
+    /// Сплошная заливка: подложка полноэкранного окна (и тесты захвата).
+    Solid=SolidColorRenderElement,
     CursorImage=smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
     Physics=PhysicsElement,
     Overlay=crate::overlay::OverlayElement,
@@ -380,6 +381,8 @@ pub struct RenderCache {
     overlays: [(Id, u64, CommitCounter); 3],
     /// Обводки окон/кусков: (id, отпечаток, commit, кадр последнего показа).
     borders: HashMap<BorderKey, (Id, u64, CommitCounter, u64)>,
+    /// Чёрная подложка полноэкранного окна (см. [`frame_elements`]).
+    backdrop: SolidColorBuffer,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -413,6 +416,7 @@ impl Default for RenderCache {
             frame: 0,
             overlays: std::array::from_fn(|_| (Id::new(), 0, CommitCounter::default())),
             borders: HashMap::new(),
+            backdrop: SolidColorBuffer::new((1, 1), [0.0, 0.0, 0.0, 1.0]),
         }
     }
 }
@@ -882,11 +886,22 @@ pub fn frame_elements(
 ) -> Vec<CustomRenderElements> {
     use crate::layer_shell::layer_elements;
     use smithay::wayland::shell::wlr_layer::Layer;
-    // Полноэкранное окно: только оно, его X11-меню и слой overlay.
+    // Полноэкранное окно: только оно, его X11-меню и слой overlay — поверх
+    // чёрной подложки, как в niri. Альфа буфера игры тогда ни на что не
+    // влияет: игры пишут в неё что попало (Source — служебные значения, у
+    // оружия в руках тоже), и раньше сквозь кадр проступал цвет фона — игра
+    // выглядела светлее, а оружие в TF2 чернело. Непрозрачное окно подложку
+    // закрывает целиком, и она не мешает выводу буфера прямо на экран.
     if let Some(window) = state.fullscreen_window() {
         let mut elements = layer_elements(renderer, output, &[Layer::Overlay]);
         elements.extend(override_redirect_elements(renderer, state));
         elements.extend(window_elements(renderer, &window, (0, 0).into(), None));
+        let size = state.output_size();
+        let backdrop = &mut state.render_cache.backdrop;
+        backdrop.update(size, [0.0, 0.0, 0.0, 1.0]);
+        elements.push(CustomRenderElements::Solid(
+            SolidColorRenderElement::from_buffer(backdrop, (0, 0), 1.0, 1.0, Kind::Unspecified),
+        ));
         return elements;
     }
     let mut elements = layer_elements(renderer, output, &[Layer::Overlay, Layer::Top]);
@@ -905,15 +920,34 @@ pub fn frame_elements(
     elements
 }
 
+/// Как часто получают кадровые колбэки невидимые поверхности: окна и
+/// слои под полноэкранным окном.
+pub const HIDDEN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Кадровые колбэки после отрисовки: окнам активного стола и слоям.
-/// Окна скрытых столов колбэков не получают (как свёрнутые).
+/// Окна скрытых столов колбэков не получают (как свёрнутые). Окна и слои под
+/// полноэкранным окном получают их раз в секунду: иначе Steam, браузер или
+/// Discord под игрой рисовали бы невидимые кадры на полной частоте и делили
+/// бы с ней GPU.
 pub fn send_frames<T: Into<std::time::Duration> + Copy>(state: &AppState, output: &Output, now: T) {
+    let fullscreen = state.fullscreen_window();
     for window in state.space.elements() {
-        window.send_frame(output, now, Some(std::time::Duration::ZERO), |_, _| {
-            Some(output.clone())
+        // Над полноэкранным окном видны только X11-меню и всплывашки (OR).
+        let hidden = fullscreen.as_ref().is_some_and(|fs| {
+            fs != window
+                && !window
+                    .x11_surface()
+                    .is_some_and(|x| x.is_override_redirect())
         });
+        if hidden {
+            window.send_frame(output, now, Some(HIDDEN_FRAME_INTERVAL), |_, _| None);
+        } else {
+            window.send_frame(output, now, Some(std::time::Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        }
     }
-    state.send_layer_frames(output, now);
+    state.send_layer_frames(output, now, fullscreen.is_some());
 }
 
 #[cfg(test)]

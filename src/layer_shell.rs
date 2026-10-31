@@ -251,13 +251,29 @@ impl AppState {
     }
 
     /// Отправляет кадровые колбэки поверхностям слоёв и чистит мёртвые.
-    pub fn send_layer_frames<T: Into<std::time::Duration> + Copy>(&self, output: &Output, now: T) {
+    /// Под полноэкранным окном (`fullscreen`) видны только слои `overlay`,
+    /// остальные получают колбэки редко (см. `render::send_frames`).
+    pub fn send_layer_frames<T: Into<std::time::Duration> + Copy>(
+        &self,
+        output: &Output,
+        now: T,
+        fullscreen: bool,
+    ) {
         let mut map = layer_map_for_output(output);
         map.cleanup();
         for layer in map.layers() {
-            layer.send_frame(output, now, Some(std::time::Duration::ZERO), |_, _| {
-                Some(output.clone())
-            });
+            if fullscreen && layer.layer() != Layer::Overlay {
+                layer.send_frame(
+                    output,
+                    now,
+                    Some(crate::render::HIDDEN_FRAME_INTERVAL),
+                    |_, _| None,
+                );
+            } else {
+                layer.send_frame(output, now, Some(std::time::Duration::ZERO), |_, _| {
+                    Some(output.clone())
+                });
+            }
         }
     }
 }
