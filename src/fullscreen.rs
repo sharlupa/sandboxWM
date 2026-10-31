@@ -200,10 +200,17 @@ impl AppState {
             return;
         };
         let loc = self.screen_origin_in_space();
+        let mut restack = false;
         if self.space.element_location(&window) != Some(loc) {
             self.space.map_element(window.clone(), loc, false);
+            restack = true;
         }
-        self.space.raise_element(&window, false);
+        // Уже наверху — X-стек не трогаем: синхронизация берёт grab X-сервера,
+        // а в физике это место вызывается каждый кадр.
+        if self.space.elements().last() != Some(&window) {
+            self.space.raise_element(&window, false);
+            restack = true;
+        }
         if let Some(x11) = window.x11_surface() {
             let target = Rectangle::from_size(self.output_size());
             if x11.geometry() != target {
@@ -217,6 +224,8 @@ impl AppState {
                 let _ = x11.configure(target);
             }
         }
-        self.sync_x11_stacking();
+        if restack {
+            self.sync_x11_stacking();
+        }
     }
 }
